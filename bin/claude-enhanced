@@ -3,9 +3,11 @@ set -euo pipefail
 
 PROFILE_DIR="${CLAUDE_ENHANCED_CONFIG_DIR:-$HOME/.claude-enhanced}"
 APP_DIR="${CLAUDE_ENHANCED_APP_DIR:-$HOME/.local/share/claude-enhanced}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-brigade"
 ENV_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-enhanced/longcat.env"
 TOKEN_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-enhanced/router.token"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-enhanced"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-brigade"
 PORT_FILE="$CACHE_DIR/router.port"
 _PREFERRED_PORT="${CLAUDE_ENHANCED_PORT:-8787}"
 
@@ -110,20 +112,35 @@ unset LONGCAT_API_KEY
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL
 unset ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL
 unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_SUBAGENT_MODEL CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
+unset CLAUDE_CODE_SUBAGENT_MODEL
 export CLAUDE_CODE_FORK_SUBAGENT=0
 export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
-unset CLAUDE_CODE_SUBAGENT_MODEL
+
+# Export path variables for hooks and downstream processes
+export BRIGADE_CONFIG_DIR="$CONFIG_DIR"
+export BRIGADE_STATE_DIR="$STATE_DIR"
+export BRIGADE_CACHE_DIR="$CACHE_DIR"
+CLAUDE_BRIGADE_PYTHON="$APP_DIR/venv/bin/python"
+export CLAUDE_BRIGADE_PYTHON
+
 export CLAUDE_CONFIG_DIR="$PROFILE_DIR"
 ROUTER_BASE_URL="http://127.0.0.1:${PORT}"
 
 SESSION_SETTINGS_JSON="$(
-  python3 - "$ROUTER_BASE_URL" <<'PY'
+  python3 - "$ROUTER_BASE_URL" "$CLAUDE_BRIGADE_PYTHON" "$RUN_ID" "$BRIGADE_CONFIG_DIR" "$BRIGADE_STATE_DIR" "$BRIGADE_CACHE_DIR" <<'PY'
 import json
 import sys
 
+router_url, python_path, run_id, config_dir, state_dir, cache_dir = sys.argv[1:7]
+
 print(json.dumps({
     "env": {
-        "ANTHROPIC_BASE_URL": sys.argv[1],
+        "ANTHROPIC_BASE_URL": router_url,
+        "CLAUDE_BRIGADE_PYTHON": python_path,
+        "CLAUDE_BRIGADE_RUN_ID": run_id,
+        "BRIGADE_CONFIG_DIR": config_dir,
+        "BRIGADE_STATE_DIR": state_dir,
+        "BRIGADE_CACHE_DIR": cache_dir,
     }
 }))
 PY

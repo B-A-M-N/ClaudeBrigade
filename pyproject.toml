@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "enhanced_router"
+version = "0.1.0"
+description = "Loopback model router for Claude Enhanced"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "httpx>=0.28,<1",
+    "mcp>=1.27,<2",
+    "PyYAML>=6.0,<7",
+    "uvicorn>=0.34,<1",
+]
+
+[tool.setuptools.packages.find]
+where = ["router"]
+include = ["enhanced_router*"]

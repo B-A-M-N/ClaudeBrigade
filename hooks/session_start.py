@@ -9,6 +9,13 @@ import uuid
 from datetime import datetime, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
+
+# Ensure enhanced_router is importable (supports both pip-installed and dev modes)
+_bracket = os.environ.get("CLAUDE_BRIGADE_PYTHON")
+if _bracket:
+    _site = str(pathlib.Path(_bracket).parent / "site-packages")
+    if _site not in sys.path:
+        sys.path.insert(0, _site)
 from workspace_fingerprint import fingerprint
 
 

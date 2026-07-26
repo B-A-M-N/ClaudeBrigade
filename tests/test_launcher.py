@@ -96,9 +96,15 @@ echo "$@"
     stdout = result.stdout
     stderr = result.stderr
     
-    expected_settings = '{"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8788"}}'
+    expected_settings = '{"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8788"'
     assert "--settings" in stdout
     assert expected_settings in stdout
+    # Verify new Brigade env vars are included
+    assert "CLAUDE_BRIGADE_PYTHON" in stdout
+    assert "CLAUDE_BRIGADE_RUN_ID" in stdout
+    assert "BRIGADE_CONFIG_DIR" in stdout
+    assert "BRIGADE_STATE_DIR" in stdout
+    assert "BRIGADE_CACHE_DIR" in stdout
 
     # Launcher exports CLAUDE_BRIGADE_RUN_ID in its script
     launcher = Path(__file__).resolve().parents[1] / "bin" / "claude-enhanced"

@@ -22,8 +22,6 @@
       "Bash(pnpm run lint *)",
       "Bash(pnpm run build *)",
       "Bash(yarn test *)",
-      "Bash(pytest *)",
-      "Bash(python -m pytest *)",
       "Bash(cargo test *)",
       "Bash(go test *)",
       "Bash(make test *)"
@@ -36,7 +34,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_CONFIG_DIR/hooks/session_start.py\""
+            "command": "\"$CLAUDE_BRIGADE_PYTHON\" \"$CLAUDE_CONFIG_DIR/hooks/session_start.py\""
           }
         ]
       }
@@ -46,7 +44,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_CONFIG_DIR/hooks/user_prompt_submit.py\""
+            "command": "\"$CLAUDE_BRIGADE_PYTHON\" \"$CLAUDE_CONFIG_DIR/hooks/user_prompt_submit.py\""
           }
         ]
       }
@@ -119,7 +117,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_CONFIG_DIR/hooks/session_end.py\""
+            "command": "\"$CLAUDE_BRIGADE_PYTHON\" \"$CLAUDE_CONFIG_DIR/hooks/session_end.py\""
           }
         ]
       }
