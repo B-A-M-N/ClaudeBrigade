@@ -18,6 +18,7 @@ models:
 
   glm-review:
     display_name: GLM Reviewer
+    enabled: false
     backend: litellm
     litellm_model: openrouter/vendor/model-id
     api_key_env: OPENROUTER_API_KEY

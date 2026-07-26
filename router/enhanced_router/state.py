@@ -258,9 +258,15 @@ class RouteState:
         finally:
             conn.close()
 
-    def set_profile_routes_atomic(self, run_id: str, epoch_id: str, profile_id: str, reason: str) -> dict[str, dict]:
-        """BEGIN IMMEDIATE transaction: set all 4 role routes from profile. One failure rolls back ALL."""
-        # Import registry lazily to avoid circular imports
+    def set_profile_routes_atomic(
+        self, run_id: str, epoch_id: str, profile_id: str, reason: str
+    ) -> dict[str, dict]:
+        """BEGIN IMMEDIATE transaction: set all 4 role routes from profile.
+
+        Updates epochs.profile_id, upserts each role route, appends a
+        *route_event* row per changed role, and returns the actual persisted
+        versions.  One failure rolls back ALL changes.
+        """
         from enhanced_router.registry import ModelRegistry
 
         conn = self._new_conn()
@@ -271,7 +277,96 @@ class RouteState:
                 reg = ModelRegistry()
                 reg.load_profiles()
                 profile = reg.get_profile(profile_id)
+
+                # 1. Update epochs.profile_id on the active epoch row
+                conn.execute(
+                    "UPDATE epochs SET profile_id = ? WHERE run_id = ? AND epoch_id = ? AND closed_at IS NULL",
+                    (profile_id, run_id, epoch_id),
+                )
+
                 results: dict[str, dict] = {}
+                for role in ("recon", "implementer", "adversary", "repairer"):
+                    model_id = getattr(profile, role)
+                    conn.execute(
+                        """INSERT INTO role_routes (run_id, epoch_id, role, model_id, source, reason, version, changed_at)
+                           VALUES (?, ?, ?, ?, 'profile', ?, 1, ?)
+                           ON CONFLICT(run_id, epoch_id, role) DO UPDATE SET
+                               model_id = excluded.model_id,
+                               source = excluded.source,
+                               reason = excluded.reason,
+                               version = version + 1,
+                               changed_at = excluded.changed_at""",
+                        (run_id, epoch_id, role, model_id, reason, now),
+                    )
+
+                    # 2. Read actual version after upsert
+                    row = conn.execute(
+                        "SELECT version, model_id FROM role_routes WHERE run_id=? AND epoch_id=? AND role=?",
+                        (run_id, epoch_id, role),
+                    ).fetchone()
+                    actual_version = row[0] if row else 1
+
+                    # 3. Append route_event for this role
+                    conn.execute(
+                        "INSERT INTO route_events (run_id, epoch_id, event_type, role, new_model_id, created_at) "
+                        "VALUES (?, ?, 'profile_set', ?, ?, ?)",
+                        (run_id, epoch_id, role, model_id, now),
+                    )
+
+                    results[role] = {
+                        "run_id": run_id,
+                        "epoch_id": epoch_id,
+                        "role": role,
+                        "model_id": model_id,
+                        "source": "profile",
+                        "reason": reason,
+                        "version": actual_version,
+                    }
+
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            return results
+        finally:
+            conn.close()
+
+    def create_epoch_from_profile(
+        self, run_id: str, epoch_id: str, workflow_id: str, profile_id: str
+    ) -> dict:
+        """Transaction: create_epoch + set profile routes. Returns epoch dict.
+
+        Routes are NOT optional -- a profile load failure propagates as an
+        exception so the caller knows the epoch has no routes.
+        """
+        conn = self._new_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Check for active epoch
+                active = conn.execute(
+                    "SELECT 1 FROM epochs WHERE run_id = ? AND closed_at IS NULL",
+                    (run_id,),
+                ).fetchone()
+                if active:
+                    conn.rollback()
+                    raise ValueError(
+                        f"Active epoch already exists for run {run_id}"
+                    )
+
+                # Create the epoch row
+                conn.execute(
+                    "INSERT INTO epochs (run_id, epoch_id, workflow_id, profile_id, status, created_at) VALUES (?, ?, ?, ?, 'active', ?)",
+                    (run_id, epoch_id, workflow_id, profile_id, _utcnow()),
+                )
+
+                # Load profile and set routes -- raise on failure
+                from enhanced_router.registry import ModelRegistry
+
+                reg = ModelRegistry()
+                reg.load_profiles()
+                profile = reg.get_profile(profile_id)
+                now = _utcnow()
                 for role in ("recon", "implementer", "adversary", "repairer"):
                     model_id = getattr(profile, role)
                     conn.execute(
@@ -285,70 +380,13 @@ class RouteState:
                                changed_at = excluded.changed_at""",
                         (run_id, epoch_id, role, model_id, f"profile:{profile_id}", now),
                     )
-                    results[role] = {
-                        "run_id": run_id,
-                        "epoch_id": epoch_id,
-                        "role": role,
-                        "model_id": model_id,
-                        "source": "profile",
-                        "reason": f"profile:{profile_id}",
-                        "version": 1,
-                    }
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-            return results
-        finally:
-            conn.close()
 
-    def create_epoch_from_profile(self, run_id: str, epoch_id: str, workflow_id: str, profile_id: str) -> dict:
-        """Transaction: create_epoch + set profile routes. Returns epoch dict."""
-        conn = self._new_conn()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                # Check for active epoch
-                active = conn.execute(
-                    "SELECT 1 FROM epochs WHERE run_id = ? AND closed_at IS NULL",
-                    (run_id,),
-                ).fetchone()
-                if active:
-                    conn.rollback()
-                    raise ValueError(f"Active epoch already exists for run {run_id}")
-
-                # Create the epoch row
-                conn.execute(
-                    "INSERT INTO epochs (run_id, epoch_id, workflow_id, profile_id, status, created_at) VALUES (?, ?, ?, ?, 'active', ?)",
-                    (run_id, epoch_id, workflow_id, profile_id, _utcnow()),
-                )
-
-                # Load profile and set routes
-                try:
-                    from enhanced_router.registry import ModelRegistry
-                    reg = ModelRegistry()
-                    reg.load_profiles()
-                    profile = reg.get_profile(profile_id)
-                    now = _utcnow()
-                    for role in ("recon", "implementer", "adversary", "repairer"):
-                        model_id = getattr(profile, role)
-                        conn.execute(
-                            """INSERT INTO role_routes (run_id, epoch_id, role, model_id, source, reason, version, changed_at)
-                               VALUES (?, ?, ?, ?, 'profile', ?, 1, ?)
-                               ON CONFLICT(run_id, epoch_id, role) DO UPDATE SET
-                                   model_id = excluded.model_id,
-                                   source = excluded.source,
-                                   reason = excluded.reason,
-                                   version = version + 1,
-                                   changed_at = excluded.changed_at""",
-                            (run_id, epoch_id, role, model_id, f"profile:{profile_id}", now),
-                        )
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to load profile %s for epoch, creating without routes: %s",
-                        profile_id, exc,
+                    # Append route_event for each role
+                    conn.execute(
+                        "INSERT INTO route_events (run_id, epoch_id, event_type, role, new_model_id, created_at) "
+                        "VALUES (?, ?, 'profile_set', ?, ?, ?)",
+                        (run_id, epoch_id, role, model_id, now),
                     )
-                    # Still commit the epoch, routes are optional if profile fails
 
                 conn.commit()
                 epoch = conn.execute(
@@ -357,11 +395,24 @@ class RouteState:
                     (run_id,),
                 ).fetchone()
                 if epoch is None:
-                    raise RuntimeError(f"Failed to create epoch {epoch_id} for run {run_id}")
-                return dict(zip(
-                    ("id", "run_id", "epoch_id", "workflow_id", "profile_id", "status", "created_at", "closed_at"),
-                    epoch,
-                ))
+                    raise RuntimeError(
+                        f"Failed to create epoch {epoch_id} for run {run_id}"
+                    )
+                return dict(
+                    zip(
+                        (
+                            "id",
+                            "run_id",
+                            "epoch_id",
+                            "workflow_id",
+                            "profile_id",
+                            "status",
+                            "created_at",
+                            "closed_at",
+                        ),
+                        epoch,
+                    )
+                )
             except Exception:
                 conn.rollback()
                 raise
@@ -571,25 +622,42 @@ class RouteState:
 
     # ---- Snapshot --------------------------------------------------
 
-    def create_route_snapshot(self, run_id: str, epoch_id: str, purpose: str = "completion") -> str:
-        """Capture state as JSON, SHA-256. Returns hex digest."""
+    def create_route_snapshot(
+        self, run_id: str, epoch_id: str, purpose: str = "completion"
+    ) -> str:
+        """Capture state as JSON, SHA-256. Returns hex digest.
+
+        Deterministic: no timestamp in hash input, ALL bindings included
+        (not just active), sorted keys, compact separators.
+        """
         conn = self._new_conn()
         try:
             routes_rows = conn.execute(
-                "SELECT role, model_id, version FROM role_routes WHERE run_id = ? AND epoch_id = ?",
+                "SELECT role, model_id, version FROM role_routes "
+                "WHERE run_id = ? AND epoch_id = ?",
                 (run_id, epoch_id),
             ).fetchall()
-            routes = {row[0]: {"model_id": row[1], "version": row[2]} for row in routes_rows}
-
-            bindings_rows = conn.execute(
-                "SELECT claude_agent_id, role, model_id, binding_id FROM agent_bindings "
-                "WHERE run_id = ? AND epoch_id = ? AND released_at IS NULL",
-                (run_id, epoch_id),
-            ).fetchall()
-            bindings = {
-                row[0]: {"role": row[1], "model_id": row[2], "binding_id": row[3]}
-                for row in bindings_rows
+            routes = {
+                row[0]: {"model_id": row[1], "version": row[2]}
+                for row in routes_rows
             }
+
+            # ALL bindings, not just active ones
+            bindings_rows = conn.execute(
+                "SELECT claude_agent_id, role, model_id, binding_id, released_at "
+                "FROM agent_bindings WHERE run_id = ? AND epoch_id = ?",
+                (run_id, epoch_id),
+            ).fetchall()
+            bindings = [
+                {
+                    "claude_agent_id": row[0],
+                    "role": row[1],
+                    "model_id": row[2],
+                    "binding_id": row[3],
+                    "released_at": row[4],
+                }
+                for row in bindings_rows
+            ]
 
             max_event = conn.execute(
                 "SELECT MAX(id) FROM route_events WHERE run_id = ? AND epoch_id = ?",
@@ -601,12 +669,13 @@ class RouteState:
                 "run_id": run_id,
                 "epoch_id": epoch_id,
                 "routes": routes,
-                "bindings": bindings,
+                "all_bindings": bindings,
                 "max_event_id": max_event,
-                "captured_at": _utcnow(),
             }
 
-            json_bytes = json.dumps(snapshot_data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            json_bytes = json.dumps(
+                snapshot_data, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
             return hashlib.sha256(json_bytes).hexdigest()
         finally:
             conn.close()

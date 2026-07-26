@@ -104,6 +104,64 @@ async def set_role_route(
     Takes effect on the **next** subagent spawn. Already-running agents are
     unaffected.
     """
+    registry: ModelRegistry = _get_registry()
+
+    # Validate model exists in registry
+    try:
+        spec = registry.get_model(model_id)
+    except KeyError:
+        return {"changed": False, "error": f"Unknown model: {model_id}"}
+
+    # Validate model is enabled
+    if not spec.enabled:
+        return {
+            "changed": False,
+            "error": f"Model '{model_id}' is disabled",
+        }
+
+    # Validate role is allowed for this model
+    if role not in spec.allowed_roles:
+        return {
+            "changed": False,
+            "error": (
+                f"Model '{model_id}' does not allow role '{role}'"
+            ),
+        }
+
+    # Validate mutation capability for mutation roles
+    if role in ("implementer", "repairer") and not spec.capabilities.mutation:
+        return {
+            "changed": False,
+            "error": (
+                f"Model '{model_id}' has mutation=false "
+                f"but role '{role}' requires mutation"
+            ),
+        }
+
+    # Validate tools capability
+    if not spec.capabilities.tools:
+        return {
+            "changed": False,
+            "error": (
+                f"Model '{model_id}' has tools=false "
+                f"but role '{role}' requires tools"
+            ),
+        }
+
+    # Validate credentials available for direct-anthropic backends
+    if spec.backend == "direct-anthropic":
+        import os
+
+        if spec.api_key_env and not os.environ.get(spec.api_key_env):
+            return {
+                "changed": False,
+                "error": (
+                    f"API key env var '{spec.api_key_env}' "
+                    f"for model '{model_id}' is not set"
+                ),
+            }
+
+    # If all validations pass, proceed with the route change
     state: RouteState = get_state()
     run_id = _get_current_run_id()
 
