@@ -14,6 +14,17 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from enhanced_router.backends import (
+    BackendType,
+    ResolvedRoute,
+    ROLE_MODEL_ALIASES,
+    sanitize_upstream_headers,
+)
+from enhanced_router.mcp_control import control_mcp
+from enhanced_router.mcp_transport import authenticated_mcp_app
+from enhanced_router.routing import resolve_request
+from enhanced_router.state import get_state
+
 LOGGER = logging.getLogger("claude-enhanced-router")
 logging.basicConfig(level=os.getenv("ENHANCED_ROUTER_LOG_LEVEL", "INFO"))
 
@@ -61,13 +72,28 @@ def _build_client() -> httpx.AsyncClient:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.client = _build_client()
-    try:
-        yield
-    finally:
-        await app.state.client.aclose()
+    # Run the MCP session manager inside the FastAPI lifespan
+    async with control_mcp.session_manager.run():
+        try:
+            yield
+        finally:
+            await app.state.client.aclose()
 
 
 app = FastAPI(title="Claude Enhanced Router", docs_url=None, redoc_url=None, lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# MCP mount
+# ---------------------------------------------------------------------------
+
+_mcp_asgi = authenticated_mcp_app(control_mcp.streamable_http_app(), get_state())
+app.mount("/mcp", _mcp_asgi)
+
+
+# ---------------------------------------------------------------------------
+# Security helpers
+# ---------------------------------------------------------------------------
 
 
 def _is_loopback(host: str | None) -> bool:
@@ -80,6 +106,11 @@ def _require_local(request: Request) -> None:
         raise HTTPException(status_code=403, detail="loopback access only")
     if ROUTER_TOKEN and request.headers.get("x-enhanced-token") != ROUTER_TOKEN:
         raise HTTPException(status_code=401, detail="invalid router token")
+
+
+# ---------------------------------------------------------------------------
+# LongCat payload normalization (unchanged from original)
+# ---------------------------------------------------------------------------
 
 
 def _is_longcat(model: Any) -> bool:
@@ -150,8 +181,6 @@ def normalize_longcat_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     normalized["model"] = LONGCAT_UPSTREAM_ID
     normalized["messages"] = _normalize_messages(normalized.get("messages"))
 
-    # Only include system/tools if present; sending explicit null can cause
-    # validation errors on strict API implementations.
     system = normalized.get("system")
     if system is not None:
         normalized["system"] = _strip_cache_control_from_blocks(system)
@@ -173,6 +202,11 @@ def normalize_longcat_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             normalized["thinking"] = {"type": thinking_type}
 
     return normalized
+
+
+# ---------------------------------------------------------------------------
+# Upstream request helpers
+# ---------------------------------------------------------------------------
 
 
 def _copy_request_headers(request: Request, *, longcat: bool) -> dict[str, str]:
@@ -231,10 +265,9 @@ def _parse_retry_after(headers: httpx.Headers) -> float | None:
         return None
 
 
-# Statuses worth retrying on non-streaming calls and pre-stream streaming calls. 529 = Anthropic overloaded.
 _RETRYABLE_STATUSES = {429, 503, 529}
 _MAX_RETRIES = 3
-_RETRY_BASE_DELAY = 0.5  # seconds; doubles each attempt
+_RETRY_BASE_DELAY = 0.5
 
 
 async def _proxy(request: Request, payload: dict[str, Any], path: str) -> Response:
@@ -278,13 +311,10 @@ async def _proxy(request: Request, payload: dict[str, Any], path: str) -> Respon
         elapsed_ms = int((time.monotonic() - started) * 1000)
         status = upstream_response.status_code
 
-        # Retry transient overload/rate-limit errors.
-        # This is safe for both non-streaming AND streaming requests before the StreamingResponse starts yielding bytes.
         if status in _RETRYABLE_STATUSES and attempt < _MAX_RETRIES - 1:
             retry_after = _parse_retry_after(upstream_response.headers)
             delay = retry_after if retry_after is not None else (_RETRY_BASE_DELAY * (2 ** attempt))
             delay = min(delay, 30.0)
-
             await upstream_response.aclose()
             LOGGER.info(
                 "route=%s session=%s agent=%s status=%s attempt=%s retrying_in=%.1fs",
@@ -315,34 +345,51 @@ async def _proxy(request: Request, payload: dict[str, Any], path: str) -> Respon
         await upstream_response.aclose()
         return Response(content=content, status_code=status, headers=response_headers)
 
-    # Unreachable, but satisfies the type checker.
     return JSONResponse(status_code=502, content={"error": {"type": "upstream_connection_error", "message": "max retries exceeded"}})
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 
 
 @app.head("/")
 async def root_probe(request: Request) -> Response:
-    """Answer Claude Code gateway reachability probes without touching an upstream."""
     _require_local(request)
-    # 200 OK is the conventional response for a HEAD health probe; 204 can
-    # confuse clients that interpret it as "no content available".
     return Response(status_code=200)
 
 
 @app.get("/healthz")
-async def healthz(request: Request) -> dict[str, str]:
+async def healthz(request: Request) -> dict[str, Any]:
     _require_local(request)
-    return {"status": "ok"}
+    try:
+        from enhanced_router.registry import ModelRegistry
+        registry = ModelRegistry()
+        registry.load_models()
+        registry.load_profiles()
+        registry.load_workflows()
+        model_count = len(registry.models)
+        health = {"status": "ok", "gateway": "ok", "mcp": "ok", "litellm": "not_configured"}
+        health["registry_hash"] = registry.registry_hash()
+        health["configured_models"] = model_count
+        health["healthy_models"] = model_count
+    except Exception as exc:
+        health = {
+            "status": "degraded",
+            "gateway": "ok",
+            "mcp": "ok",
+            "litellm": "not_configured",
+            "registry_error": str(exc),
+        }
+    return health
 
 
 @app.get("/v1/models")
 async def models(request: Request) -> dict[str, Any]:
     _require_local(request)
     entries: list[dict[str, Any]] = [
-        {
-            "id": LONGCAT_PUBLIC_ID,
-            "display_name": "LongCat 2.0 (subagents)",
-            "type": "model",
-        }
+        {"id": alias, "display_name": f"Brigade {role.title()}", "type": "model"}
+        for alias, role in ROLE_MODEL_ALIASES.items()
     ]
     for m in _PASSTHROUGH_MODELS:
         entries.append({"id": m["id"], "display_name": m["display_name"], "type": "model"})
@@ -358,7 +405,82 @@ async def messages(request: Request) -> Response:
         raise HTTPException(status_code=400, detail=f"invalid JSON: {exc}") from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("model"), str):
         raise HTTPException(status_code=400, detail="request requires a model")
+
+    model = payload["model"]
+
+    # Route role aliases through the Brigade state machine
+    if model in ROLE_MODEL_ALIASES:
+        resolved: ResolvedRoute = resolve_request(
+            public_model=model,
+            run_id=request.headers.get("x-brigade-run-id"),
+            claude_agent_id=request.headers.get("x-claude-code-agent-id"),
+        )
+        # Strip internal Brigade headers before forwarding
+        headers = dict(request.headers)
+        sanitized = sanitize_upstream_headers(headers)
+        # For now, direct-anthropic is the only implemented backend
+        if resolved.kind == BackendType.DIRECT_ANTHROPIC and resolved.upstream_model:
+            payload["model"] = resolved.upstream_model
+            if _is_longcat(resolved.upstream_model):
+                payload = normalize_longcat_payload(payload)
+            return await _proxy_route(request, payload, resolved.upstream_model)
+        elif resolved.kind == BackendType.ANTHROPIC_PASSTHROUGH:
+            return await _proxy(request, payload, "/v1/messages")
+        # LITELLM handled in Phase 4 — falls through to standard proxy for now
+        return await _proxy(request, payload, "/v1/messages")
+
+    # Legacy LongCat model check (backward compat)
+    if _is_longcat(model):
+        return await _proxy(request, payload, "/v1/messages")
+
+    # Standard Anthropic passthrough
     return await _proxy(request, payload, "/v1/messages")
+
+
+async def _proxy_route(request: Request, payload: dict[str, Any], upstream_model: str) -> Response:
+    """Route to a specific upstream with internal header stripping."""
+    # This is a simplified proxy path for Brigade-routed requests
+    upstream_url = LONGCAT_UPSTREAM if _is_longcat(upstream_model) else ANTHROPIC_UPSTREAM
+    headers = _copy_request_headers(request, longcat=_is_longcat(upstream_model))
+    query = request.url.query
+    url = f"{upstream_url}/v1/messages" + (f"?{query}" if query else "")
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    is_streaming = bool(payload.get("stream"))
+
+    client: httpx.AsyncClient = request.app.state.client
+
+    for attempt in range(_MAX_RETRIES):
+        started = time.monotonic()
+        try:
+            upstream_request = client.build_request(request.method, url, headers=headers, content=body)
+            upstream_response = await client.send(upstream_request, stream=True)
+        except httpx.HTTPError as exc:
+            if attempt < _MAX_RETRIES - 1:
+                await asyncio.sleep(_RETRY_BASE_DELAY * (2 ** attempt))
+                continue
+            return JSONResponse(
+                status_code=502,
+                content={"error": {"type": "upstream_connection_error", "message": str(exc)}},
+            )
+
+        status = upstream_response.status_code
+        if status in _RETRYABLE_STATUSES and attempt < _MAX_RETRIES - 1:
+            await upstream_response.aclose()
+            await asyncio.sleep(_RETRY_BASE_DELAY * (2 ** attempt))
+            continue
+
+        response_headers = _copy_response_headers(upstream_response.headers)
+        if is_streaming:
+            return StreamingResponse(
+                _stream_upstream(upstream_response),
+                status_code=status,
+                headers=response_headers,
+            )
+        content = await upstream_response.aread()
+        await upstream_response.aclose()
+        return Response(content=content, status_code=status, headers=response_headers)
+
+    return JSONResponse(status_code=502, content={"error": {"type": "upstream_connection_error", "message": "max retries exceeded"}})
 
 
 @app.post("/v1/messages/count_tokens")
@@ -370,7 +492,22 @@ async def count_tokens(request: Request) -> Response:
         raise HTTPException(status_code=400, detail=f"invalid JSON: {exc}") from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("model"), str):
         raise HTTPException(status_code=400, detail="request requires a model")
-    if _is_longcat(payload.get("model")):
+    model = payload["model"]
+
+    # Role aliases — local estimation only
+    if model in ROLE_MODEL_ALIASES:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "type": "not_found_error",
+                    "message": "Token counting for Brigade role aliases is unavailable; Claude Code should estimate locally",
+                }
+            },
+        )
+
+    # LongCat — also unavailable
+    if _is_longcat(model):
         return JSONResponse(
             status_code=404,
             content={
@@ -380,4 +517,5 @@ async def count_tokens(request: Request) -> Response:
                 }
             },
         )
+
     return await _proxy(request, payload, "/v1/messages/count_tokens")

@@ -1,0 +1,110 @@
+"""ASGI auth middleware for the ClaudeBrigade MCP control server."""
+
+from __future__ import annotations
+
+import hmac
+import logging
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+from enhanced_router.mcp_control import set_current_run_id
+from enhanced_router.state import RouteState
+
+LOGGER = logging.getLogger("claude-enhanced-router")
+
+# The token is loaded at call time from the environment
+ROUTER_TOKEN: str | None = None
+
+
+def _get_token() -> str:
+    global ROUTER_TOKEN
+    if ROUTER_TOKEN is None:
+        ROUTER_TOKEN = __import__("os").environ.get("ENHANCED_ROUTER_TOKEN", "")
+    return ROUTER_TOKEN
+
+
+def authenticated_mcp_app(
+    inner_app: Callable[..., Awaitable[Any]],
+    state: RouteState,
+) -> Callable[..., Awaitable[Any]]:
+    """Wrap the MCP app with request-level authentication.
+
+    Requirements (in order):
+    1. Loopback source IP
+    2. X-Enhanced-Token matches router token (constant-time comparison)
+    3. X-Brigade-Run-Id header present and run exists in DB
+    """
+
+    async def auth_wrapper(scope: dict, receive: Callable, send: Callable) -> None:
+        if scope["type"] != "http":
+            await inner_app(scope, receive, send)
+            return
+
+        # Extract headers
+        headers = dict(scope.get("headers", []))
+
+        def _h(name: str) -> str | None:
+            val = headers.get(name.lower().encode())
+            return val.decode() if val else None
+
+        # 1. Loopback check
+        client_addr = scope.get("client")
+        if client_addr:
+            host = client_addr[0]
+            if host not in ("127.0.0.1", "::1", "localhost"):
+                await _send_error(send, 403, "loopback access only")
+                return
+
+        token = _get_token()
+        provided_token = _h("x-enhanced-token")
+
+        # 2. Token validation
+        if token:
+            if not provided_token:
+                await _send_error(send, 401, "missing x-enhanced-token")
+                return
+            if not hmac.compare_digest(provided_token, token):
+                await _send_error(send, 401, "invalid router token")
+                return
+
+        # 3. Run ID validation
+        run_id = _h("x-brigade-run-id")
+        if not run_id:
+            await _send_error(send, 400, "missing x-brigade-run-id header")
+            return
+
+        run = state.get_run(run_id)
+        if run is None:
+            await _send_error(send, 404, f"run {run_id} not found")
+            return
+        if run.get("closed_at"):
+            await _send_error(send, 410, f"run {run_id} is closed")
+            return
+
+        # Store run_id in context var for tools
+        set_current_run_id(run_id)
+
+        try:
+            await inner_app(scope, receive, send)
+        finally:
+            set_current_run_id(None)
+
+    return auth_wrapper
+
+
+async def _send_error(send: Callable, status: int, detail: str) -> None:
+    """Send an error response via ASGI send."""
+    body = __import__("json").dumps(
+        {"error": detail}, separators=(",", ":")
+    ).encode("utf-8")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})

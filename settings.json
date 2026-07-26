@@ -4,7 +4,8 @@
   "env": {
     "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
     "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
-    "CLAUDE_CODE_FORK_SUBAGENT": "0"
+    "CLAUDE_CODE_FORK_SUBAGENT": "0",
+    "ENABLE_TOOL_SEARCH": "true"
   },
   "permissions": {
     "allow": [
@@ -36,6 +37,16 @@
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_CONFIG_DIR/hooks/session_start.py\""
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_CONFIG_DIR/hooks/user_prompt_submit.py\""
           }
         ]
       }
@@ -99,6 +110,16 @@
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_CONFIG_DIR/hooks/completion_guard.py\""
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_CONFIG_DIR/hooks/session_end.py\""
           }
         ]
       }

@@ -150,8 +150,33 @@ AGENTS_JSON="$(
   PYTHONPATH="$APP_DIR/router"     "$APP_DIR/venv/bin/python" -m enhanced_router.agents_json "$PROFILE_DIR/agents"
 )"
 
+# Write MCP config to a temp file with restricted permissions
+# so the router token never appears on the command line.
+MCP_CONFIG_JSON="$(mktemp /tmp/claude-brigade-mcp-XXXXXX.json 2>/dev/null || echo "$CACHE_DIR/mcp-config.json")"
+chmod 600 "$MCP_CONFIG_JSON" 2>/dev/null || true
+python3 - "$ROUTER_TOKEN" "$RUN_ID" "$PORT" "$MCP_CONFIG_JSON" <<'PY'
+import json, sys
+token, run_id, port, path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+config = {
+    "mcpServers": {
+        "claude-brigade": {
+            "type": "http",
+            "url": f"http://127.0.0.1:{port}/mcp",
+            "headers": {
+                "X-Enhanced-Token": token,
+                "X-Brigade-Run-Id": run_id,
+            },
+        }
+    }
+}
+with open(path, 'w') as f:
+    json.dump(config, f, separators=(',', ':'))
+PY
+trap "rm -f '$MCP_CONFIG_JSON'" EXIT INT TERM
+
 exec claude \
   --settings "$SESSION_SETTINGS_JSON" \
   --agents "$AGENTS_JSON" \
+  --mcp-config "$MCP_CONFIG_JSON" \
   --append-system-prompt-file "$PROFILE_DIR/controller-append.md" \
   "$@"

@@ -86,16 +86,21 @@ def test_router_healthz_and_models_endpoints(monkeypatch):
     # Request with valid token should succeed
     resp = client.get("/healthz", headers={"x-enhanced-token": "test-token"})
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+    data = resp.json()
+    assert data["status"] == "ok"  # healthz now returns richer data
 
     # Models endpoint with token
     resp = client.get("/v1/models", headers={"x-enhanced-token": "test-token"})
     assert resp.status_code == 200
     models = resp.json()["data"]
     ids = {model["id"] for model in models}
-    
+
     assert "claude-sonnet-5" in ids
-    assert "anthropic-longcat-2-0" in ids
+    # Role aliases should be advertised instead of LongCat ID
+    assert "anthropic-brigade-recon" in ids
+    assert "anthropic-brigade-implementer" in ids
+    assert "anthropic-brigade-adversary" in ids
+    assert "anthropic-brigade-repairer" in ids
     assert not any(model_id.endswith("[1m]") for model_id in ids)
 
 
