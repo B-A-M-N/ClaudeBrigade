@@ -116,7 +116,13 @@ def resolve_request(
             role=role,
             model_id=model_id,
             upstream_model=spec.upstream_model or spec.litellm_model,
+            api_base=spec.api_base,
             agent_binding_id=existing["binding_id"],
+            route_version=existing.get("route_version"),
+            registry_hash=registry.registry_hash(),
+            catalog_generation=existing.get("catalog_generation"),
+            litellm_model_name=existing.get("litellm_model_name"),
+            litellm_base_url=spec.api_base,
         )
 
     # No existing binding — resolve current epoch route
@@ -159,15 +165,23 @@ def resolve_request(
 
     kind = _backend_kind(spec.backend)
     upstream_model = spec.upstream_model or spec.litellm_model
+    route_version = route["version"]
+    reg_hash = registry.registry_hash()
 
-    # Create immutable binding
+    # Create immutable binding with all pinning fields
     binding_id = state.bind_agent(
         run_id=run_id,
         claude_agent_id=claude_agent_id,
         epoch_id=epoch_id,
         role=role,
         model_id=model_id,
-        route_version=route["version"],
+        route_version=route_version,
+        backend=spec.backend,
+        registry_hash=reg_hash,
+        catalog_generation=None,
+        litellm_model_name=spec.litellm_model,
+        upstream_model=spec.upstream_model,
+        api_base=spec.api_base,
     )
 
     return ResolvedRoute(
@@ -175,7 +189,13 @@ def resolve_request(
         role=role,
         model_id=model_id,
         upstream_model=upstream_model,
+        api_base=spec.api_base,
         agent_binding_id=binding_id,
+        route_version=route_version,
+        registry_hash=reg_hash,
+        catalog_generation=None,
+        litellm_model_name=spec.litellm_model,
+        litellm_base_url=spec.api_base,
     )
 
 

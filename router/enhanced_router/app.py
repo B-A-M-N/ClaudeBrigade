@@ -19,6 +19,7 @@ from enhanced_router.backends import (
     ResolvedRoute,
     ROLE_MODEL_ALIASES,
     sanitize_upstream_headers,
+    proxy_litellm_messages as _proxy_litellm_messages_backend,
 )
 from enhanced_router.mcp_control import control_mcp
 from enhanced_router.mcp_transport import authenticated_mcp_app
@@ -477,51 +478,11 @@ async def _proxy_litellm(
 ) -> Response:
     """Proxy a request through the internal LiteLLM child process.
 
-    The role alias model ID has already been replaced with the Litellm
-    model-group name (``brigade-{model_id}``) in the app dispatch path.
+    Delegates to backends.proxy_litellm_messages(). The role alias model ID
+    has already been replaced with the LiteLLM model-group name in the
+    resolve_request path.
     """
-    litellm_base = os.getenv("LITELLM_BASE_URL", "http://127.0.0.1:18000")
-    query = request.url.query
-    url = f"{litellm_base}/v1/messages" + (f"?{query}" if query else "")
-    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    is_streaming = bool(payload.get("stream"))
-
-    client: httpx.AsyncClient = request.app.state.client
-
-    for attempt in range(_MAX_RETRIES):
-        try:
-            upstream_request = client.build_request(request.method, url, headers=headers, content=body)
-            upstream_response = await client.send(upstream_request, stream=True)
-        except httpx.HTTPError as exc:
-            if attempt < _MAX_RETRIES - 1:
-                await asyncio.sleep(_RETRY_BASE_DELAY * (2**attempt))
-                continue
-            return JSONResponse(
-                status_code=502,
-                content={"error": {"type": "litellm_connection_error", "message": str(exc)}},
-            )
-
-        status = upstream_response.status_code
-        if status in _RETRYABLE_STATUSES and attempt < _MAX_RETRIES - 1:
-            await upstream_response.aclose()
-            await asyncio.sleep(_RETRY_BASE_DELAY * (2**attempt))
-            continue
-
-        response_headers = _copy_response_headers(upstream_response.headers)
-        if is_streaming:
-            return StreamingResponse(
-                _stream_upstream(upstream_response),
-                status_code=status,
-                headers=response_headers,
-            )
-        content = await upstream_response.aread()
-        await upstream_response.aclose()
-        return Response(content=content, status_code=status, headers=response_headers)
-
-    return JSONResponse(
-        status_code=502,
-        content={"error": {"type": "litellm_connection_error", "message": "max retries exceeded"}},
-    )
+    return await _proxy_litellm_messages_backend(request, payload, resolved)
 
 
 @app.post("/v1/messages/count_tokens")

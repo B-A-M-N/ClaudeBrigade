@@ -14,7 +14,7 @@ from enhanced_router.base import DEFAULT_DB_PATH
 
 logger = logging.getLogger("claude-enhanced-router")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _VALID_ROLES = frozenset(("recon", "implementer", "adversary", "repairer"))
 
@@ -110,11 +110,26 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     if current < 1:
         _migrate_v1(conn)
         conn.execute("PRAGMA user_version = 1")
+    if current < 2:
+        _migrate_v2(conn)
+        conn.execute("PRAGMA user_version = 2")
 
 
 def _migrate_v1(conn: sqlite3.Connection) -> None:
     conn.executescript(_TABLES_DDL)
     conn.executescript(_INDEXES_DDL)
+
+
+def _migrate_v2(conn: sqlite3.Connection) -> None:
+    """Add binding pinning columns for immutable deployment targets."""
+    conn.executescript("""
+        ALTER TABLE agent_bindings ADD COLUMN backend TEXT;
+        ALTER TABLE agent_bindings ADD COLUMN registry_hash TEXT;
+        ALTER TABLE agent_bindings ADD COLUMN catalog_generation INTEGER;
+        ALTER TABLE agent_bindings ADD COLUMN litellm_model_name TEXT;
+        ALTER TABLE agent_bindings ADD COLUMN upstream_model TEXT;
+        ALTER TABLE agent_bindings ADD COLUMN api_base TEXT;
+    """)
 
 
 # ------------------------------------------------------------------ RouteState
@@ -443,7 +458,21 @@ class RouteState:
 
     # ---- Binding operations ----------------------------------------
 
-    def bind_agent(self, run_id: str, claude_agent_id: str, epoch_id: str, role: str, model_id: str, route_version: int) -> int:
+    def bind_agent(
+        self,
+        run_id: str,
+        claude_agent_id: str,
+        epoch_id: str,
+        role: str,
+        model_id: str,
+        route_version: int,
+        backend: str | None = None,
+        registry_hash: str | None = None,
+        catalog_generation: int | None = None,
+        litellm_model_name: str | None = None,
+        upstream_model: str | None = None,
+        api_base: str | None = None,
+    ) -> int:
         """Create binding row. Raises ValueError if active binding exists. Returns binding_id."""
         conn = self._new_conn()
         try:
@@ -459,9 +488,14 @@ class RouteState:
             conn.execute("BEGIN IMMEDIATE")
             now = _utcnow()
             cursor = conn.execute(
-                "INSERT INTO agent_bindings (run_id, claude_agent_id, epoch_id, role, model_id, route_version, bound_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (run_id, claude_agent_id, epoch_id, role, model_id, route_version, now),
+                "INSERT INTO agent_bindings "
+                "(run_id, claude_agent_id, epoch_id, role, model_id, route_version, bound_at, "
+                " backend, registry_hash, catalog_generation, litellm_model_name, upstream_model, api_base) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id, claude_agent_id, epoch_id, role, model_id, route_version, now,
+                    backend, registry_hash, catalog_generation, litellm_model_name, upstream_model, api_base,
+                ),
             )
             binding_id: int = cursor.lastrowid  # type: ignore[assignment]
             conn.commit()
@@ -474,14 +508,18 @@ class RouteState:
         conn = self._new_conn()
         try:
             row = conn.execute(
-                "SELECT binding_id, run_id, claude_agent_id, epoch_id, role, model_id, route_version, bound_at, released_at "
+                "SELECT binding_id, run_id, claude_agent_id, epoch_id, role, model_id, "
+                "route_version, bound_at, released_at, backend, registry_hash, "
+                "catalog_generation, litellm_model_name, upstream_model, api_base "
                 "FROM agent_bindings WHERE run_id = ? AND claude_agent_id = ? AND released_at IS NULL",
                 (run_id, claude_agent_id),
             ).fetchone()
             if row is None:
                 return None
             return dict(zip(
-                ("binding_id", "run_id", "claude_agent_id", "epoch_id", "role", "model_id", "route_version", "bound_at", "released_at"),
+                ("binding_id", "run_id", "claude_agent_id", "epoch_id", "role", "model_id",
+                 "route_version", "bound_at", "released_at", "backend", "registry_hash",
+                 "catalog_generation", "litellm_model_name", "upstream_model", "api_base"),
                 row,
             ))
         finally:
@@ -505,19 +543,25 @@ class RouteState:
         try:
             if epoch_id:
                 rows = conn.execute(
-                    "SELECT binding_id, run_id, claude_agent_id, epoch_id, role, model_id, route_version, bound_at, released_at "
+                    "SELECT binding_id, run_id, claude_agent_id, epoch_id, role, model_id, "
+                    "route_version, bound_at, released_at, backend, registry_hash, "
+                    "catalog_generation, litellm_model_name, upstream_model, api_base "
                     "FROM agent_bindings WHERE run_id = ? AND epoch_id = ? AND released_at IS NULL",
                     (run_id, epoch_id),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT binding_id, run_id, claude_agent_id, epoch_id, role, model_id, route_version, bound_at, released_at "
+                    "SELECT binding_id, run_id, claude_agent_id, epoch_id, role, model_id, "
+                    "route_version, bound_at, released_at, backend, registry_hash, "
+                    "catalog_generation, litellm_model_name, upstream_model, api_base "
                     "FROM agent_bindings WHERE run_id = ? AND released_at IS NULL",
                     (run_id,),
                 ).fetchall()
             return [
                 dict(zip(
-                    ("binding_id", "run_id", "claude_agent_id", "epoch_id", "role", "model_id", "route_version", "bound_at", "released_at"),
+                    ("binding_id", "run_id", "claude_agent_id", "epoch_id", "role", "model_id",
+                     "route_version", "bound_at", "released_at", "backend", "registry_hash",
+                     "catalog_generation", "litellm_model_name", "upstream_model", "api_base"),
                     row,
                 ))
                 for row in rows

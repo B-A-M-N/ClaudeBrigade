@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -15,7 +15,7 @@ class BackendType(Enum):
     LITELLM = "litellm"
 
 
-@dataclass
+@dataclass(frozen=True)
 class ResolvedRoute:
     """Resolved routing decision for an incoming request."""
 
@@ -23,7 +23,13 @@ class ResolvedRoute:
     role: str | None = None
     model_id: str | None = None
     upstream_model: str | None = None
+    api_base: str | None = None
     agent_binding_id: int | None = None
+    route_version: int | None = None
+    registry_hash: str | None = None
+    catalog_generation: int | None = None
+    litellm_model_name: str | None = None
+    litellm_base_url: str | None = None
 
 
 # Maps the public-facing model aliases to internal role strings.
@@ -90,16 +96,20 @@ async def proxy_anthropic_passthrough(
 async def proxy_direct_anthropic(
     request: Any,
     payload: dict[str, Any],
-    upstream_model: str,
+    resolved: "ResolvedRoute",
 ) -> Any:
-    """Route to a direct-anthropic backend (e.g. LongCat)."""
+    """Route worker traffic to a direct Anthropic-compatible backend (e.g. LongCat).
+
+    Uses *resolved.upstream_model* as the target model and
+    *resolved.api_base* or env vars for the endpoint.
+    """
     raise NotImplementedError
 
 
 async def proxy_litellm_messages(
     request: Any,
     payload: dict[str, Any],
-    resolved: ResolvedRoute,
+    resolved: "ResolvedRoute",
 ) -> Any:
     """Forward through a LiteLLM proxy instance."""
     raise NotImplementedError

@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from workspace_fingerprint import fingerprint
 
-MUTATORS = {"longcat-implementer", "longcat-repairer", "sonnet-direct"}
+MUTATORS = {"brigade-implementer", "brigade-repairer", "sonnet-direct"}
 MUTATING_BASH = re.compile(
     r"(?:^|[;&|]\s*)(?:rm|mv|cp|touch|mkdir|rmdir|truncate|install|patch|dd|ln)\b"
     r"|(?:^|\s)(?:sed\s+-i|perl\s+-pi|tee\b)"
