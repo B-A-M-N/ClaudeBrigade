@@ -284,3 +284,42 @@ class ModelRegistry:
     @property
     def workflows(self) -> dict[str, dict[str, Any]]:
         return self._workflows
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton
+# ---------------------------------------------------------------------------
+
+_registry_instance: ModelRegistry | None = None
+
+
+def get_registry() -> ModelRegistry:
+    """Return the module-level ModelRegistry singleton, initializing it if needed.
+
+    Uses ``BRIGADE_CONFIG_DIR`` from the environment. Falls back to ``config/``
+    relative to the repository root for development mode.
+    """
+    global _registry_instance
+    if _registry_instance is None:
+        from enhanced_router.base import BRIGADE_CONFIG_DIR
+
+        cfg = BRIGADE_CONFIG_DIR
+        # In development: fall back to repo-relative config/
+        if not cfg.is_dir() or not any(cfg.glob("*.yaml")):
+            import pathlib
+
+            pkg_dir = pathlib.Path(__file__).resolve().parent.parent.parent
+            repo_config = pkg_dir / "config"
+            if repo_config.is_dir():
+                cfg = repo_config
+            else:
+                raise RuntimeError(
+                    f"No config directory found at {BRIGADE_CONFIG_DIR} or {repo_config}. "
+                    "Set BRIGADE_CONFIG_DIR or run from the repository root."
+                )
+
+        _registry_instance = ModelRegistry(cfg)
+        _registry_instance.load_models()
+        _registry_instance.load_profiles()
+        _registry_instance.load_workflows()
+    return _registry_instance

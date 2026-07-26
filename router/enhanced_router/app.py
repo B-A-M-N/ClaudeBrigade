@@ -211,9 +211,10 @@ def normalize_longcat_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 def _copy_request_headers(request: Request, *, longcat: bool) -> dict[str, str]:
     headers: dict[str, str] = {}
+    BANNED = frozenset({"x-enhanced-token", "x-brigade-run-id"})
     for key, value in request.headers.items():
         lower = key.lower()
-        if lower in HOP_BY_HOP or lower == "x-enhanced-token":
+        if lower in HOP_BY_HOP or lower in BANNED:
             continue
         if longcat:
             if lower in {"authorization", "x-api-key", "anthropic-beta"}:
@@ -408,28 +409,59 @@ async def messages(request: Request) -> Response:
 
     model = payload["model"]
 
-    # Route role aliases through the Brigade state machine
+    # Never forward a role alias upstream unchanged
     if model in ROLE_MODEL_ALIASES:
         resolved: ResolvedRoute = resolve_request(
             public_model=model,
             run_id=request.headers.get("x-brigade-run-id"),
             claude_agent_id=request.headers.get("x-claude-code-agent-id"),
         )
-        # Strip internal Brigade headers before forwarding
-        headers = dict(request.headers)
-        sanitized = sanitize_upstream_headers(headers)
-        # For now, direct-anthropic is the only implemented backend
-        if resolved.kind == BackendType.DIRECT_ANTHROPIC and resolved.upstream_model:
-            payload["model"] = resolved.upstream_model
-            if _is_longcat(resolved.upstream_model):
-                payload = normalize_longcat_payload(payload)
-            return await _proxy_route(request, payload, resolved.upstream_model)
-        elif resolved.kind == BackendType.ANTHROPIC_PASSTHROUGH:
-            return await _proxy(request, payload, "/v1/messages")
-        # LITELLM handled in Phase 4 — falls through to standard proxy for now
-        return await _proxy(request, payload, "/v1/messages")
 
-    # Legacy LongCat model check (backward compat)
+        # Build headers once, strip internal Brigade fields
+        raw_headers = {k: v for k, v in request.headers.items()}
+        clean_headers = sanitize_upstream_headers(raw_headers)
+
+        match resolved.kind:
+            case BackendType.ANTHROPIC_PASSTHROUGH:
+                # A role alias resolving to passthrough is an internal error
+                # unless the route explicitly targets an Anthropic API model.
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"Role alias '{model}' resolved to unexpected passthrough "
+                        f"for model '{resolved.model_id}'. Ensure the model is "
+                        "properly configured in models.yaml."
+                    ),
+                )
+
+            case BackendType.DIRECT_ANTHROPIC:
+                if not resolved.upstream_model:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"DIRECT_ANTHROPIC route for {model} has no upstream_model.",
+                    )
+                payload["model"] = resolved.upstream_model
+                if _is_longcat(resolved.upstream_model):
+                    payload = normalize_longcat_payload(payload)
+                return await _proxy(request, payload, "/v1/messages")
+
+            case BackendType.LITELLM:
+                if not resolved.upstream_model:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"LITELLM route for {model} has no upstream_model.",
+                    )
+                payload["model"] = resolved.upstream_model
+                # LiteLLM backend — uses sanitized headers, not _copy_request_headers
+                return await _proxy_litellm(request, payload, resolved, clean_headers)
+
+            case _:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Unhandled backend kind: {resolved.kind}",
+                )
+
+    # Legacy LongCat direct model check
     if _is_longcat(model):
         return await _proxy(request, payload, "/v1/messages")
 
@@ -437,36 +469,42 @@ async def messages(request: Request) -> Response:
     return await _proxy(request, payload, "/v1/messages")
 
 
-async def _proxy_route(request: Request, payload: dict[str, Any], upstream_model: str) -> Response:
-    """Route to a specific upstream with internal header stripping."""
-    # This is a simplified proxy path for Brigade-routed requests
-    upstream_url = LONGCAT_UPSTREAM if _is_longcat(upstream_model) else ANTHROPIC_UPSTREAM
-    headers = _copy_request_headers(request, longcat=_is_longcat(upstream_model))
+async def _proxy_litellm(
+    request: Request,
+    payload: dict[str, Any],
+    resolved: ResolvedRoute,
+    headers: dict[str, str],
+) -> Response:
+    """Proxy a request through the internal LiteLLM child process.
+
+    The role alias model ID has already been replaced with the Litellm
+    model-group name (``brigade-{model_id}``) in the app dispatch path.
+    """
+    litellm_base = os.getenv("LITELLM_BASE_URL", "http://127.0.0.1:18000")
     query = request.url.query
-    url = f"{upstream_url}/v1/messages" + (f"?{query}" if query else "")
+    url = f"{litellm_base}/v1/messages" + (f"?{query}" if query else "")
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     is_streaming = bool(payload.get("stream"))
 
     client: httpx.AsyncClient = request.app.state.client
 
     for attempt in range(_MAX_RETRIES):
-        started = time.monotonic()
         try:
             upstream_request = client.build_request(request.method, url, headers=headers, content=body)
             upstream_response = await client.send(upstream_request, stream=True)
         except httpx.HTTPError as exc:
             if attempt < _MAX_RETRIES - 1:
-                await asyncio.sleep(_RETRY_BASE_DELAY * (2 ** attempt))
+                await asyncio.sleep(_RETRY_BASE_DELAY * (2**attempt))
                 continue
             return JSONResponse(
                 status_code=502,
-                content={"error": {"type": "upstream_connection_error", "message": str(exc)}},
+                content={"error": {"type": "litellm_connection_error", "message": str(exc)}},
             )
 
         status = upstream_response.status_code
         if status in _RETRYABLE_STATUSES and attempt < _MAX_RETRIES - 1:
             await upstream_response.aclose()
-            await asyncio.sleep(_RETRY_BASE_DELAY * (2 ** attempt))
+            await asyncio.sleep(_RETRY_BASE_DELAY * (2**attempt))
             continue
 
         response_headers = _copy_response_headers(upstream_response.headers)
@@ -480,7 +518,10 @@ async def _proxy_route(request: Request, payload: dict[str, Any], upstream_model
         await upstream_response.aclose()
         return Response(content=content, status_code=status, headers=response_headers)
 
-    return JSONResponse(status_code=502, content={"error": {"type": "upstream_connection_error", "message": "max retries exceeded"}})
+    return JSONResponse(
+        status_code=502,
+        content={"error": {"type": "litellm_connection_error", "message": "max retries exceeded"}},
+    )
 
 
 @app.post("/v1/messages/count_tokens")

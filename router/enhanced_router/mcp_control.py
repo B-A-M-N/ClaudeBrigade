@@ -26,10 +26,10 @@ control_mcp = FastMCP(
 # ---------------------------------------------------------------------------
 
 
-def _sanitize_model(spec: ModelSpec) -> dict[str, Any]:
+def _sanitize_model(model_id: str, spec: ModelSpec) -> dict[str, Any]:
     """Return a safe subset of model metadata with no backend configuration."""
     return {
-        "model_id": spec.display_name,
+        "model_id": model_id,
         "display_name": spec.display_name,
         "capabilities": {
             "tools": spec.capabilities.tools,
@@ -58,10 +58,10 @@ async def list_models(
     if role:
         candidates = registry.models_for_role(role)
         for mid, spec in candidates:
-            results.append(_sanitize_model(spec))
+            results.append(_sanitize_model(mid, spec))
     else:
         for mid, spec in registry.models.items():
-            results.append(_sanitize_model(spec))
+            results.append(_sanitize_model(mid, spec))
 
     return results
 
@@ -259,6 +259,11 @@ def _get_current_run_id() -> str | None:
 
 
 def set_current_run_id(run_id: str | None) -> None:
-    """Set the run ID for the current request context."""
+    """Set the run ID for the current request context.
+
+    If *run_id* is ``None``, the context variable is reset to its default.
+    """
     if run_id is not None:
         _brigade_run_id_var.set(run_id)
+    else:
+        _brigade_run_id_var.set(None)

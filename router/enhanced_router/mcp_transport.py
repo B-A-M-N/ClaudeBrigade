@@ -7,7 +7,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from enhanced_router.mcp_control import set_current_run_id
+from enhanced_router.mcp_control import _brigade_run_id_var
 from enhanced_router.state import RouteState
 
 LOGGER = logging.getLogger("claude-enhanced-router")
@@ -81,13 +81,13 @@ def authenticated_mcp_app(
             await _send_error(send, 410, f"run {run_id} is closed")
             return
 
-        # Store run_id in context var for tools
-        set_current_run_id(run_id)
+        # Store run_id in context var for tools — use token-based reset
+        token = _brigade_run_id_var.set(run_id)
 
         try:
             await inner_app(scope, receive, send)
         finally:
-            set_current_run_id(None)
+            _brigade_run_id_var.reset(token)
 
     return auth_wrapper
 
