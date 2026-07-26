@@ -100,6 +100,16 @@ echo "$@"
     assert "--settings" in stdout
     assert expected_settings in stdout
 
+    # Launcher exports CLAUDE_BRIGADE_RUN_ID in its script
+    launcher = Path(__file__).resolve().parents[1] / "bin" / "claude-enhanced"
+    launcher_text = launcher.read_text()
+    assert "CLAUDE_BRIGADE_RUN_ID" in launcher_text
+
+    # Settings include CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY
+    root = Path(__file__).resolve().parents[1]
+    settings = json.loads((root / "settings.json").read_text(encoding="utf-8"))
+    assert settings.get("env", {}).get("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY") == "1"
+
 if __name__ == "__main__":
     import tempfile
     with tempfile.TemporaryDirectory() as td:

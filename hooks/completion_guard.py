@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 from collections import Counter
+from datetime import datetime, timezone
 
 # Explicitly anchor the import so this script works regardless of the working
 # directory from which Claude Code invokes it.
@@ -26,7 +27,7 @@ REQUIRED = {
     "Verification",
     "Verified-Workspace-SHA256",
 }
-IMPLEMENTATION_AGENTS = {"longcat-implementer", "longcat-repairer", "sonnet-direct"}
+IMPLEMENTATION_AGENTS = {"brigade-implementer", "brigade-repairer", "sonnet-direct"}
 
 
 def block(reason: str) -> None:
@@ -113,12 +114,12 @@ def validate_ledger_sequence(parsed: dict[str, str], session_dir: pathlib.Path, 
 
     if tier == "trivial" and implementation_agent != "sonnet-direct":
         return "Trivial tier must use the controlled sonnet-direct mutation path"
-    if tier in {"normal", "cross-cutting", "high-risk"} and implementation_agent == "longcat-repairer":
-        if completed["longcat-implementer"] < 1:
+    if tier in {"normal", "cross-cutting", "high-risk"} and implementation_agent == "brigade-repairer":
+        if completed["brigade-implementer"] < 1:
             return "A repairer cannot be the only implementation lifecycle; initial implementer evidence is missing"
 
-    if tier in {"cross-cutting", "high-risk"} and completed["longcat-recon"] < 1:
-        return f"{tier} work requires a completed longcat-recon lifecycle"
+    if tier in {"cross-cutting", "high-risk"} and completed["brigade-recon"] < 1:
+        return f"{tier} work requires a completed brigade-recon lifecycle"
 
     # Read events from the active epoch only
     ledger_events = read_epoch_ledger(session_dir, active_epoch_id)
@@ -150,32 +151,32 @@ def validate_ledger_sequence(parsed: dict[str, str], session_dir: pathlib.Path, 
             if status not in {"completed", "success"}:
                 return f"Subagent {agent_type} outcome failed with status '{status}'; task cannot be accepted."
 
-            # Verify model resolution for LongCat vs Sonnet
-            if agent_type and agent_type.startswith("longcat-"):
-                if resolved_model and not any(k in resolved_model for k in ("longcat", "anthropic-longcat-2-0")):
-                    return f"Model resolution mismatch: {agent_type} resolved to '{resolved_model}' instead of LongCat."
+            # Verify model resolution for Brigade vs Sonnet
+            if agent_type and agent_type.startswith("brigade-"):
+                if resolved_model and not any(k in resolved_model for k in ("brigade", "anthropic-brigade-")):
+                    return f"Model resolution mismatch: {agent_type} resolved to '{resolved_model}' instead of Brigade."
             elif agent_type == "sonnet-direct":
                 if resolved_model and "sonnet" not in resolved_model:
                     return f"Model resolution mismatch: sonnet-direct resolved to '{resolved_model}' instead of Sonnet."
 
         elif ev_type == "SubagentStop":
-            if agent_type == "longcat-recon":
+            if agent_type == "brigade-recon":
                 recon_stops.append(idx)
-            elif agent_type == "longcat-adversary":
+            elif agent_type == "brigade-adversary":
                 if not impl_starts:
                     adv_design_stops.append(idx)
                 else:
                     adv_impl_stops.append(idx)
-            elif agent_type in {"longcat-repairer", "sonnet-direct"} and impl_starts:
+            elif agent_type in {"brigade-repairer", "sonnet-direct"} and impl_starts:
                 repair_stops.append(idx)
         elif ev_type == "SubagentStart":
-            if agent_type in {"longcat-implementer", "sonnet-direct"}:
+            if agent_type in {"brigade-implementer", "sonnet-direct"}:
                 impl_starts.append(idx)
 
     # 1. Recon phase sequence check
     if tier in {"cross-cutting", "high-risk"}:
         if not recon_stops or (impl_starts and recon_stops[0] > impl_starts[0]):
-            return "Sequence violation: longcat-recon must complete before implementation begins"
+            return "Sequence violation: brigade-recon must complete before implementation begins"
 
     # 2. Adversary phase sequence check
     if tier == "high-risk":
@@ -189,10 +190,10 @@ def validate_ledger_sequence(parsed: dict[str, str], session_dir: pathlib.Path, 
         if impl_starts and adv_impl_stops[-1] < impl_starts[0]:
             return "Sequence violation: adversarial review must review after implementation finishes"
 
-    # 3. Accepted findings repair validation (supports longcat-repairer and sonnet-direct)
+    # 3. Accepted findings repair validation (supports brigade-repairer and sonnet-direct)
     if parsed["Accepted-Findings"] == "resolved":
         if not repair_stops:
-            return "Accepted findings are marked resolved, but no repair lifecycle (longcat-repairer or sonnet-direct) is recorded after adversary review"
+            return "Accepted findings are marked resolved, but no repair lifecycle (brigade-repairer or sonnet-direct) is recorded after adversary review"
         if adv_impl_stops and repair_stops[-1] < adv_impl_stops[0]:
             return "Sequence violation: repair must execute after adversarial findings were reported"
 

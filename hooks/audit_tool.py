@@ -42,7 +42,7 @@ def record_ledger(session_dir: pathlib.Path, record: dict) -> None:
 
 def lookup_agent_type(session_dir: pathlib.Path, agent_id: str | None) -> str:
     if not agent_id:
-        return "enhanced-controller"
+        return "unknown"
     marker = session_dir / "active" / f"{agent_id}.json"
     try:
         return str(json.loads(marker.read_text(encoding="utf-8")).get("agent_type", "unknown"))

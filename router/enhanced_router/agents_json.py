@@ -77,8 +77,22 @@ def render_agents(directory: pathlib.Path) -> dict[str, dict[str, Any]]:
         if name in agents:
             raise ValueError(f"Duplicate agent name: {name}")
         agents[name] = definition
-    if "enhanced-controller" not in agents:
-        raise ValueError("enhanced-controller definition is missing")
+    REQUIRED_ROLES = {"brigade-recon", "brigade-implementer", "brigade-adversary", "brigade-repairer", "sonnet-direct"}
+    EXPECTED_MODELS = {
+        "brigade-recon": "anthropic-brigade-recon",
+        "brigade-implementer": "anthropic-brigade-implementer",
+        "brigade-adversary": "anthropic-brigade-adversary",
+        "brigade-repairer": "anthropic-brigade-repairer",
+    }
+    missing = REQUIRED_ROLES - set(agents.keys())
+    if missing:
+        raise ValueError(f"Missing required agent roles: {', '.join(sorted(missing))}")
+    for agent_name, expected_model in EXPECTED_MODELS.items():
+        actual_model = agents[agent_name].get("model", "")
+        if actual_model != expected_model:
+            raise ValueError(
+                f"Agent '{agent_name}' has model '{actual_model}' but expected '{expected_model}'"
+            )
     return agents
 
 

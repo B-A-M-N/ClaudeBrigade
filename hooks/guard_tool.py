@@ -7,8 +7,8 @@ import pathlib
 import re
 import sys
 
-MUTATORS = {"longcat-implementer", "longcat-repairer", "sonnet-direct"}
-ALLOWED_SUBAGENTS = {"longcat-recon", "longcat-implementer", "longcat-adversary", "longcat-repairer", "sonnet-direct"}
+MUTATORS = {"brigade-implementer", "brigade-repairer", "sonnet-direct"}
+ALLOWED_SUBAGENTS = {"brigade-recon", "brigade-implementer", "brigade-adversary", "brigade-repairer", "sonnet-direct"}
 
 MUTATING_BASH = re.compile(
     r"(?:^|[;&|]\s*)(?:rm|mv|cp|touch|mkdir|rmdir|truncate|install|patch|dd|ln)\b"
@@ -59,7 +59,7 @@ def record_ledger_event(session_id: str, event_type: str, details: dict) -> None
 def lookup_agent_type(data: dict) -> str:
     agent_id = data.get("agent_id")
     if not agent_id:
-        return "enhanced-controller"
+        return "unknown"
     cache = pathlib.Path(os.environ.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache")) / "claude-enhanced"
     marker = cache / "sessions" / str(data.get("session_id", "unknown")) / "active" / f"{agent_id}.json"
     try:

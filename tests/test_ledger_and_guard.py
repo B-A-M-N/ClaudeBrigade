@@ -48,7 +48,7 @@ def test_completion_guard_mutation_triggered_gate(tmp_path, monkeypatch):
     epoch_file.write_text("ep_123", encoding="utf-8")
 
     ledger_path = session_dir / "ledger.jsonl"
-    ledger_path.write_text(json.dumps({"event": "Mutation", "epoch_id": "ep_123", "tool": "Write", "agent_type": "longcat-implementer"}) + "\n")
+    ledger_path.write_text(json.dumps({"event": "Mutation", "epoch_id": "ep_123", "tool": "Write", "agent_type": "brigade-implementer"}) + "\n")
 
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / ".cache"))
 
@@ -77,11 +77,11 @@ def test_cross_cutting_requires_impl_adversary(tmp_path):
 
     # Sequence: Recon -> Impl (no adversary after impl)
     ledger_events = [
-        {"event": "SubagentStart", "epoch_id": active_epoch_id, "agent_type": "longcat-recon"},
-        {"event": "SubagentStop", "epoch_id": active_epoch_id, "agent_type": "longcat-recon"},
-        {"event": "SubagentStart", "epoch_id": active_epoch_id, "agent_type": "longcat-implementer"},
-        {"event": "Mutation", "epoch_id": active_epoch_id, "tool": "Write", "agent_type": "longcat-implementer"},
-        {"event": "SubagentStop", "epoch_id": active_epoch_id, "agent_type": "longcat-implementer"},
+        {"event": "SubagentStart", "epoch_id": active_epoch_id, "agent_type": "brigade-recon"},
+        {"event": "SubagentStop", "epoch_id": active_epoch_id, "agent_type": "brigade-recon"},
+        {"event": "SubagentStart", "epoch_id": active_epoch_id, "agent_type": "brigade-implementer"},
+        {"event": "Mutation", "epoch_id": active_epoch_id, "tool": "Write", "agent_type": "brigade-implementer"},
+        {"event": "SubagentStop", "epoch_id": active_epoch_id, "agent_type": "brigade-implementer"},
         {"event": "TestExecutionSuccess", "epoch_id": active_epoch_id, "command": "pytest", "exit_code": 0},
     ]
     with (session_dir / "ledger.jsonl").open("w") as f:
@@ -89,16 +89,16 @@ def test_cross_cutting_requires_impl_adversary(tmp_path):
             f.write(json.dumps(e) + "\n")
 
     records = [
-        {"event": "SubagentStart", "agent_id": "1", "agent_type": "longcat-recon"},
-        {"event": "SubagentStop", "agent_id": "1", "agent_type": "longcat-recon"},
-        {"event": "SubagentStart", "agent_id": "2", "agent_type": "longcat-implementer"},
-        {"event": "SubagentStop", "agent_id": "2", "agent_type": "longcat-implementer"},
+        {"event": "SubagentStart", "agent_id": "1", "agent_type": "brigade-recon"},
+        {"event": "SubagentStop", "agent_id": "1", "agent_type": "brigade-recon"},
+        {"event": "SubagentStart", "agent_id": "2", "agent_type": "brigade-implementer"},
+        {"event": "SubagentStop", "agent_id": "2", "agent_type": "brigade-implementer"},
     ]
     (session_dir / "agents.jsonl").write_text("\n".join(json.dumps(r) for r in records) + "\n")
 
     parsed = {
         "Workflow-Tier": "cross-cutting",
-        "Implementation-Agent": "longcat-implementer",
+        "Implementation-Agent": "brigade-implementer",
         "Sonnet-Diff-Review": "passed",
         "Adversarial-Review": "passed",
         "Accepted-Findings": "none",
@@ -117,23 +117,23 @@ def test_model_resolution_mismatch_is_rejected(tmp_path):
     active_epoch_id = "ep_model"
 
     ledger_events = [
-        {"event": "AgentResult", "epoch_id": active_epoch_id, "subagent_type": "longcat-implementer", "status": "completed", "resolved_model": "gpt-4-oops"},
-        {"event": "SubagentStart", "epoch_id": active_epoch_id, "agent_type": "longcat-implementer"},
-        {"event": "SubagentStop", "epoch_id": active_epoch_id, "agent_type": "longcat-implementer"},
+        {"event": "AgentResult", "epoch_id": active_epoch_id, "subagent_type": "brigade-implementer", "status": "completed", "resolved_model": "gpt-4-oops"},
+        {"event": "SubagentStart", "epoch_id": active_epoch_id, "agent_type": "brigade-implementer"},
+        {"event": "SubagentStop", "epoch_id": active_epoch_id, "agent_type": "brigade-implementer"},
     ]
     with (session_dir / "ledger.jsonl").open("w") as f:
         for e in ledger_events:
             f.write(json.dumps(e) + "\n")
 
     records = [
-        {"event": "SubagentStart", "agent_id": "1", "agent_type": "longcat-implementer"},
-        {"event": "SubagentStop", "agent_id": "1", "agent_type": "longcat-implementer"},
+        {"event": "SubagentStart", "agent_id": "1", "agent_type": "brigade-implementer"},
+        {"event": "SubagentStop", "agent_id": "1", "agent_type": "brigade-implementer"},
     ]
     (session_dir / "agents.jsonl").write_text("\n".join(json.dumps(r) for r in records) + "\n")
 
     parsed = {
         "Workflow-Tier": "normal",
-        "Implementation-Agent": "longcat-implementer",
+        "Implementation-Agent": "brigade-implementer",
         "Sonnet-Diff-Review": "passed",
         "Adversarial-Review": "not-required",
         "Accepted-Findings": "none",
