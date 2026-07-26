@@ -1,0 +1,25 @@
+models:
+  longcat-2:
+    display_name: LongCat 2.0
+    backend: direct-anthropic
+    upstream_model: LongCat-2.0
+    api_base_env: LONGCAT_API_BASE
+    api_key_env: LONGCAT_API_KEY
+    capabilities: {tools: true, mutation: true, context_tokens: 1000000, reasoning: high, local: false}
+    allowed_roles: [recon, implementer, adversary, repairer]
+
+  qwen-local:
+    display_name: Qwen Local
+    backend: litellm
+    litellm_model: ollama/qwen3-coder-next
+    api_base: http://127.0.0.1:11434
+    capabilities: {tools: true, mutation: true, context_tokens: 131072, reasoning: medium, local: true}
+    allowed_roles: [recon, implementer, repairer]
+
+  glm-review:
+    display_name: GLM Reviewer
+    backend: litellm
+    litellm_model: openrouter/vendor/model-id
+    api_key_env: OPENROUTER_API_KEY
+    capabilities: {tools: true, mutation: false, context_tokens: 200000, reasoning: high, local: false}
+    allowed_roles: [recon, adversary]

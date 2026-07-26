@@ -1,0 +1,18 @@
+profiles:
+  longcat:
+    recon: longcat-2
+    implementer: longcat-2
+    adversary: longcat-2
+    repairer: longcat-2
+
+  local-first:
+    recon: qwen-local
+    implementer: qwen-local
+    adversary: glm-review
+    repairer: qwen-local
+
+  hybrid:
+    recon: qwen-local
+    implementer: longcat-2
+    adversary: glm-review
+    repairer: longcat-2

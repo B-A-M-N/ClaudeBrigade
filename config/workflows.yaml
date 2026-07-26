@@ -1,0 +1,5 @@
+workflows:
+  normal: {default_profile: hybrid}
+  cross-cutting: {default_profile: hybrid}
+  high-risk: {default_profile: hybrid}
+  trivial: {default_profile: longcat}
