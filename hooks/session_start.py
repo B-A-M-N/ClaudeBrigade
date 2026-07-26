@@ -47,6 +47,35 @@ def main() -> int:
     epoch_file = session_dir / "active_epoch_id.txt"
     baseline_file = session_dir / "active_epoch_baseline.txt"
 
+    # --- Run / Epoch bootstrap via SQLite RouteState ----------------
+    run_id = os.environ.get("CLAUDE_BRIGADE_RUN_ID") or data.get("run_id")
+    if run_id:
+        try:
+            from enhanced_router.state import RouteState, get_state  # type: ignore
+        except ImportError:
+            pass  # package not installed yet, skip SQLite bootstrap
+        else:
+            state = get_state()
+            state.create_run(run_id, session, str(cwd))  # idempotent
+            active = state.get_active_epoch(run_id)
+            if active is None:
+                epoch_id = f"ep_{uuid.uuid4().hex[:12]}"
+                state.create_epoch_from_profile(
+                    run_id, epoch_id, "normal", "hybrid"
+                )
+                # Use the epoch_id just created for backward-compat file
+                epoch_file.write_text(epoch_id, encoding="utf-8")
+                if current_fp:
+                    baseline_file.write_text(current_fp, encoding="utf-8")
+                    record_ledger(session_dir, {
+                        "event": "EpochStart",
+                        "session_id": session,
+                        "epoch_id": epoch_id,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "baseline_fingerprint": current_fp,
+                        "source": source,
+                    })
+
     # Start a new epoch on startup or clear, or if no active epoch exists
     should_start_new_epoch = (
         source in {"startup", "clear"} or
