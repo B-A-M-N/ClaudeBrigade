@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+set -u
+
+PROFILE_DIR="${CLAUDE_ENHANCED_CONFIG_DIR:-$HOME/.claude-enhanced}"
+APP_DIR="${CLAUDE_ENHANCED_APP_DIR:-$HOME/.local/share/claude-enhanced}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-enhanced"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-enhanced"
+PORT_FILE="$CACHE_DIR/router.port"
+if [[ -n "${CLAUDE_ENHANCED_PORT:-}" ]]; then
+  PORT="$CLAUDE_ENHANCED_PORT"
+elif [[ -f "$PORT_FILE" ]]; then
+  PORT="$(cat "$PORT_FILE")"
+else
+  PORT="${CLAUDE_ENHANCED_PORT:-8787}"
+fi
+failed=0
+
+ok() { printf 'OK   %s\n' "$*"; }
+warn() { printf 'WARN %s\n' "$*"; }
+fail() { printf 'FAIL %s\n' "$*"; failed=1; }
+
+if command -v claude >/dev/null 2>&1; then
+  version="$(claude --version 2>/dev/null | head -n1)"
+  ok "Claude Code found: $version"
+else
+  fail "Claude Code is not on PATH"
+fi
+
+if [[ -x "$APP_DIR/venv/bin/python" ]]; then
+  if "$APP_DIR/venv/bin/python" -c "import fastapi, uvicorn, httpx, yaml" 2>/dev/null; then
+    ok "Router dependencies importable"
+  else
+    fail "Router dependencies missing or incomplete; run install.sh"
+  fi
+else
+  fail "Router virtual environment missing; run install.sh"
+fi
+
+for file in "$PROFILE_DIR/settings.json" "$PROFILE_DIR/agents/enhanced-controller.md" "$CONFIG_DIR/router.token" "$CONFIG_DIR/longcat.env"; do
+  if [[ -r "$file" ]]; then ok "$file"; else fail "Missing $file"; fi
+done
+
+if [[ -r "$CONFIG_DIR/longcat.env" ]]; then
+  if grep -q '^LONGCAT_API_KEY=.*replace_me' "$CONFIG_DIR/longcat.env" || ! grep -q '^LONGCAT_API_KEY=' "$CONFIG_DIR/longcat.env"; then
+    fail "LongCat API key is not configured"
+  else
+    mode="$(stat -c '%a' "$CONFIG_DIR/longcat.env" 2>/dev/null || true)"
+    [[ "$mode" == "600" ]] && ok "LongCat key file mode is 0600" || warn "LongCat key file mode is $mode; run chmod 600"
+  fi
+fi
+
+if command -v claude >/dev/null 2>&1; then
+  if env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY -u CLAUDE_CODE_OAUTH_TOKEN -u CLAUDE_CODE_USE_BEDROCK -u CLAUDE_CODE_USE_VERTEX -u CLAUDE_CODE_USE_FOUNDRY -u ANTHROPIC_MODEL \
+      CLAUDE_CONFIG_DIR="$PROFILE_DIR" claude auth status --text >/dev/null 2>&1; then
+    ok "Separate Claude profile is authenticated"
+  else
+    warn "Separate Claude profile is not authenticated; run claude-enhanced-login"
+  fi
+fi
+
+profile_base_url="$(
+  python3 - "$PROFILE_DIR/settings.json" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    print(data.get("env", {}).get("ANTHROPIC_BASE_URL", ""))
+except Exception:
+    print("")
+PY
+)"
+
+if [[ -n "$profile_base_url" ]]; then
+  fail "Profile hardcodes ANTHROPIC_BASE_URL=$profile_base_url; the launcher must own the dynamic router URL"
+fi
+
+if [[ -r "$CONFIG_DIR/router.token" ]] && curl -fsS \
+    -H "X-Enhanced-Token: $(cat "$CONFIG_DIR/router.token")" \
+    "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then
+  ok "Loopback router is healthy on 127.0.0.1:$PORT"
+  
+  models_json="$(
+    curl -fsS \
+      -H "X-Enhanced-Token: $(cat "$CONFIG_DIR/router.token")" \
+      "http://127.0.0.1:${PORT}/v1/models"
+  )" || models_json=""
+
+  if grep -q '"claude-sonnet-5"' <<<"$models_json" &&
+     grep -q '"anthropic-longcat-2-0"' <<<"$models_json"; then
+    ok "Expected Claude Enhanced models are advertised"
+  else
+    fail "Port $PORT is not serving the expected Claude Enhanced model inventory"
+  fi
+else
+  warn "Router is not running; claude-enhanced starts it automatically"
+fi
+
+if [[ -f "$CACHE_DIR/router.log" ]]; then
+  ok "Router log: $CACHE_DIR/router.log"
+fi
+
+exit "$failed"
