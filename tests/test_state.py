@@ -774,6 +774,89 @@ def test_begin_integration_journal_reopens_a_failed_retry(state: RouteState):
     assert retried["error"] is None
 
 
+def test_reconcile_lifecycle_terminalizes_stale_agent_executions(state: RouteState):
+    """A claim orphaned by crash recovery must also terminalize the
+    underlying agent_executions row -- otherwise a dead execution stays
+    'started' forever, permanently consuming phase parallelism/fanout
+    budget since nothing else ever marks it terminal.
+    """
+    from enhanced_router.state import _utcnow_age
+
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    state.create_agent_execution(
+        execution_id="exec-1", run_id="r1", epoch_id="ep-1",
+        claude_agent_id="agent-1", role="recon", model_id="model-a",
+    )
+    conn = state._new_conn()
+    try:
+        conn.execute(
+            "INSERT INTO runnable_action_claims "
+            "(action_id, run_id, epoch_id, phase_id, role, native_agent_name, model_id, "
+            "action_kind, claim_token, status, created_at, claimed_at, consumed_at, "
+            "expires_at, claude_agent_id, execution_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("action-1", "r1", "ep-1", "phase-1", "recon", "brigade-recon", "model-a",
+             "native_agent", "tok-1", "consumed", _utcnow_age(2000), _utcnow_age(2000),
+             _utcnow_age(2000), _utcnow_age(2000), "agent-1", "exec-1"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = state.reconcile_lifecycle(max_age_seconds=900)
+    assert result["claims_orphaned"] == 1
+    assert result["executions_orphaned"] == 1
+
+    execution = state.get_agent_execution("exec-1")
+    assert execution is not None
+    assert execution["status"] == "timeout"
+    assert "orphaned" in execution["error"]
+
+    conn = state._new_conn()
+    try:
+        row = conn.execute(
+            "SELECT status FROM runnable_action_claims WHERE action_id='action-1'"
+        ).fetchone()
+        assert row["status"] == "orphaned"
+    finally:
+        conn.close()
+
+
+def test_reconcile_lifecycle_skips_already_terminal_execution(state: RouteState):
+    """If the execution actually completed right before the crash-recovery
+    cutoff ran, reconciling its now-stale claim must not raise -- it should
+    just skip terminalizing an execution that's already terminal.
+    """
+    from enhanced_router.state import _utcnow_age
+
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    state.create_agent_execution(
+        execution_id="exec-1", run_id="r1", epoch_id="ep-1",
+        claude_agent_id="agent-1", role="recon", model_id="model-a",
+    )
+    state.update_agent_execution(execution_id="exec-1", status="completed")
+    conn = state._new_conn()
+    try:
+        conn.execute(
+            "INSERT INTO runnable_action_claims "
+            "(action_id, run_id, epoch_id, phase_id, role, native_agent_name, model_id, "
+            "action_kind, claim_token, status, created_at, claimed_at, consumed_at, "
+            "expires_at, claude_agent_id, execution_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("action-1", "r1", "ep-1", "phase-1", "recon", "brigade-recon", "model-a",
+             "native_agent", "tok-1", "consumed", _utcnow_age(2000), _utcnow_age(2000),
+             _utcnow_age(2000), _utcnow_age(2000), "agent-1", "exec-1"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = state.reconcile_lifecycle(max_age_seconds=900)
+    assert result["claims_orphaned"] == 1
+    assert result["executions_orphaned"] == 0
+    assert state.get_agent_execution("exec-1")["status"] == "completed"  # type: ignore[index]
+
+
 def test_v29_to_current_adds_binding_and_group_columns(tmp_path: Path):
     db = tmp_path / "v29.db"
     state = RouteState(db)

@@ -3016,6 +3016,7 @@ class RouteState:
         conn = self._new_conn()
         reservation_ids: list[str] = []
         provider_ids: set[str] = set()
+        orphaned_execution_ids: list[str] = []
         try:
             conn.execute("BEGIN IMMEDIATE")
             run_clause = "" if run_id is None else " AND run_id=?"
@@ -3029,7 +3030,7 @@ class RouteState:
             reservation_ids = [str(row[0]) for row in expired if row[0]]
             provider_ids.update(str(row[1]) for row in expired if row[1])
             claims = conn.execute(
-                "SELECT c.action_id, c.reservation_id, c.intent_id, r.provider_id "
+                "SELECT c.action_id, c.reservation_id, c.intent_id, r.provider_id, c.execution_id "
                 "FROM runnable_action_claims AS c LEFT JOIN provider_reservations AS r "
                 "ON r.reservation_id=c.reservation_id "
                 "WHERE c.status IN ('claimed','consumed') AND "
@@ -3041,9 +3042,10 @@ class RouteState:
             claim_reservations = [str(row[1]) for row in claims if row[1]]
             provider_ids.update(str(row[3]) for row in claims if row[3])
             reservation_ids.extend(claim_reservations)
+            orphaned_execution_ids = [str(row[4]) for row in claims if row[4]]
             claim_count = 0
             for row in claims:
-                action_id, reservation_id, intent_id, _provider_id = row
+                action_id, reservation_id, intent_id, _provider_id, _execution_id = row
                 conn.execute(
                     "UPDATE runnable_action_claims SET status='orphaned', "
                     "consumed_at=COALESCE(consumed_at, ?) WHERE action_id=? "
@@ -3081,6 +3083,19 @@ class RouteState:
                 provider = registry.providers.get(provider_id)
                 if provider:
                     self.admit_provider_agents(provider_id, provider.limits.max_active_agents)
+        executions_orphaned = 0
+        for execution_id in orphaned_execution_ids:
+            try:
+                self.update_agent_execution(
+                    execution_id=execution_id, status="timeout",
+                    error="orphaned: no terminal report before crash-recovery cutoff",
+                )
+                executions_orphaned += 1
+            except WorkflowStateError:
+                # Already terminal (it finished right before reconciliation
+                # ran) -- nothing to reconcile, not a failure.
+                pass
+        result["executions_orphaned"] = executions_orphaned
         return result
 
     def admit_provider_agents(self, provider_id: str, max_active: int) -> list[dict]:
