@@ -16,17 +16,17 @@ def test_fingerprint_with_head(tmp_path):
     subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True)
 
     assert git_has_head(repo) is True
-    fp1 = fingerprint(repo)
+    fp1 = fingerprint(repo, epoch_id="ep-1")
     assert len(fp1) == 64
 
     # Mutate file
     file1.write_text("modified content")
-    fp2 = fingerprint(repo)
+    fp2 = fingerprint(repo, epoch_id="ep-1")
     assert fp1 != fp2
 
     # Revert modification
     file1.write_text("initial content")
-    assert fingerprint(repo) == fp1
+    assert fingerprint(repo, epoch_id="ep-1") == fp1
 
 
 def test_fingerprint_without_head(tmp_path):
@@ -36,11 +36,11 @@ def test_fingerprint_without_head(tmp_path):
 
     assert git_has_head(repo) is False
     # Should calculate fingerprint without throwing bad revision HEAD error
-    fp1 = fingerprint(repo)
+    fp1 = fingerprint(repo, epoch_id="ep-1")
     assert len(fp1) == 64
 
     # Add untracked file
     untracked = repo / "new_file.txt"
     untracked.write_text("hello")
-    fp2 = fingerprint(repo)
+    fp2 = fingerprint(repo, epoch_id="ep-1")
     assert fp1 != fp2

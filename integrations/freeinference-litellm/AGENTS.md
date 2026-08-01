@@ -40,5 +40,7 @@ Run live probes only when an operator explicitly requests them.
 
 | Path | Purpose |
 |------|---------|
-| `src/fi_litellm/` | Local CLI, catalog sync, endpoint policy, and compatibility harness |
-| `tests/` | Offline contract tests for deterministic kit behavior |
+| `config/` | Loopback LiteLLM configuration template |
+| `scripts/` | Explicit catalog synchronization and operator diagnostics |
+| `src/` | Installable Python package and CLI implementation |
+| `tests/` | Offline integration-kit contract tests |

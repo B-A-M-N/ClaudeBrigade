@@ -112,13 +112,13 @@ CLAUDE_CONFIG_DIR=~/.claude-brigade claude auth status --text
 | `registry.py` | `ModelRegistry` — loads YAML, validates cross-refs, deterministic `recommend()` |
 | `config_models.py` | Pydantic models: `ModelSpec`, `ProfileSpec`, `ModelCapabilities`, etc. |
 | `backends.py` | Proxy implementations: `proxy_anthropic_passthrough`, `proxy_direct_anthropic`, `proxy_litellm_messages` |
-| `base.py` | Path constants (`BRIGADE_STATE_DIR`, etc.), allowlists (`ALLOWED_SUBAGENTS`, `MUTATORS`, `HOP_BY_HOP`) |
+| `base.py` | Path constants, compatibility role sets, registry-backed agent authorization helpers, and hop-by-hop headers |
 | `litellm_config.py` | Generates LiteLLM YAML config from registry; atomic write + digest |
 | `litellm_supervisor.py` | `LiteLLMSupervisor` — blue-green child process lifecycle (generations, deployments) |
 | `mcp_control.py` | Authenticated local control surface for models, profiles, routes, task phases, runnable actions, fastpath proposal disposition, and status |
 | `mcp_transport.py` | Auth wrapper for MCP StreamableHTTP |
 | `policy.py` | Heuristics for tier classification (trivial/normal/cross-cutting/high-risk) |
-| `agents_json.py` | Generates `agents.json` for native `--agents` injection |
+| `agents_json.py` | Validates and generates the native `--agents` manifest, including registry-qualified specialists |
 
 ### Configuration (`config/`)
 
@@ -249,11 +249,13 @@ Key invariants (enforced by unique indexes):
 
 ### Role Aliases (public-facing)
 - `anthropic-brigade-{recon,implementer,adversary,repairer}`
-- Defined in `backends.py:ROLE_MODEL_ALIASES`
+- Stable aliases are exposed by the registry manifest; model-qualified aliases
+  are declared in profile specialist metadata.
 
 ### Agent Types (internal)
 - `brigade-recon`, `brigade-implementer`, `brigade-adversary`, `brigade-repairer`, `controller-direct`
-- Used in `base.py:ALLOWED_SUBAGENTS`, `MUTATORS`, `IMPLEMENTATION_AGENTS`
+- Static compatibility names are supplemented by registry-backed manifest
+  authorization through `base.py` helpers.
 
 ### Epoch IDs
 - Format: `ep_{profile}_{N}` (e.g., `ep_hybrid_001`)
@@ -325,7 +327,10 @@ Internal headers (`x-enhanced-token`, `x-brigade-run-id`) are stripped in `sanit
 The four `anthropic-brigade-*` aliases are role-routed. Main-thread model IDs are resolved through the registry and pinned as controller bindings; only models explicitly configured as `anthropic-passthrough` reach Anthropic.
 
 ### 7. Mutation Detection in Hooks
-`guard_tool.py` uses regex on Bash commands (after stripping heredocs + safe redirections). False positives/negatives are possible. The `audit_tool.py` fingerprint diff is the ground truth.
+Read-only Bash authorization uses a narrow observational allowlist; regex
+classification is diagnostic only. The `audit_tool.py` pre/post fingerprint
+diff remains the mutation evidence, and fingerprinting must recalculate the
+mutable workspace rather than cache by epoch.
 
 ### 8. Shadow-worktree integration
 
@@ -457,8 +462,12 @@ All 9 milestones complete (see `bin/plan.md` and `meta/M*.md`):
 
 | Path | Purpose |
 |------|---------|
-| `router/enhanced_router/` | FastAPI router, registry, state, backends, and orchestration controls |
+| `router/` | Python runtime package and its enhanced router implementation |
 | `hooks/` | Claude Code lifecycle, guardrail, audit, and completion hooks |
 | `agents/` | Native visible agent definitions injected at launch |
 | `config/` | Model, provider, profile, and workflow configuration |
-| `integrations/freeinference-litellm/` | Separately usable local FreeInference LiteLLM BYOK kit |
+| `bin/` | Launcher, doctor, login, and router lifecycle commands |
+| `tests/` | Offline unit, integration, hook, and fixture verification |
+| `meta/` | Milestone and implementation handoff records |
+| `Targets/` | Provider/target planning notes, not runtime configuration |
+| `integrations/` | Separately usable integrations and their local contracts |
