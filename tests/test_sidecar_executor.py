@@ -161,3 +161,52 @@ async def test_detached_fastpath_failure_can_retry_while_router_is_alive(tmp_pat
     with pytest.raises(WorkflowStateError, match="not retryable"):
         await executor.retry(retry["execution_id"])
     await executor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_detached_fastpath_retry_reconstructs_after_executor_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    state = RouteState(tmp_path / "state.db")
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    first_executor = SidecarExecutor(state)
+
+    async def failed_runner() -> dict:
+        raise RuntimeError("provider unavailable")
+
+    first = await first_executor.invoke_detached(
+        run_id="r1", epoch_id="ep-1", execution_id="fp-restart",
+        phase_id="fastpath:verify", role="fastpath", model_id="diffusiongemma",
+        provider_id="freeinference", packet={"verification_id": "v-restart"},
+        timeout_seconds=30, runner=failed_runner,
+    )
+    await first_executor.wait(first["execution_id"])
+    await first_executor.shutdown()
+
+    import enhanced_router.app as app_module
+    import enhanced_router.registry as registry_module
+
+    async def recovered_runner(packet: dict) -> dict:
+        assert packet["verification_id"] == "v-restart"
+        return {"decision": "escalate", "validation_status": "advisory"}
+
+    class FakeFastpathConfig:
+        timeout_seconds = 30
+
+    monkeypatch.setattr(app_module, "_run_fastpath_verify", recovered_runner)
+    monkeypatch.setattr(
+        registry_module,
+        "get_registry",
+        lambda: SimpleNamespace(fastpath=FakeFastpathConfig()),
+    )
+
+    restarted_executor = SidecarExecutor(state)
+    retry = await restarted_executor.retry(first["execution_id"])
+    await restarted_executor.wait(retry["execution_id"])
+    final = state.get_agent_execution(retry["execution_id"])
+    assert final is not None
+    assert final["status"] == "completed"
+    assert final["parent_execution_id"] == first["execution_id"]
+    assert final["retry_count"] == 1
+    await restarted_executor.shutdown()

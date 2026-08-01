@@ -146,10 +146,8 @@ class SidecarExecutor:
                 raise WorkflowStateError("detached fastpath execution is not retryable")
             job = self._detached_jobs.get(execution_id)
             if job is None:
-                raise WorkflowStateError(
-                    "detached fastpath retry is unavailable after router restart"
-                )
-            attempt = int(job.get("attempt", 1)) + 1
+                job = self._recover_detached_job(execution)
+            attempt = int(execution.get("retry_count") or 0) + 2
             if attempt > 2:
                 raise WorkflowStateError("detached fastpath retry budget exhausted")
             retry_id = f"{execution_id}:retry:{uuid.uuid4().hex[:8]}"
@@ -165,6 +163,7 @@ class SidecarExecutor:
                 timeout_seconds=float(job["timeout_seconds"]),
                 runner=job["runner"],
                 attempt=attempt,
+                parent_execution_id=execution_id,
             )
         retry = self.state.prepare_sidecar_retry(execution_id)
         return await self.invoke(
@@ -189,6 +188,7 @@ class SidecarExecutor:
         timeout_seconds: float,
         runner: Callable[[], Awaitable[dict[str, Any]]],
         attempt: int = 1,
+        parent_execution_id: str | None = None,
     ) -> dict[str, Any]:
         """Run a router-owned advisory job under persisted sidecar lifecycle."""
         execution = self.state.start_detached_sidecar_execution(
@@ -200,6 +200,8 @@ class SidecarExecutor:
             model_id=model_id,
             provider_id=provider_id,
             packet=packet,
+            parent_execution_id=parent_execution_id,
+            retry_count=max(0, attempt - 1),
         )
         self._detached_jobs[execution_id] = {
             "run_id": run_id,
@@ -326,6 +328,50 @@ class SidecarExecutor:
             })
             self.state.finish_spawn_assignment(run_id, epoch_id, agent_id, "failed")
 
+    def _recover_detached_job(self, execution: dict[str, Any]) -> dict[str, Any]:
+        """Rebuild a supported fastpath runner from durable execution evidence."""
+        run_id = str(execution["run_id"])
+        epoch_id = str(execution["epoch_id"])
+        execution_id = str(execution["execution_id"])
+        events = self.state.get_execution_events(
+            run_id, epoch_id, execution_id, limit=1,
+        )
+        if not events or not isinstance(events[0].get("payload"), dict):
+            raise WorkflowStateError("detached fastpath input packet is unavailable")
+        packet = dict(events[0]["payload"])
+        phase_id = str(execution.get("phase_id") or "")
+        if phase_id == "fastpath:route":
+            from enhanced_router.app import _run_fastpath_route
+
+            async def runner() -> dict[str, Any]:
+                return await _run_fastpath_route(packet)
+        elif phase_id == "fastpath:verify":
+            from enhanced_router.app import _run_fastpath_verify
+
+            async def runner() -> dict[str, Any]:
+                return await _run_fastpath_verify(packet)
+        else:
+            raise WorkflowStateError("detached execution type cannot be recovered")
+        timeout_seconds = 5.0
+        try:
+            from enhanced_router.registry import get_registry
+
+            config = get_registry().fastpath
+            if config is not None:
+                timeout_seconds = float(config.timeout_seconds)
+        except (ImportError, AttributeError, RuntimeError):
+            pass
+        return {
+            "run_id": run_id,
+            "epoch_id": epoch_id,
+            "phase_id": phase_id,
+            "role": str(execution["role"]),
+            "model_id": str(execution["model_id"]),
+            "provider_id": execution.get("provider_id"),
+            "packet": packet,
+            "timeout_seconds": timeout_seconds,
+            "runner": runner,
+        }
     async def _run_detached(
         self,
         *,

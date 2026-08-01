@@ -2245,6 +2245,8 @@ class RouteState:
         model_id: str,
         provider_id: str | None,
         packet: dict,
+        parent_execution_id: str | None = None,
+        retry_count: int = 0,
     ) -> dict:
         """Create a persisted router-owned advisory sidecar execution.
 
@@ -2270,6 +2272,13 @@ class RouteState:
             ).fetchone()
             if owned is None or epoch is None:
                 raise WorkflowStateError("detached sidecar run or epoch is not active")
+            if parent_execution_id is not None:
+                parent = conn.execute(
+                    "SELECT run_id, epoch_id FROM agent_executions WHERE execution_id=?",
+                    (parent_execution_id,),
+                ).fetchone()
+                if parent is None or parent[0] != run_id or parent[1] != epoch_id:
+                    raise WorkflowStateError("detached sidecar retry parent is out of scope")
             existing = conn.execute(
                 "SELECT * FROM agent_executions WHERE execution_id=?", (execution_id,)
             ).fetchone()
@@ -2291,10 +2300,11 @@ class RouteState:
             conn.execute(
                 "INSERT INTO agent_executions "
                 "(execution_id, run_id, epoch_id, claude_agent_id, role, model_id, phase_id, "
-                "status, actor_kind, execution_kind, provider_id, independence_key) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'started', 'sidecar', 'sidecar_call', ?, ?)",
+                "status, actor_kind, execution_kind, provider_id, retry_count, "
+                "parent_execution_id, independence_key) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'started', 'sidecar', 'sidecar_call', ?, ?, ?, ?)",
                 (execution_id, run_id, epoch_id, sidecar_agent_id, role, model_id,
-                 phase_id, provider_id, independence_key),
+                 phase_id, provider_id, retry_count, parent_execution_id, independence_key),
             )
             conn.execute(
                 "INSERT INTO execution_events "
