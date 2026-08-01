@@ -126,7 +126,9 @@ class ProviderAdmissionManager:
             deadline,
         )
 
-    async def acquire_request(self, provider_id: str, request_id: str, deadline: float | None = None) -> None:
+    async def acquire_request(
+        self, provider_id: str, request_id: str, deadline: float | None = None, *, priority: bool = False,
+    ) -> None:
         state = self._state(provider_id)
         await self._admit_circuit(state, request_id)
         try:
@@ -138,6 +140,7 @@ class ProviderAdmissionManager:
                 state.limits.max_inflight_requests,
                 None,
                 deadline,
+                priority=priority,
             )
         except BaseException:
             async with self._lock:
@@ -311,6 +314,8 @@ class ProviderAdmissionManager:
         capacity: int,
         max_queue: int | None,
         deadline: float | None,
+        *,
+        priority: bool = False,
     ) -> None:
         async with self._lock:
             if queue is state.request_queue and self._group_queue:
@@ -328,7 +333,14 @@ class ProviderAdmissionManager:
                 deadline=deadline if deadline is not None else monotonic() + state.limits.queue_timeout_seconds,
                 future=loop.create_future(),
             )
-            queue.append(waiter)
+            # Priority only ever reorders who's next among callers already
+            # forced to queue -- it never lets anything exceed the provider's
+            # existing max_inflight_requests/max_active_agents cap, and a
+            # non-priority queue (the default) behaves exactly as before.
+            if priority:
+                queue.appendleft(waiter)
+            else:
+                queue.append(waiter)
 
         try:
             remaining = max(0.0, waiter.deadline - monotonic())

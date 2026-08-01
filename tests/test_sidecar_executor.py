@@ -132,6 +132,58 @@ async def test_detached_sidecar_persists_lifecycle_and_is_cancellable(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_detached_bypass_is_not_recorded_as_a_valid_success(tmp_path: Path):
+    """A validation_status='bypassed' dict result must not look identical to
+    a real success in the ledger -- previously any dict result got
+    schema_valid=True, evidence_valid=True, quality_score=1.0 unconditionally,
+    so a policy bypass (e.g. app.py's failure_policy='bypass' path) was
+    indistinguishable from a genuinely accepted proposal."""
+    state = RouteState(tmp_path / "state.db")
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    executor = SidecarExecutor(state)
+
+    async def bypass_runner() -> dict:
+        return {
+            "validation_status": "bypassed",
+            "validation_reason": "endpoint not certified",
+            "confidence": 0.0,
+        }
+
+    await executor.invoke_detached(
+        run_id="r1", epoch_id="ep-1", execution_id="fp-bypass",
+        phase_id="fastpath:route", role="fastpath", model_id="diffusiongemma",
+        provider_id="freeinference", packet={"proposal_id": "p1"},
+        timeout_seconds=5, runner=bypass_runner,
+    )
+    await executor.wait("fp-bypass")
+    bypassed = state.get_agent_execution("fp-bypass")
+    assert bypassed is not None
+    assert bypassed["status"] == "completed"
+    assert bypassed["schema_valid"] == 0
+    assert bypassed["evidence_valid"] == 0
+    assert bypassed["quality_score"] == 0.0
+
+    async def accepted_runner() -> dict:
+        return {"validation_status": "accepted_for_controller_review", "routes": {}}
+
+    await executor.invoke_detached(
+        run_id="r1", epoch_id="ep-1", execution_id="fp-accepted",
+        phase_id="fastpath:route", role="fastpath", model_id="diffusiongemma",
+        provider_id="freeinference", packet={"proposal_id": "p2"},
+        timeout_seconds=5, runner=accepted_runner,
+    )
+    await executor.wait("fp-accepted")
+    accepted = state.get_agent_execution("fp-accepted")
+    assert accepted is not None
+    assert accepted["status"] == "completed"
+    assert accepted["schema_valid"] == 1
+    assert accepted["evidence_valid"] == 1
+    assert accepted["quality_score"] == 1.0
+    await executor.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_detached_fastpath_failure_can_retry_while_router_is_alive(tmp_path: Path):
     state = RouteState(tmp_path / "state.db")
     state.create_run("r1")

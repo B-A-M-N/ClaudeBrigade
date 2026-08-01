@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from types import SimpleNamespace
@@ -1035,7 +1036,7 @@ def test_v29_to_current_adds_binding_and_group_columns(tmp_path: Path):
         assert "configuration_hash" in columns
         assert "routing_mode" in columns
         assert "deployment_group" in columns
-        assert version == 39
+        assert version == 40
     finally:
         conn.close()
 
@@ -1472,9 +1473,367 @@ def test_migration_v39_adds_fallback_routes_column(tmp_path: Path):
         columns = {row[1] for row in conn.execute("PRAGMA table_info(role_routes)")}
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         assert "fallback_routes_json" in columns
-        assert version == 39
+        assert version == 40
     finally:
         conn.close()
+
+
+def test_migration_v40_adds_route_proposal_lifecycle_columns(tmp_path: Path):
+    db = tmp_path / "v39.db"
+    state = RouteState(db)
+    conn = state._new_conn()
+    try:
+        for column in (
+            "run_id", "epoch_id", "execution_id", "status",
+            "configuration_hash", "candidate_digest", "expires_at", "completed_at",
+        ):
+            conn.execute(f"ALTER TABLE route_proposals DROP COLUMN {column}")
+        conn.execute("PRAGMA user_version = 39")
+        conn.commit()
+    finally:
+        conn.close()
+
+    upgraded = RouteState(db)
+    conn = upgraded._new_conn()
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(route_proposals)")}
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        for column in (
+            "run_id", "epoch_id", "execution_id", "status",
+            "configuration_hash", "candidate_digest", "expires_at", "completed_at",
+        ):
+            assert column in columns
+        assert version == 40
+    finally:
+        conn.close()
+
+
+def _setup_intake(state: RouteState, run_id: str = "r1", epoch_id: str = "ep-1") -> str:
+    state.create_run(run_id)
+    state.create_epoch(run_id, epoch_id, "normal", "hybrid")
+    intake = state.create_task_intake(
+        intake_id="intake-1", run_id=run_id, session_id="main-session",
+        prompt="implement the change", request_kind="change",
+        repository_features={}, deterministic_signals=[], minimum_tier="normal",
+    )
+    return str(intake["intake_id"])
+
+
+def test_reserve_route_proposal_is_immediately_retrievable(state: RouteState):
+    """The proposal_id race this closes: previously the row was only
+    INSERTed after the detached model call finished, so a caller handed a
+    proposal_id in a "queued" response could get "not found" for however
+    long inference took."""
+    intake_id = _setup_intake(state)
+    reserved = state.reserve_route_proposal(
+        proposal_id="p1", intake_id=intake_id, run_id="r1", epoch_id="ep-1",
+        execution_id="exec-1", source="fastpath",
+    )
+    assert reserved["status"] == "queued"
+    fetched = state.get_route_proposal("p1")
+    assert fetched is not None
+    assert fetched["status"] == "queued"
+    assert fetched["run_id"] == "r1"
+    assert fetched["epoch_id"] == "ep-1"
+
+
+def test_reserve_route_proposal_is_idempotent(state: RouteState):
+    intake_id = _setup_intake(state)
+    first = state.reserve_route_proposal(
+        proposal_id="p1", intake_id=intake_id, run_id="r1", epoch_id="ep-1",
+        execution_id="exec-1", source="fastpath",
+    )
+    second = state.reserve_route_proposal(
+        proposal_id="p1", intake_id=intake_id, run_id="r1", epoch_id="ep-1",
+        execution_id="exec-2", source="fastpath",
+    )
+    assert first["execution_id"] == second["execution_id"] == "exec-1"
+
+
+def test_mark_route_proposal_running_transitions_status(state: RouteState):
+    intake_id = _setup_intake(state)
+    state.reserve_route_proposal(
+        proposal_id="p1", intake_id=intake_id, run_id="r1", epoch_id="ep-1",
+        execution_id="exec-1", source="fastpath",
+    )
+    running = state.mark_route_proposal_running("p1")
+    assert running is not None
+    assert running["status"] == "running"
+
+
+def test_complete_route_proposal_sets_terminal_state_and_result(state: RouteState):
+    intake_id = _setup_intake(state)
+    state.reserve_route_proposal(
+        proposal_id="p1", intake_id=intake_id, run_id="r1", epoch_id="ep-1",
+        execution_id="exec-1", source="fastpath",
+    )
+    state.mark_route_proposal_running("p1")
+    completed = state.complete_route_proposal(
+        "p1", parsed_proposal={"routes": {"implementer": {"model": "longcat-2"}}},
+        validation_status="accepted_for_controller_review", confidence=0.9,
+    )
+    assert completed is not None
+    assert completed["status"] == "completed"
+    assert completed["validation_status"] == "accepted_for_controller_review"
+    assert completed["completed_at"] is not None
+
+
+def test_fail_route_proposal_leaves_a_durable_failed_record(state: RouteState):
+    """A failed detached job (e.g. exception raised with failure_policy=fail)
+    must leave a durable failed proposal, not just vanish."""
+    intake_id = _setup_intake(state)
+    state.reserve_route_proposal(
+        proposal_id="p1", intake_id=intake_id, run_id="r1", epoch_id="ep-1",
+        execution_id="exec-1", source="fastpath",
+    )
+    failed = state.fail_route_proposal("p1", "upstream provider timed out")
+    assert failed is not None
+    assert failed["status"] == "failed"
+    assert failed["validation_status"] == "failed"
+    assert "timed out" in failed["validation_reason"]
+    refetched = state.get_route_proposal("p1")
+    assert refetched is not None
+    assert refetched["status"] == "failed"
+
+
+def test_complete_route_proposal_is_cas_guarded_against_a_second_completion(state: RouteState):
+    intake_id = _setup_intake(state)
+    state.reserve_route_proposal(
+        proposal_id="p1", intake_id=intake_id, run_id="r1", epoch_id="ep-1",
+        execution_id="exec-1", source="fastpath",
+    )
+    state.complete_route_proposal(
+        "p1", parsed_proposal={"routes": {}}, validation_status="accepted_for_controller_review",
+    )
+    # A late/duplicate completion (e.g. a retried detached job racing the
+    # original) must not clobber the already-terminal row.
+    second = state.complete_route_proposal(
+        "p1", parsed_proposal={"routes": {"implementer": {"model": "evil-model"}}},
+        validation_status="accepted_for_controller_review",
+    )
+    assert second is None
+    unchanged = state.get_route_proposal("p1")
+    assert unchanged is not None
+    assert json.loads(unchanged["parsed_proposal_json"])["routes"] == {}
+
+
+def test_stale_queued_proposal_is_lazily_expired_on_read(state: RouteState):
+    intake_id = _setup_intake(state)
+    state.reserve_route_proposal(
+        proposal_id="p1", intake_id=intake_id, run_id="r1", epoch_id="ep-1",
+        execution_id="exec-1", source="fastpath", ttl_seconds=30,
+    )
+    conn = state._new_conn()
+    conn.execute(
+        "UPDATE route_proposals SET expires_at='2000-01-01T00:00:00+00:00' WHERE proposal_id='p1'",
+    )
+    conn.commit()
+    conn.close()
+    expired = state.get_route_proposal("p1")
+    assert expired is not None
+    assert expired["status"] == "expired"
+
+
+def test_expired_proposal_disappears_from_runnable_actions(state: RouteState):
+    intake_id = _setup_intake(state)
+    state.reserve_route_proposal(
+        proposal_id="p1", intake_id=intake_id, run_id="r1", epoch_id="ep-1",
+        execution_id="exec-1", source="fastpath",
+    )
+    state.complete_route_proposal(
+        "p1", parsed_proposal={"routes": {"implementer": {"model": "longcat-2"}}},
+        validation_status="accepted_for_controller_review",
+    )
+    present = state.get_runnable_actions("r1", "ep-1")
+    assert any(item["action_id"] == "route-proposal:p1" for item in present)
+
+    conn = state._new_conn()
+    conn.execute(
+        "UPDATE route_proposals SET expires_at='2000-01-01T00:00:00+00:00' WHERE proposal_id='p1'",
+    )
+    conn.commit()
+    conn.close()
+    after_expiry = state.get_runnable_actions("r1", "ep-1")
+    assert not any(item["action_id"] == "route-proposal:p1" for item in after_expiry)
+
+
+def test_set_route_proposal_disposition_rejects_cross_epoch_application(state: RouteState):
+    """P1-1: a late proposal generated for an earlier epoch of a run must
+    not be applicable once a later epoch of the same run is active."""
+    intake_id = _setup_intake(state)
+    state.reserve_route_proposal(
+        proposal_id="p1", intake_id=intake_id, run_id="r1", epoch_id="ep-1",
+        execution_id="exec-1", source="fastpath",
+    )
+    state.complete_route_proposal(
+        "p1", parsed_proposal={"routes": {"implementer": {"model": "longcat-2"}}},
+        validation_status="accepted_for_controller_review",
+    )
+    result = state.set_route_proposal_disposition(
+        "p1", "r1", "accepted", reason="stale epoch", epoch_id="ep-2",
+    )
+    assert result is None
+
+
+def test_set_route_proposal_disposition_rejects_double_disposition(state: RouteState):
+    intake_id = _setup_intake(state)
+    state.reserve_route_proposal(
+        proposal_id="p1", intake_id=intake_id, run_id="r1", epoch_id="ep-1",
+        execution_id="exec-1", source="fastpath",
+    )
+    state.complete_route_proposal(
+        "p1", parsed_proposal={"routes": {"implementer": {"model": "longcat-2"}}},
+        validation_status="accepted_for_controller_review",
+    )
+    first = state.set_route_proposal_disposition(
+        "p1", "r1", "accepted", reason="ok", epoch_id="ep-1",
+    )
+    assert first is not None
+    second = state.set_route_proposal_disposition(
+        "p1", "r1", "rejected", reason="changed my mind", epoch_id="ep-1",
+    )
+    assert second is None
+    assert state.get_route_proposal("p1")["controller_disposition"] == "accepted"
+
+
+def test_get_route_proposal_outcomes_aggregates_status_and_disposition(state: RouteState):
+    intake_id = _setup_intake(state)
+
+    # One accepted.
+    state.reserve_route_proposal(
+        proposal_id="p1", intake_id=intake_id, run_id="r1", epoch_id="ep-1",
+        execution_id="exec-1", source="fastpath",
+    )
+    state.complete_route_proposal(
+        "p1", parsed_proposal={"routes": {"implementer": {"model": "longcat-2"}}},
+        validation_status="accepted_for_controller_review",
+    )
+    state.set_route_proposal_disposition("p1", "r1", "accepted", reason="ok", epoch_id="ep-1")
+
+    # One rejected.
+    state.reserve_route_proposal(
+        proposal_id="p2", intake_id=intake_id, run_id="r1", epoch_id="ep-1",
+        execution_id="exec-2", source="fastpath",
+    )
+    state.complete_route_proposal(
+        "p2", parsed_proposal={"routes": {}}, validation_status="accepted_for_controller_review",
+    )
+    state.set_route_proposal_disposition("p2", "r1", "rejected", reason="no")
+
+    # One bypassed (never reaches a disposition).
+    state.reserve_route_proposal(
+        proposal_id="p3", intake_id=intake_id, run_id="r1", epoch_id="ep-1",
+        execution_id="exec-3", source="fastpath",
+    )
+    state.complete_route_proposal("p3", parsed_proposal={}, validation_status="bypassed")
+
+    outcomes = state.get_route_proposal_outcomes("r1")
+    assert outcomes["total"] == 3
+    assert outcomes["by_status"]["completed"] == 3
+    assert outcomes["by_validation_status"]["accepted_for_controller_review"] == 2
+    assert outcomes["by_validation_status"]["bypassed"] == 1
+    assert outcomes["by_disposition"]["accepted"] == 1
+    assert outcomes["by_disposition"]["rejected"] == 1
+    assert outcomes["by_disposition"]["undecided"] == 1
+    assert outcomes["acceptance_rate"] == 0.5  # 1 accepted out of 2 reviewable
+
+
+def test_get_route_proposal_outcomes_handles_zero_proposals(state: RouteState):
+    state.create_run("r1")
+    outcomes = state.get_route_proposal_outcomes("r1")
+    assert outcomes["total"] == 0
+    assert outcomes["acceptance_rate"] is None
+
+
+def test_set_route_proposal_disposition_rejects_still_queued_proposal(state: RouteState):
+    """Accepting requires status='completed' -- a proposal still mid-flight
+    (queued/running) cannot be accepted."""
+    intake_id = _setup_intake(state)
+    state.reserve_route_proposal(
+        proposal_id="p1", intake_id=intake_id, run_id="r1", epoch_id="ep-1",
+        execution_id="exec-1", source="fastpath",
+    )
+    result = state.set_route_proposal_disposition(
+        "p1", "r1", "accepted", reason="too early", epoch_id="ep-1",
+    )
+    assert result is None
+
+
+def _real_registry(monkeypatch: pytest.MonkeyPatch):
+    import enhanced_router.registry as registry_module
+    from enhanced_router.registry import ModelRegistry
+
+    registry = ModelRegistry(Path(__file__).resolve().parents[1] / "config")
+    registry.load_models()
+    registry.load_workflows()
+    registry.load_profiles()
+    monkeypatch.setattr(registry_module, "get_registry", lambda: registry)
+    return registry
+
+
+def test_begin_task_creates_run_epoch_routes_and_phases(state: RouteState, monkeypatch: pytest.MonkeyPatch):
+    _real_registry(monkeypatch)
+    contract = state.begin_task(
+        "r1", "session-1", "/tmp", force_workflow="trivial", prompt="fix a typo",
+    )
+    assert contract["run_id"] == "r1"
+    assert contract["workflow_id"] == "trivial"
+    assert contract["profile_id"] == "freeinference"
+    assert contract["phases"]
+    assert state.get_active_epoch("r1") is not None
+
+
+def test_begin_task_rejects_a_second_epoch_while_one_is_active(state: RouteState, monkeypatch: pytest.MonkeyPatch):
+    _real_registry(monkeypatch)
+    state.begin_task("r1", "session-1", "/tmp", force_workflow="trivial", prompt="first task")
+    with pytest.raises(ValueError, match="Active epoch already exists"):
+        state.begin_task("r1", "session-1", "/tmp", force_workflow="trivial", prompt="second task")
+
+
+def test_prepare_task_plan_does_not_write_anything(state: RouteState, monkeypatch: pytest.MonkeyPatch):
+    """Pure/read-only: calling it twice must not create a run, epoch, or
+    conflict -- nothing is persisted until materialize_task_epoch runs."""
+    _real_registry(monkeypatch)
+    plan1 = state.prepare_task_plan("r1", "session-1", "/tmp", force_workflow="trivial", prompt="task")
+    plan2 = state.prepare_task_plan("r1", "session-1", "/tmp", force_workflow="trivial", prompt="task")
+    assert plan1["epoch_id"] != plan2["epoch_id"]  # timestamp-based, each call plans a fresh one
+    assert state.get_run("r1") is None
+    assert state.get_active_epoch("r1") is None
+
+
+def test_materialize_task_epoch_uses_the_plans_pregenerated_epoch_id(
+    state: RouteState, monkeypatch: pytest.MonkeyPatch,
+):
+    _real_registry(monkeypatch)
+    plan = state.prepare_task_plan("r1", "session-1", "/tmp", force_workflow="trivial", prompt="task")
+    contract = state.materialize_task_epoch(plan)
+    assert contract["epoch_id"] == plan["epoch_id"]
+    active = state.get_active_epoch("r1")
+    assert active is not None
+    assert active["epoch_id"] == plan["epoch_id"]
+
+
+def test_materialize_task_epoch_applies_route_overrides_for_specified_roles_only(
+    state: RouteState, monkeypatch: pytest.MonkeyPatch,
+):
+    """A validated, accepted fastpath route proposal that arrived during
+    prepare_task_plan's caller-side wait replaces the profile default for
+    the roles it names, atomically as part of the same materialization --
+    every other role still gets its plain profile default."""
+    _real_registry(monkeypatch)
+    plan = state.prepare_task_plan(
+        "r1", "session-1", "/tmp", force_workflow="normal", profile_id="hybrid", prompt="task",
+    )
+    contract = state.materialize_task_epoch(plan, route_overrides={"implementer": "longcat-2"})
+    epoch_id = contract["epoch_id"]
+
+    implementer_route = state.get_role_route("r1", epoch_id, "implementer")
+    assert implementer_route["model_id"] == "longcat-2"
+    assert implementer_route["source"].startswith("fastpath-accepted:")
+
+    recon_route = state.get_role_route("r1", epoch_id, "recon")
+    assert recon_route["source"].startswith("profile:")
+    assert recon_route["model_id"] != "longcat-2"  # hybrid's own profile default for recon
 
 
 def test_completion_token_is_bound_to_workspace_and_consumed_once(state: RouteState):

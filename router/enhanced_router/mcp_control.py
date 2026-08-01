@@ -889,6 +889,25 @@ async def get_route_proposal(proposal_id: str) -> dict[str, Any]:
 
 
 @control_mcp.tool()
+async def get_route_proposal_outcomes() -> dict[str, Any]:
+    """Aggregate fastpath route-proposal outcome telemetry for this run.
+
+    Answers whether DiffusionGemma's route proposals are actually being
+    accepted before trusting their influence: how many proposals completed,
+    how many were bypassed/failed, how many the controller accepted vs
+    rejected vs left undecided.
+    """
+    run_id = _get_current_run_id()
+    if not run_id:
+        return {"found": False, "error": "No active run ID"}
+    state = get_state()
+    authorization_error = _require_capability(state, run_id, "read_routes")
+    if authorization_error:
+        return {"found": False, "error": authorization_error}
+    return {"found": True, **state.get_route_proposal_outcomes(run_id)}
+
+
+@control_mcp.tool()
 async def accept_route_proposal(
     proposal_id: str,
     reason: str,
@@ -912,12 +931,32 @@ async def accept_route_proposal(
     proposal = state.get_route_proposal_for_run(proposal_id, run_id)
     if proposal is None:
         return {"accepted": False, "error": "route proposal not found"}
+    proposal_epoch_id = str(proposal.get("epoch_id") or "")
+    action_error = _consume_controller_route_review_action(
+        state, run_id, proposal_epoch_id, proposal_id,
+    )
+    if action_error:
+        return {"accepted": False, "error": action_error}
+    action_id = f"route-proposal:{proposal_id}"
+    outcome = "failed"
     try:
         targets = _proposal_route_targets(proposal)
         active = state.get_active_epoch(run_id)
         if active is None:
             raise ValueError("no active epoch for proposal")
         epoch_id = str(active["epoch_id"])
+        if proposal_epoch_id != epoch_id:
+            raise ValueError(
+                "proposal was generated for a different epoch than the "
+                "one currently active; it can no longer be applied"
+            )
+        bound_roles = {str(b["role"]) for b in state.get_active_bindings(run_id, epoch_id)}
+        already_bound = sorted(bound_roles & targets.keys())
+        if already_bound:
+            raise ValueError(
+                f"proposal targets already-bound role(s) {already_bound}; "
+                "a proposal cannot replace a role that already has an active binding"
+            )
         registry = _get_registry()
         if apply_routes:
             for role, (model_id, endpoint) in targets.items():
@@ -937,16 +976,24 @@ async def accept_route_proposal(
                     endpoint_override=None if endpoint == "auto" else endpoint,
                 )
         result = state.set_route_proposal_disposition(
-            proposal_id, "accepted", reason=reason, epoch_id=epoch_id,
+            proposal_id, run_id, "accepted", reason=reason, epoch_id=epoch_id,
         )
+        if result is None:
+            raise ValueError(
+                "proposal is no longer acceptable (already dispositioned, "
+                "expired, not completed, or not accepted for review)"
+            )
+        outcome = "completed"
         return {
-            "accepted": result is not None,
+            "accepted": True,
             "proposal": result,
             "applied_routes": apply_routes,
             "routes": targets,
         }
     except (KeyError, ValueError, json.JSONDecodeError) as exc:
         return {"accepted": False, "error": str(exc)}
+    finally:
+        state.finish_controller_action(run_id, proposal_epoch_id, action_id, outcome)
 
 
 @control_mcp.tool()
@@ -964,10 +1011,24 @@ async def reject_route_proposal(proposal_id: str, reason: str) -> dict[str, Any]
     proposal = state.get_route_proposal_for_run(proposal_id, run_id)
     if proposal is None:
         return {"rejected": False, "error": "route proposal not found"}
-    result = state.set_route_proposal_disposition(
-        proposal_id, "rejected", reason=reason,
+    proposal_epoch_id = str(proposal.get("epoch_id") or "")
+    action_error = _consume_controller_route_review_action(
+        state, run_id, proposal_epoch_id, proposal_id,
     )
-    return {"rejected": result is not None, "proposal": result}
+    if action_error:
+        return {"rejected": False, "error": action_error}
+    action_id = f"route-proposal:{proposal_id}"
+    outcome = "failed"
+    try:
+        result = state.set_route_proposal_disposition(
+            proposal_id, run_id, "rejected", reason=reason,
+        )
+        if result is None:
+            return {"rejected": False, "error": "proposal was already dispositioned"}
+        outcome = "completed"
+        return {"rejected": True, "proposal": result}
+    finally:
+        state.finish_controller_action(run_id, proposal_epoch_id, action_id, outcome)
 
 
 @control_mcp.tool()
@@ -1776,6 +1837,19 @@ def _consume_controller_integration_action(
     if state.consume_controller_action(run_id, epoch_id, action_id) is None:
         return (
             "integration action is not claimed; the main controller must call "
+            "get_runnable_actions and claim_runnable_action first"
+        )
+    return None
+
+
+def _consume_controller_route_review_action(
+    state: RouteState, run_id: str, epoch_id: str, proposal_id: str,
+) -> str | None:
+    """Require a controller-planned route-review action before disposition."""
+    action_id = f"route-proposal:{proposal_id}"
+    if not epoch_id or state.consume_controller_action(run_id, epoch_id, action_id) is None:
+        return (
+            "route-review action is not claimed; the main controller must call "
             "get_runnable_actions and claim_runnable_action first"
         )
     return None

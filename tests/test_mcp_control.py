@@ -161,7 +161,8 @@ def test_fastpath_proposal_requires_main_controller_and_can_apply_logical_route(
         repository_features={}, deterministic_signals=[], minimum_tier="normal",
     )
     state.create_route_proposal(
-        proposal_id="proposal-1", intake_id=intake["intake_id"], source="fastpath",
+        proposal_id="proposal-1", intake_id=intake["intake_id"],
+        run_id="r1", epoch_id="ep-1", source="fastpath",
         parsed_proposal={
             "routes": {"implementer": {"model": "longcat-2", "endpoint": "auto"}},
         }, validation_status="accepted_for_controller_review", confidence=0.99,
@@ -183,6 +184,9 @@ def test_fastpath_proposal_requires_main_controller_and_can_apply_logical_route(
             registry_hash="test-registry", certification_id=None,
             auth_spec_json=None, api_key_env="LONGCAT_API_KEY",
         )
+        runnable = state.get_runnable_actions("r1", "ep-1")
+        assert any(item["action_id"] == "route-proposal:proposal-1" for item in runnable)
+        state.claim_runnable_action("r1", "ep-1", "route-proposal:proposal-1")
         accepted = asyncio.run(
             mcp_control.accept_route_proposal(
                 "proposal-1", "controller approved", apply_routes=True,
@@ -191,6 +195,100 @@ def test_fastpath_proposal_requires_main_controller_and_can_apply_logical_route(
         assert accepted["accepted"] is True
         assert accepted["applied_routes"] is True
         assert state.get_role_route("r1", "ep-1", "implementer")["model_id"] == "longcat-2"
+    finally:
+        mcp_control.set_current_run_id(None)
+
+
+def test_get_route_proposal_outcomes_requires_an_active_run(monkeypatch: pytest.MonkeyPatch):
+    from enhanced_router import mcp_control
+
+    monkeypatch.setattr(mcp_control, "_get_current_run_id", lambda: None)
+    result = asyncio.run(mcp_control.get_route_proposal_outcomes())
+    assert result["found"] is False
+
+
+def test_get_route_proposal_outcomes_returns_aggregated_telemetry(
+    state: RouteState, monkeypatch: pytest.MonkeyPatch,
+):
+    from enhanced_router import mcp_control
+
+    state.create_run("r1", session_id="main-session", cwd="/tmp")
+    intake = state.create_task_intake(
+        intake_id="intake-1", run_id="r1", session_id="main-session",
+        prompt="implement the change", request_kind="change",
+        repository_features={}, deterministic_signals=[], minimum_tier="normal",
+    )
+    state.create_route_proposal(
+        proposal_id="proposal-1", intake_id=intake["intake_id"],
+        run_id="r1", epoch_id="ep-1", source="fastpath",
+        parsed_proposal={"routes": {}}, validation_status="accepted_for_controller_review",
+    )
+    monkeypatch.setattr(mcp_control, "get_state", lambda: state)
+    mcp_control.set_current_run_id("r1")
+    try:
+        result = asyncio.run(mcp_control.get_route_proposal_outcomes())
+        assert result["found"] is True
+        assert result["total"] == 1
+        assert result["by_validation_status"]["accepted_for_controller_review"] == 1
+    finally:
+        mcp_control.set_current_run_id(None)
+
+
+def test_accept_route_proposal_rejects_a_proposal_targeting_an_already_bound_role(
+    state: RouteState, monkeypatch: pytest.MonkeyPatch,
+):
+    """P1-1: a proposal cannot replace a role that already has an active
+    binding -- the role's execution is already underway."""
+    from enhanced_router import mcp_control
+    from enhanced_router.registry import ModelRegistry
+
+    registry = ModelRegistry(Path(__file__).resolve().parents[1] / "config")
+    registry.load_models()
+    monkeypatch.setattr(mcp_control, "_get_registry", lambda: registry)
+
+    state.create_run("r1", session_id="main-session", cwd="/tmp")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    intake = state.create_task_intake(
+        intake_id="intake-1", run_id="r1", session_id="main-session",
+        prompt="implement the change", request_kind="change",
+        repository_features={}, deterministic_signals=[], minimum_tier="normal",
+    )
+    state.create_route_proposal(
+        proposal_id="proposal-1", intake_id=intake["intake_id"],
+        run_id="r1", epoch_id="ep-1", source="fastpath",
+        parsed_proposal={
+            "routes": {"implementer": {"model": "longcat-2", "endpoint": "auto"}},
+        }, validation_status="accepted_for_controller_review", confidence=0.99,
+    )
+    state.bind_or_get_agent("r1", "agent-1", "ep-1", "implementer", "longcat-2", 1)
+
+    monkeypatch.setattr(mcp_control, "get_state", lambda: state)
+    mcp_control.set_current_run_id("r1")
+    try:
+        state.bind_or_get_controller(
+            run_id="r1", client_session_id="main-session", public_model="longcat-2",
+            registry_model_id="longcat-2", backend="direct-anthropic",
+            upstream_model="LongCat-2.0", provider_id=None,
+            api_base="https://api.longcat.chat/anthropic", catalog_generation=None,
+            registry_hash="test-registry", certification_id=None,
+            auth_spec_json=None, api_key_env="LONGCAT_API_KEY",
+        )
+        state.claim_runnable_action("r1", "ep-1", "route-proposal:proposal-1")
+        result = asyncio.run(
+            mcp_control.accept_route_proposal(
+                "proposal-1", "controller approved", apply_routes=True,
+            )
+        )
+        assert result["accepted"] is False
+        assert "already-bound" in result["error"]
+        # The rejected proposal is not silently dispositioned -- it stays
+        # actionable so the controller can still explicitly reject it.
+        assert state.get_route_proposal("proposal-1")["controller_disposition"] is None
+        # The failed attempt terminalizes this claim, but (matching the same
+        # pattern as a failed shadow-integration attempt) the action
+        # reappears so the controller isn't stuck.
+        runnable_again = state.get_runnable_actions("r1", "ep-1")
+        assert any(item["action_id"] == "route-proposal:proposal-1" for item in runnable_again)
     finally:
         mcp_control.set_current_run_id(None)
 

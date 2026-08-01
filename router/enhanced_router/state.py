@@ -303,6 +303,9 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     if current < 39:
         _migrate_v39(conn)
         conn.execute("PRAGMA user_version = 39")
+    if current < 40:
+        _migrate_v40(conn)
+        conn.execute("PRAGMA user_version = 40")
 
 
 def _needs_v37_hardening(conn: sqlite3.Connection) -> bool:
@@ -1284,6 +1287,31 @@ def _migrate_v39(conn: sqlite3.Connection) -> None:
     inheriting the primary route's endpoint (or "auto").
     """
     _add_column_if_missing(conn, "role_routes", "fallback_routes_json", "TEXT")
+
+
+def _migrate_v40(conn: sqlite3.Connection) -> None:
+    """Give route_proposals a real queued/running/completed/failed/expired
+    lifecycle bound to the run/epoch it was generated for.
+
+    Previously the row was only INSERTed after the detached fastpath model
+    call finished, so a proposal_id handed to a caller in the "queued" HTTP
+    response could resolve to "not found" for however long inference took.
+    It also had no run_id/epoch_id of its own (only reachable indirectly via
+    its intake), so a late proposal from an earlier epoch could be accepted
+    during a later epoch of the same run. status/expires_at/configuration_hash/
+    candidate_digest support reserving the row up front and CAS-guarding
+    every subsequent transition (running/completed/failed/disposition).
+    Existing rows all predate this lifecycle and were only ever written once
+    fully resolved, so they default to status='completed'.
+    """
+    _add_column_if_missing(conn, "route_proposals", "run_id", "TEXT")
+    _add_column_if_missing(conn, "route_proposals", "epoch_id", "TEXT")
+    _add_column_if_missing(conn, "route_proposals", "execution_id", "TEXT")
+    _add_column_if_missing(conn, "route_proposals", "status", "TEXT NOT NULL DEFAULT 'completed'")
+    _add_column_if_missing(conn, "route_proposals", "configuration_hash", "TEXT")
+    _add_column_if_missing(conn, "route_proposals", "candidate_digest", "TEXT")
+    _add_column_if_missing(conn, "route_proposals", "expires_at", "TEXT")
+    _add_column_if_missing(conn, "route_proposals", "completed_at", "TEXT")
 
 
 def _migrate_v37(conn: sqlite3.Connection) -> None:

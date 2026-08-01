@@ -393,6 +393,13 @@ class SidecarExecutor:
             result_json = json.dumps(result, separators=(",", ":"), ensure_ascii=False)
             if len(result_json.encode("utf-8")) > _MAX_RESULT_BYTES:
                 raise ValueError("detached sidecar result exceeds the 128 KiB bound")
+            # A bypass (e.g. app.py's failure_policy="bypass" path) returns a
+            # normal dict, not an exception -- without this branch every
+            # bypass was indistinguishable from a genuine success: same
+            # status="completed", schema_valid=True, quality_score=1.0. That
+            # silently corrupted quality metrics and made a bypass
+            # unretryable (retry() only permits status in {failed, timeout}).
+            is_bypass = str(result.get("validation_status") or "") == "bypassed"
             completed = self.state.update_agent_execution(
                 execution_id,
                 status="completed",
@@ -400,10 +407,10 @@ class SidecarExecutor:
                 result_summary=self._summary(result),
                 output_hash=hashlib.sha256(result_json.encode("utf-8")).hexdigest(),
                 result_json=result_json,
-                schema_valid=True,
-                evidence_valid=True,
+                schema_valid=not is_bypass,
+                evidence_valid=not is_bypass,
                 accepted_by_controller=False,
-                quality_score=1.0,
+                quality_score=0.0 if is_bypass else 1.0,
             )
             self._detached_jobs.pop(execution_id, None)
             self._event(execution_id, completed or execution, "completed", {

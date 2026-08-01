@@ -179,6 +179,51 @@ class RunnableActionRepository:
                     "intent_id": claim.get("intent_id"),
                 })
             actions.append(action)
+        for proposal in self.get_pending_route_proposals(run_id, epoch_id):
+            action_id = f"route-proposal:{proposal['proposal_id']}"
+            claim = claims.get(action_id)
+            if claim is not None and not include_claimed:
+                continue
+            try:
+                affected_roles = sorted(
+                    json.loads(str(proposal.get("parsed_proposal_json") or "{}")).get("routes", {})
+                )
+            except (TypeError, ValueError):
+                affected_roles = []
+            controller_model = "controller"
+            run = self.get_run(run_id)
+            if run and run.get("claude_session_id"):
+                binding = self.get_controller_binding(
+                    run_id, str(run["claude_session_id"])
+                )
+                if binding and binding.get("registry_model_id"):
+                    controller_model = str(binding["registry_model_id"])
+            action = {
+                "action_id": action_id,
+                "action_kind": "controller_route_review",
+                "requires_main_controller": True,
+                "proposal_id": proposal["proposal_id"],
+                "phase_id": "controller-route-review",
+                "role": "controller",
+                "native_agent_name": "controller",
+                "model_id": controller_model,
+                "affected_roles": affected_roles,
+                "confidence": proposal.get("confidence"),
+                "expires_at": proposal.get("expires_at"),
+                "required_action": (
+                    "call get_route_proposal, then accept_route_proposal or "
+                    "reject_route_proposal before spawning the affected role(s)"
+                ),
+                "status": "escalated",
+            }
+            if claim is not None:
+                action.update({
+                    "status": str(claim["status"]),
+                    "claim_token": claim["claim_token"],
+                    "reservation_id": claim.get("reservation_id"),
+                    "intent_id": claim.get("intent_id"),
+                })
+            actions.append(action)
         for phase in self.get_ready_phases(run_id, epoch_id) + self.get_active_phases(run_id, epoch_id):
             actor_contract = str(phase.get("required_actor") or phase.get("actor") or "")
             controller_phase = actor_contract == "controller"
@@ -552,14 +597,14 @@ class RunnableActionRepository:
         action_id: str,
         status: str,
     ) -> dict | None:
-        """Terminalize a consumed controller-integration action.
+        """Terminalize a consumed controller-integration or route-review action.
 
-        Controller integration is a two-step operation: the controller first
-        consumes the claim immediately before acting, then the integration or
-        resolution operation records its outcome.  Keeping the claim in
+        Both are two-step operations: the controller first consumes the
+        claim immediately before acting, then the integration/resolution/
+        disposition operation records its outcome.  Keeping the claim in
         ``consumed`` after that outcome would make it look active forever and
-        would prevent the same candidate from being claimed again after a
-        failed integration or an explicit retry decision.
+        would prevent the same candidate/proposal from being claimed again
+        after a failed integration or an explicit retry decision.
         """
         if status not in {"completed", "failed", "cancelled", "orphaned"}:
             raise ValueError(f"invalid controller action status: {status}")
@@ -570,7 +615,8 @@ class RunnableActionRepository:
             updated = conn.execute(
                 "UPDATE runnable_action_claims SET status=?, consumed_at=COALESCE(consumed_at, ?) "
                 "WHERE action_id=? AND run_id=? AND epoch_id=? AND role='controller' "
-                "AND action_kind='controller_integration' AND status='consumed'",
+                "AND action_kind IN ('controller_integration', 'controller_route_review') "
+                "AND status='consumed'",
                 (status, now, action_id, run_id, epoch_id),
             )
             if updated.rowcount != 1:

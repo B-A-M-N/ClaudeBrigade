@@ -256,7 +256,7 @@ class TestResolvedRoute:
             ),
         )
 
-        async def acquire(route, request, *, streaming=False):
+        async def acquire(route, request, *, streaming=False, priority=False):
             assert route.provider_id == "freeinference"
             assert route.endpoint_id == "openai"
             assert request.headers["authorization"] == "Bearer secret"

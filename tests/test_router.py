@@ -162,6 +162,37 @@ async def test_fastpath_route_can_detach_from_prompt_intake(monkeypatch):
     assert execution["execution_id"] == "fp-test"
 
 
+def test_enrich_route_packet_offers_candidates_only_for_unbound_roles(tmp_path):
+    """P0-1: the packet actually sent to the fastpath model must carry real,
+    router-computed candidates -- not the bare task-facts-only packet the
+    hook builds, and not candidates for a role that's already bound."""
+    from pathlib import Path
+
+    import enhanced_router.app as app_module
+    from enhanced_router.registry import ModelRegistry
+    from enhanced_router.state import RouteState
+
+    state = RouteState(tmp_path / "state.db")
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    state.bind_or_get_agent("r1", "agent-1", "ep-1", "implementer", "longcat-2", 1)
+
+    registry = ModelRegistry(Path(__file__).resolve().parents[1] / "config")
+    registry.load_models()
+
+    packet, candidates = app_module._enrich_route_packet(
+        {"run_id": "r1", "epoch_id": "ep-1", "task": "do the thing"},
+        registry=registry, state=state,
+    )
+    assert "implementer" not in packet["unbound_roles"]
+    assert "recon" in packet["unbound_roles"]
+    assert not any(c.role == "implementer" for c in candidates)
+    assert any(c.role == "recon" for c in candidates)
+    assert packet["candidates"] == [c.model_dump() for c in candidates]
+    # Original packet facts are preserved, not replaced.
+    assert packet["task"] == "do the thing"
+
+
 # ==================================================================
 # Anthropic passthrough backend tests
 # ==================================================================

@@ -41,7 +41,7 @@ class RunOrchestrationRepository:
     def _new_conn(self) -> sqlite3.Connection:  # pragma: no cover - overridden by RouteState
         raise NotImplementedError
 
-    def begin_task(
+    def prepare_task_plan(
         self,
         run_id: str,
         session_id: str,
@@ -56,24 +56,20 @@ class RunOrchestrationRepository:
         baseline_fingerprint: str | None = None,
         contract: dict | None = None,
     ) -> dict:
-        """Authoritative task start — atomic run + epoch + phases creation.
+        """Compute the deterministic task plan without writing anything yet.
 
-        Creates or idempotently confirms the run, creates a fresh epoch
-        from the workflow+profile, initializes all workflow phases with
-        full semantics, and returns the task contract.
-
-        This is the single authoritative entry point for starting a new
-        task/epoch. All hooks call this instead of doing inline
-        run/epoch/phase creation.
-
-        Returns dict with: run_id, epoch_id, workflow_id, profile_id,
-        phases, specification_hash.
+        Pure/read-only: resolves the effective workflow+profile from
+        registry state and pre-generates the epoch_id that
+        materialize_task_epoch will later create -- letting a caller (e.g.
+        the fastpath-aware two-stage task start) reference that exact
+        epoch_id (for a fastpath packet, a reserved route proposal, ...)
+        before the epoch row itself exists. Returns everything
+        materialize_task_epoch needs as **kwargs.
         """
         from enhanced_router.registry import get_registry
 
         signals = signals or []
 
-        # Determine effective workflow
         if force_workflow:
             effective_workflow = force_workflow
         elif minimum_tier:
@@ -83,7 +79,6 @@ class RunOrchestrationRepository:
             tier = determine_tier(signals) if signals else (workflow_id or "normal")
             effective_workflow = tier
 
-        # Verify workflow exists
         reg = get_registry()
         reg.load_workflows()
         spec = reg.get_workflow(effective_workflow)
@@ -91,8 +86,67 @@ class RunOrchestrationRepository:
             raise ValueError(f"Workflow '{effective_workflow}' not found in registry")
         reg.load_profiles()
         effective_profile_id = profile_id or spec.default_profile
-        profile = reg.get_profile(effective_profile_id)
+        # Confirm the profile actually resolves now, while it's cheap to
+        # fail -- materialize_task_epoch re-resolves it again for its own
+        # transaction rather than trusting a plan built against
+        # possibly-stale registry state.
+        reg.get_profile(effective_profile_id)
         prompt_digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest() if prompt else None
+
+        return {
+            "run_id": run_id,
+            "session_id": session_id,
+            "cwd": cwd,
+            "epoch_id": f"ep_{_utcnow().replace(':', '-').replace('.', '-')}",
+            "workflow_id": effective_workflow,
+            "profile_id": effective_profile_id,
+            "prompt_digest": prompt_digest,
+            "intake_id": intake_id,
+            "minimum_tier": minimum_tier or effective_workflow,
+            "baseline_fingerprint": baseline_fingerprint,
+            "contract": contract,
+        }
+
+    def materialize_task_epoch(
+        self,
+        plan: dict,
+        *,
+        route_overrides: dict[str, str] | None = None,
+    ) -> dict:
+        """Atomic run + epoch + routes + phases creation from a prepared plan.
+
+        This is the single authoritative entry point that actually writes a
+        new task/epoch. *route_overrides* lets a validated, accepted
+        fastpath route proposal that arrived during prepare_task_plan's
+        caller-side wait replace the profile default for specific roles --
+        atomically, as part of this same epoch materialization, rather than
+        via a separate post-hoc set_role_route call after the epoch (and its
+        phase DAG) already exist. Only unbound roles should ever be
+        overridden this way; there is nothing bound yet at materialization
+        time by construction, since binding requires an active epoch.
+        """
+        from enhanced_router.registry import get_registry
+
+        run_id = str(plan["run_id"])
+        session_id = str(plan["session_id"])
+        cwd = str(plan["cwd"])
+        epoch_id = str(plan["epoch_id"])
+        effective_workflow = str(plan["workflow_id"])
+        effective_profile_id = str(plan["profile_id"])
+        prompt_digest = plan.get("prompt_digest")
+        intake_id = plan.get("intake_id")
+        minimum_tier = plan.get("minimum_tier")
+        baseline_fingerprint = plan.get("baseline_fingerprint")
+        contract = plan.get("contract")
+        route_overrides = route_overrides or {}
+
+        reg = get_registry()
+        reg.load_workflows()
+        spec = reg.get_workflow(effective_workflow)
+        if spec is None:
+            raise ValueError(f"Workflow '{effective_workflow}' not found in registry")
+        reg.load_profiles()
+        profile = reg.get_profile(effective_profile_id)
 
         conn = self._new_conn()
         try:
@@ -128,8 +182,7 @@ class RunOrchestrationRepository:
                 conn.rollback()
                 raise ValueError(f"Active epoch already exists for run {run_id}")
 
-            # 3. Create epoch
-            epoch_id = f"ep_{_utcnow().replace(':', '-').replace('.', '-')}"
+            # 3. Create epoch (epoch_id already generated by prepare_task_plan)
             conn.execute(
                 "INSERT INTO epochs (run_id, epoch_id, workflow_id, profile_id, status, created_at,"
                 " prompt_digest, minimum_tier, intake_id, contract_json, baseline_fingerprint)"
@@ -140,34 +193,48 @@ class RunOrchestrationRepository:
                  baseline_fingerprint),
             )
 
-            # 4. Set profile routes atomically
+            # 4. Set profile routes atomically, applying any accepted
+            # fastpath route_override for a role in place of the profile
+            # default -- this is what actually makes a proposal that arrived
+            # in time affect the initial materialization instead of only
+            # ever being applicable after the fact via set_role_route.
             now = _utcnow()
             for role in ("recon", "implementer", "adversary", "repairer"):
                 target = profile.route_target(role)
-                model_id = target.model
+                override_model_id = route_overrides.get(role)
+                model_id = override_model_id or target.model
+                source = f"fastpath-accepted:{effective_profile_id}" if override_model_id else f"profile:{effective_profile_id}"
+                event_type = "fastpath_route_set" if override_model_id else "profile_set"
                 conn.execute(
                     """INSERT INTO role_routes (run_id, epoch_id, role, model_id, source, reason, version, changed_at)
-                       VALUES (?, ?, ?, ?, 'profile', ?, 1, ?)
+                       VALUES (?, ?, ?, ?, ?, ?, 1, ?)
                        ON CONFLICT(run_id, epoch_id, role) DO UPDATE SET
                            model_id = excluded.model_id,
                            source = excluded.source,
                            reason = excluded.reason,
                            version = version + 1,
                            changed_at = excluded.changed_at""",
-                    (run_id, epoch_id, role, model_id, f"profile:{effective_profile_id}", now),
+                    (run_id, epoch_id, role, model_id, source, source, now),
+                )
+                # A fastpath-selected route always uses "auto" endpoint
+                # selection (fastpath never chooses a physical endpoint,
+                # same invariant FastpathPolicyValidator enforces); only a
+                # profile default may pin an explicit endpoint.
+                endpoint_id = None if override_model_id else (
+                    None if target.endpoint == "auto" else target.endpoint
                 )
                 conn.execute(
                     "UPDATE role_routes SET endpoint_id=? WHERE run_id=? AND epoch_id=? AND role=?",
-                    (None if target.endpoint == "auto" else target.endpoint, run_id, epoch_id, role),
+                    (endpoint_id, run_id, epoch_id, role),
                 )
                 conn.execute(
                     "UPDATE role_routes SET fallback_models_json=? WHERE run_id=? AND epoch_id=? AND role=?",
-                    (json.dumps(target.fallback_models), run_id, epoch_id, role),
+                    (json.dumps([] if override_model_id else target.fallback_models), run_id, epoch_id, role),
                 )
                 conn.execute(
                     "INSERT INTO route_events (run_id, epoch_id, event_type, role, new_model_id, created_at) "
-                    "VALUES (?, ?, 'profile_set', ?, ?, ?)",
-                    (run_id, epoch_id, role, model_id, now),
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (run_id, epoch_id, event_type, role, model_id, now),
                 )
 
             # 5. Initialize workflow phases
@@ -287,6 +354,37 @@ class RunOrchestrationRepository:
             raise
         finally:
             conn.close()
+
+    def begin_task(
+        self,
+        run_id: str,
+        session_id: str,
+        cwd: str,
+        workflow_id: str | None = None,
+        profile_id: str | None = None,
+        signals: list[str] | None = None,
+        force_workflow: str | None = None,
+        prompt: str = "",
+        intake_id: str | None = None,
+        minimum_tier: str | None = None,
+        baseline_fingerprint: str | None = None,
+        contract: dict | None = None,
+    ) -> dict:
+        """One-shot task start: prepare_task_plan then materialize_task_epoch
+        with no route overrides.
+
+        Kept for callers that don't need the two-stage fastpath-aware flow
+        (a bounded wait for a route proposal between planning and
+        materializing) -- exactly the previous begin_task behavior,
+        composed from the same two building blocks that flow now uses.
+        """
+        plan = self.prepare_task_plan(
+            run_id, session_id, cwd, workflow_id=workflow_id, profile_id=profile_id,
+            signals=signals, force_workflow=force_workflow, prompt=prompt,
+            intake_id=intake_id, minimum_tier=minimum_tier,
+            baseline_fingerprint=baseline_fingerprint, contract=contract,
+        )
+        return self.materialize_task_epoch(plan)
 
     def validate_completion(
         self,
