@@ -28,9 +28,15 @@ def _strip_thought_envelope(content: str) -> str:
 class FastpathRoleProposal(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    # ``model``/``endpoint`` are the public route-proposal shape.  ``slot``
-    # and ``preferred_logical_model`` remain accepted for older local
-    # fastpath prompts, but the sidecar never chooses a physical endpoint.
+    # ``candidate_id`` is the preferred shape: a compact alias (e.g. "i0")
+    # into the per-role candidate list the router offered in the packet,
+    # resolved back to a real model_id by FastpathPolicyValidator against
+    # that same offered set -- the model never has to spell out (or invent)
+    # a full model_id. ``model``/``preferred_logical_model`` remain accepted
+    # for older local fastpath prompts that still propose a model directly;
+    # ``endpoint`` stays fixed at "auto" either way, since the sidecar never
+    # chooses a physical endpoint.
+    candidate_id: str | None = None
     model: str | None = None
     endpoint: Literal["auto"] = "auto"
     slot: Literal["fast", "work", "deep"] = "work"
@@ -76,6 +82,71 @@ class FastpathVerification(BaseModel):
         if not 0.0 <= value <= 1.0:
             raise ValueError("confidence must be between 0 and 1")
         return value
+
+
+# Role -> compact alias prefix. "p" for repairer since "r" is taken by recon.
+_ROLE_ALIAS_PREFIX = {"recon": "r", "implementer": "i", "adversary": "a", "repairer": "p"}
+
+
+def build_route_candidates(
+    registry: Any, roles: list[str], *, limit: int = 3,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, str]]]:
+    """Build a compact, packet-safe candidate list per role plus its
+    server-side alias -> model_id resolution map.
+
+    DiffusionGemma only ever sees the alias (e.g. "i0"), never the raw
+    model_id -- the router owns the mapping and FastpathPolicyValidator
+    resolves the chosen alias back to a real model_id from this same
+    offered set, so a route output can never introduce an arbitrary
+    candidate the router didn't actually offer.
+    """
+    packet_candidates: dict[str, list[dict[str, Any]]] = {}
+    candidate_map: dict[str, dict[str, str]] = {}
+    for role in roles:
+        prefix = _ROLE_ALIAS_PREFIX.get(role)
+        if prefix is None:
+            continue
+        ranked = registry.recommend(role)[:limit]
+        role_candidates = []
+        role_map: dict[str, str] = {}
+        for index, entry in enumerate(ranked):
+            alias = f"{prefix}{index}"
+            role_map[alias] = entry.model_id
+            role_candidates.append({"candidate_id": alias, "score": entry.score})
+        if role_candidates:
+            packet_candidates[role] = role_candidates
+            candidate_map[role] = role_map
+    return packet_candidates, candidate_map
+
+
+def route_template(minimum_tier: str, roles: list[str]) -> dict[str, Any]:
+    """Fail-safe default route output: escalates and proposes nothing.
+
+    DiffusionGemma must positively alter this state (select a real offered
+    candidate_id, raise confidence, or clear escalate_to_controller with
+    justification) to produce an accepted recommendation -- silence or an
+    unparseable/invalid response never defaults to an accepted route.
+    """
+    return {
+        "workflow_tier": minimum_tier,
+        "recommended_roles": [],
+        "routes": {role: {"candidate_id": None} for role in roles},
+        "parallel_groups": [],
+        "signals": [],
+        "confidence": 0.0,
+        "escalate_to_controller": True,
+    }
+
+
+def verification_template(check_names: list[str]) -> dict[str, Any]:
+    """Fail-safe default verification output: never initializes to pass."""
+    return {
+        "decision": "escalate",
+        "checks": {name: "unknown" for name in check_names},
+        "violations": [],
+        "requires_full_adversary": True,
+        "confidence": 0.0,
+    }
 
 
 @dataclass(frozen=True)
@@ -155,6 +226,7 @@ class FastpathPolicyValidator:
         state: Any,
         configuration_hash: str,
         confidence_threshold: float = 0.88,
+        candidate_map: dict[str, dict[str, str]] | None = None,
     ) -> FastpathRouteProposal:
         if self._tier_order[proposal.workflow_tier] < self._tier_order.get(minimum_tier, 1):
             raise ValueError("fastpath attempted to lower the deterministic workflow tier")
@@ -169,9 +241,23 @@ class FastpathPolicyValidator:
         for role, target in proposal.routes.items():
             if role not in {"recon", "implementer", "adversary", "repairer"}:
                 raise ValueError(f"fastpath proposed unknown role '{role}'")
-            model_id = target.logical_model
             if target.endpoint != "auto":
                 raise ValueError("fastpath cannot select a physical endpoint")
+            if target.candidate_id is not None:
+                # The compact-alias path: the model never named a real
+                # model_id, only an alias into the candidate set the router
+                # itself offered for this role -- resolving it here means a
+                # route output can never introduce a candidate that wasn't
+                # actually offered, regardless of what the model returns.
+                offered = (candidate_map or {}).get(role, {})
+                model_id = offered.get(target.candidate_id)
+                if model_id is None:
+                    raise ValueError(
+                        f"fastpath selected candidate '{target.candidate_id}' for "
+                        f"role '{role}', which was not in the offered set"
+                    )
+            else:
+                model_id = target.logical_model
             if model_id is None:
                 continue
             spec = registry.get_model(model_id)

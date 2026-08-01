@@ -8,6 +8,9 @@ from enhanced_router.fastpath import (
     FastpathPolicyValidator,
     FastpathRouteProposal,
     FastpathVerification,
+    build_route_candidates,
+    route_template,
+    verification_template,
     _strip_thought_envelope,
 )
 
@@ -23,6 +26,23 @@ class FakeRegistry:
 class FakeState:
     def get_endpoint_observations(self, *args, **kwargs):
         return {}
+
+
+class _RankedModel:
+    def __init__(self, model_id: str, score: int):
+        self.model_id = model_id
+        self.score = score
+
+
+class FakeRecommendingRegistry(FakeRegistry):
+    """FakeRegistry plus a deterministic .recommend(role) for candidate tests."""
+
+    def __init__(self, models, ranked_by_role: dict[str, list[_RankedModel]]):
+        super().__init__(models)
+        self.ranked_by_role = ranked_by_role
+
+    def recommend(self, role):
+        return self.ranked_by_role.get(role, [])
 
 
 def test_route_schema_rejects_unknown_keys_and_bad_confidence():
@@ -221,3 +241,117 @@ async def test_request_raises_clean_error_on_invalid_json(monkeypatch):
     client = _fake_client()
     with pytest.raises(ValueError, match="not valid JSON"):
         await client.request("verify", {"contract": {}})
+
+
+def test_route_template_defaults_to_escalation():
+    template = route_template("normal", ["recon", "implementer"])
+    assert template["confidence"] == 0.0
+    assert template["escalate_to_controller"] is True
+    assert template["recommended_roles"] == []
+    assert template["routes"] == {
+        "recon": {"candidate_id": None},
+        "implementer": {"candidate_id": None},
+    }
+
+
+def test_verification_template_defaults_to_escalation():
+    template = verification_template(["lint", "tests"])
+    assert template["decision"] == "escalate"
+    assert template["confidence"] == 0.0
+    assert template["requires_full_adversary"] is True
+    assert template["checks"] == {"lint": "unknown", "tests": "unknown"}
+
+
+def test_build_route_candidates_produces_compact_deterministic_aliases():
+    registry = FakeRecommendingRegistry({}, {
+        "implementer": [
+            _RankedModel("provider/big-model-name", 10),
+            _RankedModel("provider/other-model", 8),
+        ],
+        "recon": [_RankedModel("provider/scout", 9)],
+    })
+    packet_candidates, candidate_map = build_route_candidates(
+        registry, ["recon", "implementer", "adversary"],
+    )
+    assert packet_candidates["implementer"] == [
+        {"candidate_id": "i0", "score": 10},
+        {"candidate_id": "i1", "score": 8},
+    ]
+    assert packet_candidates["recon"] == [{"candidate_id": "r0", "score": 9}]
+    assert "adversary" not in packet_candidates  # no ranked models -> omitted
+
+    # No raw model_id leaks into the packet-safe candidate list.
+    for role_candidates in packet_candidates.values():
+        for entry in role_candidates:
+            assert "model_id" not in entry
+
+    assert candidate_map["implementer"] == {
+        "i0": "provider/big-model-name", "i1": "provider/other-model",
+    }
+    assert candidate_map["recon"] == {"r0": "provider/scout"}
+
+
+def test_build_route_candidates_respects_limit():
+    registry = FakeRecommendingRegistry({}, {
+        "recon": [_RankedModel(f"model-{i}", 10 - i) for i in range(5)],
+    })
+    packet_candidates, candidate_map = build_route_candidates(registry, ["recon"], limit=2)
+    assert len(packet_candidates["recon"]) == 2
+    assert set(candidate_map["recon"]) == {"r0", "r1"}
+
+
+def _write_certified_model(model_id: str):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        enabled=True,
+        allowed_roles=["implementer"],
+        capabilities=SimpleNamespace(write_tool_certified=True),
+    )
+
+
+def test_validate_route_resolves_candidate_id_from_offered_set():
+    registry = FakeRegistry({"provider/big-model-name": _write_certified_model("provider/big-model-name")})
+    proposal = FastpathRouteProposal.model_validate({
+        "workflow_tier": "normal",
+        "recommended_roles": ["implementer"],
+        "routes": {"implementer": {"candidate_id": "i0"}},
+        "confidence": 0.99,
+        "escalate_to_controller": False,
+    })
+    validated = FastpathPolicyValidator().validate_route(
+        proposal, minimum_tier="normal", registry=registry, state=FakeState(),
+        configuration_hash="cfg",
+        candidate_map={"implementer": {"i0": "provider/big-model-name"}},
+    )
+    assert validated.routes["implementer"].candidate_id == "i0"
+
+
+def test_validate_route_rejects_a_candidate_id_not_in_the_offered_set():
+    proposal = FastpathRouteProposal.model_validate({
+        "workflow_tier": "normal",
+        "recommended_roles": ["implementer"],
+        "routes": {"implementer": {"candidate_id": "i7"}},
+        "confidence": 0.99,
+        "escalate_to_controller": False,
+    })
+    with pytest.raises(ValueError, match="not in the offered set"):
+        FastpathPolicyValidator().validate_route(
+            proposal, minimum_tier="normal", registry=FakeRegistry({}), state=FakeState(),
+            configuration_hash="cfg",
+            candidate_map={"implementer": {"i0": "provider/big-model-name"}},
+        )
+
+
+def test_validate_route_rejects_candidate_id_when_no_candidates_were_offered():
+    proposal = FastpathRouteProposal.model_validate({
+        "workflow_tier": "normal",
+        "recommended_roles": ["implementer"],
+        "routes": {"implementer": {"candidate_id": "i0"}},
+        "confidence": 0.99,
+        "escalate_to_controller": False,
+    })
+    with pytest.raises(ValueError, match="not in the offered set"):
+        FastpathPolicyValidator().validate_route(
+            proposal, minimum_tier="normal", registry=FakeRegistry({}), state=FakeState(),
+            configuration_hash="cfg", candidate_map=None,
+        )

@@ -307,13 +307,26 @@ async def _wait_fastpath_job(execution_id: str) -> dict[str, Any]:
 
 async def _run_fastpath_route(packet: dict[str, Any]) -> dict[str, Any]:
     """Execute one advisory route call after its request has been detached."""
-    from enhanced_router.fastpath import FastpathClient, FastpathLimits, FastpathPolicyValidator, FastpathRouteProposal
+    from enhanced_router.fastpath import (
+        FastpathClient, FastpathLimits, FastpathPolicyValidator, FastpathRouteProposal,
+        build_route_candidates, route_template,
+    )
     from enhanced_router.registry import get_registry
 
     registry = get_registry()
     config = _resolve_run_fastpath(registry, packet.get("run_id"))
     if config is None or not config.enabled or "route" not in config.modes:
         raise HTTPException(status_code=404, detail="fastpath route mode is disabled")
+
+    minimum_tier = str(packet.get("deterministic_minimum_tier", "normal"))
+    roles = ["recon", "implementer", "adversary", "repairer"]
+    packet_candidates, candidate_map = build_route_candidates(registry, roles)
+    packet = {
+        **packet,
+        "candidates": packet_candidates,
+        "output_template": route_template(minimum_tier, roles),
+    }
+
     encoded = json.dumps(packet, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     if len(encoded) > config.max_packet_bytes:
         raise HTTPException(status_code=413, detail="fastpath packet exceeds byte limit")
@@ -354,11 +367,11 @@ async def _run_fastpath_route(packet: dict[str, Any]) -> dict[str, Any]:
     try:
         result = await client.request("route", packet)
         proposal = FastpathRouteProposal.model_validate(result)
-        minimum = str(packet.get("deterministic_minimum_tier", "normal"))
         FastpathPolicyValidator().validate_route(
-            proposal, minimum_tier=minimum, registry=registry, state=get_state(),
+            proposal, minimum_tier=minimum_tier, registry=registry, state=get_state(),
             configuration_hash=registry.registry_hash(),
             confidence_threshold=config.route_confidence_threshold,
+            candidate_map=candidate_map,
         )
         result_payload = {
             **proposal.model_dump(),
