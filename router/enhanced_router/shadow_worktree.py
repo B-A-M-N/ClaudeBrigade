@@ -541,27 +541,32 @@ class ShadowWorktreeManager:
             expected_generation=expected_generation,
             expected_dirty_hash=expected_dirty_patch_hash,
         )
-        applied = self._run_git(self.repo_path, "apply", "--binary", input_bytes=changeset.patch)
-        if not applied.ok:
-            state.finish_integration_journal(  # type: ignore[attr-defined]
-                journal_id, "failed", applied.stderr.strip() or "apply failed",
+        # Once the journal is 'applying', begin_integration_journal refuses any
+        # other integration against this workspace, so every path below --
+        # including an unexpected exception -- must terminalize it.  Otherwise
+        # the workspace stays locked out of integration until process restart.
+        try:
+            applied = self._run_git(self.repo_path, "apply", "--binary", input_bytes=changeset.patch)
+            if not applied.ok:
+                raise GitWorkspaceError(applied.stderr.strip() or "changeset could not be applied cleanly")
+            after = self.baseline()
+            if main is not None:
+                state.advance_canonical_workspace(  # type: ignore[attr-defined]
+                    workspace_id=str(main["workspace_id"]),
+                    expected_generation=expected_generation,
+                    expected_dirty_hash=expected_dirty_patch_hash,
+                    applied_changeset_id=changeset.changeset_id,
+                    new_base_sha=after.base_sha,
+                    new_dirty_hash=after.dirty_patch_hash,
+                )
+            state.mark_changeset_merged(changeset.changeset_id)  # type: ignore[attr-defined]
+            state.mark_integration_candidate(  # type: ignore[attr-defined]
+                changeset.changeset_id, disposition="green", validation={"applied": True}
             )
-            raise GitWorkspaceError(applied.stderr.strip() or "changeset could not be applied cleanly")
-        after = self.baseline()
-        if main is not None:
-            state.advance_canonical_workspace(  # type: ignore[attr-defined]
-                workspace_id=str(main["workspace_id"]),
-                expected_generation=expected_generation,
-                expected_dirty_hash=expected_dirty_patch_hash,
-                applied_changeset_id=changeset.changeset_id,
-                new_base_sha=after.base_sha,
-                new_dirty_hash=after.dirty_patch_hash,
-            )
-        state.mark_changeset_merged(changeset.changeset_id)  # type: ignore[attr-defined]
-        state.mark_integration_candidate(  # type: ignore[attr-defined]
-            changeset.changeset_id, disposition="green", validation={"applied": True}
-        )
-        state.finish_integration_journal(journal_id, "completed")  # type: ignore[attr-defined]
+            state.finish_integration_journal(journal_id, "completed")  # type: ignore[attr-defined]
+        except Exception as exc:
+            state.finish_integration_journal(journal_id, "failed", str(exc))  # type: ignore[attr-defined]
+            raise
         return {
             "changeset_id": changeset.changeset_id,
             "base_sha": changeset.base_sha,

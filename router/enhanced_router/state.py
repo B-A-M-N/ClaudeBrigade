@@ -5619,18 +5619,61 @@ class RouteState:
         expected_generation: int,
         expected_dirty_hash: str,
     ) -> dict:
+        """Open the journal for one integration, serializing by workspace.
+
+        The DB-level canonical_generation check in advance_canonical_workspace
+        runs *after* the actual ``git apply`` has already mutated the
+        worktree, so it cannot by itself prevent two concurrent integrations
+        against the same canonical workspace from racing at the filesystem
+        level.  Rejecting a second 'applying' journal for the same
+        workspace_id here -- before any git apply happens -- is what
+        actually serializes them.
+        """
         conn = self._new_conn()
         try:
-            conn.execute(
-                "INSERT OR IGNORE INTO integration_journal "
-                "(journal_id, run_id, epoch_id, workspace_id, changeset_id, "
-                "expected_generation, expected_dirty_hash, status, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'applying', ?)",
-                (
-                    journal_id, run_id, epoch_id, workspace_id, changeset_id,
-                    expected_generation, expected_dirty_hash, _utcnow(),
-                ),
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            in_flight = conn.execute(
+                "SELECT journal_id FROM integration_journal "
+                "WHERE workspace_id=? AND status='applying'",
+                (workspace_id,),
+            ).fetchone()
+            if in_flight is not None:
+                conn.rollback()
+                raise WorkflowStateError(
+                    f"another integration is already applying to this canonical "
+                    f"workspace: {in_flight[0]}"
+                )
+            existing = conn.execute(
+                "SELECT journal_id FROM integration_journal WHERE journal_id=?",
+                (journal_id,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO integration_journal "
+                    "(journal_id, run_id, epoch_id, workspace_id, changeset_id, "
+                    "expected_generation, expected_dirty_hash, status, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'applying', ?)",
+                    (
+                        journal_id, run_id, epoch_id, workspace_id, changeset_id,
+                        expected_generation, expected_dirty_hash, _utcnow(),
+                    ),
+                )
+            else:
+                # A retry of a previously terminal (failed) attempt for the
+                # same changeset -- reopen it rather than silently reusing
+                # the stale terminal row (INSERT OR IGNORE would have done
+                # that, leaving the journal saying 'failed' while a fresh
+                # git apply proceeded underneath it).
+                conn.execute(
+                    "UPDATE integration_journal SET run_id=?, epoch_id=?, workspace_id=?, "
+                    "changeset_id=?, expected_generation=?, expected_dirty_hash=?, "
+                    "status='applying', error=NULL, created_at=?, completed_at=NULL "
+                    "WHERE journal_id=?",
+                    (
+                        run_id, epoch_id, workspace_id, changeset_id,
+                        expected_generation, expected_dirty_hash, _utcnow(), journal_id,
+                    ),
+                )
             conn.commit()
             row = conn.execute(
                 "SELECT * FROM integration_journal WHERE journal_id=?", (journal_id,)

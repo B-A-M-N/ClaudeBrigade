@@ -697,6 +697,83 @@ def test_ttl_expired_claim_releases_its_provider_reservation(
         conn.close()
 
 
+def _register_canonical_workspace(state: RouteState) -> str:
+    state.create_run("r1", session_id="s1", cwd="/tmp")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    workspace = state.create_workspace(
+        workspace_id="ws-main", run_id="r1", epoch_id="ep-1", kind="main",
+        path="/tmp/repo", base_sha="sha-0", dirty_patch_hash="dirty-0", status="active",
+    )
+    return str(workspace["workspace_id"])
+
+
+def _make_changeset(state: RouteState, changeset_id: str, workspace_id: str) -> None:
+    state.create_changeset(
+        changeset_id=changeset_id, execution_id=f"exec-{changeset_id}",
+        workspace_id=workspace_id, base_sha="sha-0", patch_digest=f"digest-{changeset_id}",
+        changed_files=["a.py"], result={"validation": {"valid": True}}, status="validated",
+        patch=b"--- a\n+++ b\n",
+    )
+
+
+def test_begin_integration_journal_rejects_concurrent_workspace_integration(
+    state: RouteState,
+):
+    """A second changeset can't start applying while another is in flight
+    against the same canonical workspace -- the actual git apply that
+    follows begin_integration_journal is not itself serialized, so this
+    check is what prevents two concurrent integrations from racing on disk.
+    """
+    workspace_id = _register_canonical_workspace(state)
+    _make_changeset(state, "cs-1", workspace_id)
+    _make_changeset(state, "cs-2", workspace_id)
+
+    state.begin_integration_journal(
+        journal_id="integration:cs-1", run_id="r1", epoch_id="ep-1",
+        workspace_id=workspace_id, changeset_id="cs-1",
+        expected_generation=0, expected_dirty_hash="dirty-0",
+    )
+
+    with pytest.raises(WorkflowStateError, match="already applying"):
+        state.begin_integration_journal(
+            journal_id="integration:cs-2", run_id="r1", epoch_id="ep-1",
+            workspace_id=workspace_id, changeset_id="cs-2",
+            expected_generation=0, expected_dirty_hash="dirty-0",
+        )
+
+    state.finish_integration_journal("integration:cs-1", "completed")
+    reopened = state.begin_integration_journal(
+        journal_id="integration:cs-2", run_id="r1", epoch_id="ep-1",
+        workspace_id=workspace_id, changeset_id="cs-2",
+        expected_generation=0, expected_dirty_hash="dirty-0",
+    )
+    assert reopened["status"] == "applying"
+
+
+def test_begin_integration_journal_reopens_a_failed_retry(state: RouteState):
+    """Retrying integration for the same changeset after a failure must get
+    a fresh 'applying' journal, not silently reuse the stale 'failed' row.
+    """
+    workspace_id = _register_canonical_workspace(state)
+    _make_changeset(state, "cs-1", workspace_id)
+
+    journal = state.begin_integration_journal(
+        journal_id="integration:cs-1", run_id="r1", epoch_id="ep-1",
+        workspace_id=workspace_id, changeset_id="cs-1",
+        expected_generation=0, expected_dirty_hash="dirty-0",
+    )
+    assert journal["status"] == "applying"
+    state.finish_integration_journal("integration:cs-1", "failed", "boom")
+
+    retried = state.begin_integration_journal(
+        journal_id="integration:cs-1", run_id="r1", epoch_id="ep-1",
+        workspace_id=workspace_id, changeset_id="cs-1",
+        expected_generation=0, expected_dirty_hash="dirty-0",
+    )
+    assert retried["status"] == "applying"
+    assert retried["error"] is None
+
+
 def test_v29_to_current_adds_binding_and_group_columns(tmp_path: Path):
     db = tmp_path / "v29.db"
     state = RouteState(db)
