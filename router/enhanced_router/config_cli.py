@@ -17,7 +17,9 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Literal
 
@@ -43,6 +45,63 @@ from enhanced_router.registry import ModelRegistry
 _ROLES = ("recon", "implementer", "adversary", "repairer")
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
+# ---------------------------------------------------------------------------
+# Typed route choice — one concrete model + provider + endpoint combination.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RouteChoice:
+    """One selectable route: a concrete model through a specific provider
+    endpoint. A single logical model may appear as multiple RouteChoices
+    when it can be reached through distinct providers or endpoints."""
+
+    model_id: str
+    endpoint_id: str
+    provider_id: str
+    provider_name: str
+    model_name: str
+    backend: str
+    credential_configured: bool
+    availability: str
+    certified: bool
+    context_tokens: int | None = None
+    max_output_tokens: int | None = None
+    routing_mode: str = "fixed"
+
+    def route_key(self) -> tuple[str, str]:
+        """Unique key for this concrete route (model + endpoint).
+        Use for dedup and fallback exclusion instead of plain model_id."""
+        return (self.model_id, self.endpoint_id)
+
+
+class NavigationAction(Enum):
+    BACK = auto()
+    CANCEL = auto()
+    DONE = auto()
+
+
+@dataclass(frozen=True)
+class ChoiceControls:
+    """Controls for the _choose_nav function — which navigation actions are
+    available and what the default selected value should be."""
+    allow_back: bool = False
+    allow_cancel: bool = False
+    allow_done: bool = False
+    default_value: str | None = None
+
+
+@dataclass(frozen=True)
+class NavResult:
+    """Result from a navigation-aware choice prompt. Either a value was
+    selected, or a navigation action was triggered."""
+    value: str | None = None
+    action: NavigationAction | None = None
+
+    @property
+    def is_navigation(self) -> bool:
+        return self.action is not None
+
 
 def _config_dir(value: str | None) -> Path:
     return Path(
@@ -53,9 +112,49 @@ def _config_dir(value: str | None) -> Path:
     ).expanduser()
 
 
+def _print_version_diagnostic() -> None:
+    """Print the source path and git revision of this config_cli module.
+
+    Only prints when BRIGADE_DEBUG is set, making it opt-in for diagnostics.
+    """
+    if not os.environ.get("BRIGADE_DEBUG"):
+        return
+    here = Path(__file__).resolve()
+    rev = "unknown"
+    try:
+        parent = here.parent
+        while parent != parent.parent:
+            if (parent / ".git").exists():
+                import subprocess
+                result = subprocess.run(
+                    ["git", "-C", str(parent), "rev-parse", "--short", "HEAD"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                rev = result.stdout.strip() or "unknown"
+                break
+            parent = parent.parent
+    except Exception:
+        pass
+    # Also try reading install-info.json for installed-revision info.
+    install_info_path = here.parents[2] / "install-info.json"
+    if install_info_path.exists():
+        try:
+            import json
+            info = json.loads(install_info_path.read_text())
+            installed_rev = info.get("source_revision", "") or info.get("git_commit", "")[:8] or ""
+            if installed_rev:
+                rev = f"{rev} (installed: {installed_rev})"
+        except Exception:
+            pass
+    print(f"ClaudeBrigade config module: {here}", file=sys.stderr)
+    print(f"  revision: {rev}", file=sys.stderr)
+
+
 def _load_registry(config_dir: Path) -> tuple[ModelRegistry, tuple[str, ...]]:
     config_dir.mkdir(parents=True, exist_ok=True)
     loaded = load_router_credentials(config_dir)
+    # Diagnostic header: report which config_cli module is running.
+    _print_version_diagnostic()
     # The values stay in this short-lived CLI process only. They are needed to
     # determine which configured transports are usable; they are never printed.
     os.environ.update(loaded.provider_env)
@@ -221,6 +320,334 @@ def _choose(label: str, options: list[tuple[str, str]], default: int = 1) -> str
         if 1 <= index <= len(options):
             return options[index - 1][0]
         print("Choose one of the listed numbers.")
+
+
+def _choose_nav(
+    label: str,
+    options: list[tuple[str, str]],
+    controls: ChoiceControls | None = None,
+    default: int = 1,
+) -> NavResult:
+    """Numbered picker over *options* with navigation actions (back/cancel/done).
+    Returns the selected value or a navigation action. Blank input returns the
+    nav action whose letter is used as the first navigation entry's key, or
+    CANCEL when multiple nav actions are defined and none is the obvious default.
+    """
+    if not options:
+        raise RuntimeError(f"No choices are available for {label}.")
+    ctrl = controls or ChoiceControls()
+    total_pages = (len(options) - 1) // _PAGE_SIZE + 1
+    page = ((default - 1) // _PAGE_SIZE) if 1 <= default <= len(options) else 0
+
+    # Build nav action keys
+    nav_letters: dict[str, NavigationAction] = {}
+    if ctrl.allow_back:
+        nav_letters["b"] = NavigationAction.BACK
+    if ctrl.allow_cancel:
+        nav_letters["q"] = NavigationAction.CANCEL
+    if ctrl.allow_done:
+        nav_letters["d"] = NavigationAction.DONE
+
+    # Determine default nav action when no numeric input given
+    default_nav: NavigationAction | None = None
+    if ctrl.allow_back and not ctrl.allow_cancel and not ctrl.allow_done:
+        default_nav = NavigationAction.BACK
+    elif ctrl.allow_cancel and not ctrl.allow_back and not ctrl.allow_done:
+        default_nav = NavigationAction.CANCEL
+    elif ctrl.allow_done and not ctrl.allow_back and not ctrl.allow_cancel:
+        default_nav = NavigationAction.DONE
+
+    while True:
+        start = page * _PAGE_SIZE
+        end = min(start + _PAGE_SIZE, len(options))
+        suffix = f" (page {page + 1}/{total_pages})" if total_pages > 1 else ""
+        print(f"\n{label}{suffix}")
+        for number in range(start, end):
+            value, description = options[number]
+            print(f"  {number + 1}. {value} — {description}")
+        if total_pages > 1:
+            nav_parts = ["n) next page", "p) previous page"]
+        else:
+            nav_parts = []
+        for letter, action in nav_letters.items():
+            nav_parts.append(f"{letter}) {action.name.lower()}")
+        print("  " + "   ".join(nav_parts))
+        raw = _prompt("Choose", str(default) if not ctrl.default_value else ctrl.default_value)
+        lowered = raw.strip().lower()
+        if total_pages > 1 and lowered == "n":
+            page = min(page + 1, total_pages - 1)
+            continue
+        if total_pages > 1 and lowered == "p":
+            page = max(page - 1, 0)
+            continue
+        if lowered in nav_letters:
+            return NavResult(action=nav_letters[lowered])
+        if not lowered and default_nav is not None:
+            return NavResult(action=default_nav)
+        try:
+            index = int(raw)
+        except ValueError:
+            allowed = ", ".join(sorted(nav_letters.keys()))
+            if total_pages > 1:
+                allowed = "n, p, " + allowed
+            print(f"Enter one of the listed numbers{', or ' + allowed if allowed else ''}.")
+            continue
+        if 1 <= index <= len(options):
+            return NavResult(value=options[index - 1][0])
+        print("Choose one of the listed numbers.")
+
+
+def generate_route_choices(
+    registry: ModelRegistry,
+    *,
+    role: str | None = None,
+    controller: bool = False,
+) -> list[RouteChoice]:
+    """Generate typed RouteChoices for every selectable route combination.
+
+    Each model that is available through a provider with credentials yields
+    one RouteChoice per configured endpoint. A model available through two
+    different providers appears as separate RouteChoices.
+    """
+    choices: list[RouteChoice] = []
+    for model_id, model in sorted(registry.models.items(), key=lambda item: item[0]):
+        if not model.enabled:
+            continue
+        if model.backend == "anthropic-passthrough" and not controller:
+            continue
+        ungranted = False
+        if controller:
+            if not model.capabilities.controller_eligible:
+                ungranted = True
+        elif role is not None:
+            if model.allowed_roles:
+                if role not in model.allowed_roles:
+                    continue
+            else:
+                ungranted = True
+
+        # Collect endpoints — at minimum one synthetic "auto" entry.
+        endpoints = [("auto", model)]
+        for endpoint_id, endpoint_spec in sorted(model.endpoints.items()):
+            endpoints.append((endpoint_id, endpoint_spec))
+
+        for endpoint_id, endpoint_candidate in endpoints:
+            provider_id = (getattr(endpoint_candidate, "provider_id", None)
+                           or model.provider_id or "local")
+            provider = registry.providers.get(provider_id)
+            provider_name = provider.display_name if provider else provider_id
+            key_env = (getattr(endpoint_candidate, "api_key_env", None)
+                       or model.api_key_env)
+            if provider is not None:
+                key_env = key_env or provider.api_key_env
+            configured = not key_env or bool(os.environ.get(key_env))
+            backend = getattr(endpoint_candidate, "backend", model.backend)
+            if backend == "direct-anthropic":
+                configured = configured and bool(
+                    getattr(endpoint_candidate, "api_base", None)
+                    or model.api_base
+                    or getattr(endpoint_candidate, "api_base_env", None)
+                    or model.api_base_env
+                )
+            if backend == "litellm":
+                configured = configured and bool(
+                    getattr(endpoint_candidate, "litellm_model", None)
+                    or model.litellm_model
+                )
+            if not configured:
+                continue
+
+            # Certification: a model is "certified" for a role when its
+            # allowed_roles includes it (or controller_eligible is true).
+            certified = False
+            if controller:
+                certified = model.capabilities.controller_eligible
+            elif role is not None and model.allowed_roles:
+                certified = role in model.allowed_roles
+
+            context_tokens = (getattr(endpoint_candidate, "max_context_tokens", None)
+                              or model.capabilities.max_context_tokens
+                              or model.capabilities.context_tokens)
+            max_output = (getattr(endpoint_candidate, "max_output_tokens", None)
+                          or model.capabilities.max_output_tokens)
+
+            availability = getattr(endpoint_candidate, "availability", "unknown") or "unknown"
+            if availability == "unknown":
+                availability = model.availability or "unknown"
+
+            choices.append(RouteChoice(
+                model_id=model_id,
+                endpoint_id=endpoint_id,
+                provider_id=provider_id,
+                provider_name=provider_name,
+                model_name=model.display_name,
+                backend=backend,
+                credential_configured=configured,
+                availability=availability,
+                certified=certified or ungranted,  # ungranted but offerable
+                context_tokens=context_tokens,
+                max_output_tokens=max_output,
+                routing_mode=model.routing_mode,
+            ))
+    return choices
+
+
+def eligible_providers(choices: Sequence[RouteChoice]) -> list[tuple[str, str, int]]:
+    """Return (provider_id, display_name, route_count) for every provider
+    that has at least one eligible route, sorted by display_name."""
+    prov: dict[str, tuple[str, int]] = {}
+    for rc in choices:
+        if rc.provider_id not in prov:
+            prov[rc.provider_id] = (rc.provider_name, 0)
+        pid, (dname, count) = rc.provider_id, prov[rc.provider_id]
+        prov[rc.provider_id] = (dname, count + 1)
+    result = [(pid, dname, count) for pid, (dname, count) in prov.items()]
+    result.sort(key=lambda x: x[1].lower())
+    return result
+
+
+def choose_provider(
+    choices: Sequence[RouteChoice],
+    *,
+    purpose: str = "model",
+    current_provider_id: str | None = None,
+) -> NavResult | str:
+    """Provider-first picker. Shows only providers that have eligible routes.
+    Returns the selected provider_id or a navigation action.
+    """
+    providers = eligible_providers(choices)
+    if not providers:
+        print(f"No eligible providers found for {purpose}.")
+        return NavResult(action=NavigationAction.BACK)
+
+    options = [(pid, f"{dname:<25s} {count} eligible model{'s' if count != 1 else ''}")
+               for pid, dname, count in providers]
+    if current_provider_id:
+        default = next((i for i, (pid, _) in enumerate(options, 1) if pid == current_provider_id), 1)
+    else:
+        default = 1
+
+    result = _choose_nav(
+        f"Choose provider for {purpose}",
+        options,
+        ChoiceControls(allow_back=False, allow_cancel=True),
+        default,
+    )
+    if result.action is not None:
+        return result
+    return result.value
+
+
+def choose_route(
+    choices: Sequence[RouteChoice],
+    *,
+    provider_id: str,
+    purpose: str = "model",
+    current_model_id: str | None = None,
+) -> NavResult | RouteChoice:
+    """After provider selection, show that provider's eligible routes.
+    Supports search, pagination, and navigation. Returns the selected RouteChoice
+    or a navigation action.
+    """
+    provider_choices = [rc for rc in choices if rc.provider_id == provider_id]
+    if not provider_choices:
+        print(f"No eligible routes from provider '{provider_id}'.")
+        return NavResult(action=NavigationAction.BACK)
+
+    display_name = provider_choices[0].provider_name if provider_choices else provider_id
+
+    while True:
+        query = input(f"Search {display_name} models for {purpose} (blank lists all): ").strip().lower()
+        if query:
+            ranked = _rank_route_matches(query, provider_choices)
+        else:
+            ranked = provider_choices
+
+        if not ranked:
+            print(f"No matches found. Press Enter to list all {len(provider_choices)} options.")
+            continue
+
+        # Build display options — a model that has multiple endpoints gets
+        # separate lines for each endpoint.
+        options = []
+        default_pos = 1
+        for rc in ranked:
+            suffix = ""
+            if not rc.certified:
+                suffix = " · unverified"
+            cert_str = "certified" if rc.certified else "unverified"
+            ctx_str = ""
+            if rc.context_tokens:
+                ctx_str = f" · {rc.context_tokens:,} context"
+            tools_str = ""
+            if rc.availability:
+                tools_str = f" · {rc.availability}"
+            options.append((
+                rc.model_id,
+                f"{rc.model_name}{suffix}  —  {rc.endpoint_id}{tools_str}{ctx_str} · {cert_str}",
+            ))
+            if current_model_id and rc.model_id == current_model_id:
+                default_pos = len(options)
+
+        result = _choose_nav(
+            f"{display_name} models for {purpose}",
+            options,
+            ChoiceControls(allow_back=False, allow_cancel=True),
+            default_pos,
+        )
+        if result.action is not None:
+            return result
+        # Find the RouteChoice matching the selected label
+        selected_label = result.value
+        match = next(
+            (rc for rc in ranked if rc.model_id == selected_label),
+            None,
+        )
+        if match is not None:
+            return match
+        # If multiple endpoints share the model, need to disambiguate
+        same_model = [rc for rc in ranked if rc.model_id == selected_label]
+        if len(same_model) == 1:
+            return same_model[0]
+        # Multiple endpoints — pick one
+        ep_options = [(rc.endpoint_id, f"{rc.provider_name} · {rc.backend}")
+                       for rc in same_model]
+        ep_result = _choose_nav(
+            f"Endpoint for {selected_label}",
+            ep_options,
+            ChoiceControls(allow_back=True, allow_cancel=True),
+        )
+        if ep_result.action is not None:
+            return ep_result
+        endpoint_id = ep_result.value
+        match = next((rc for rc in same_model if rc.endpoint_id == endpoint_id), None)
+        if match is not None:
+            return match
+        return NavResult(action=NavigationAction.BACK)
+
+
+def _rank_route_matches(query: str, choices: Sequence[RouteChoice]) -> list[RouteChoice]:
+    """Rank RouteChoices by query relevance, best match first."""
+    query = query.lower()
+    if not query:
+        return list(choices)
+
+    def _rank(rc: RouteChoice) -> int:
+        if rc.model_id.lower() == query:
+            return 0
+        if rc.model_id.lower().startswith(query):
+            return 1
+        if query in rc.model_id.lower():
+            return 2
+        if query in rc.model_name.lower():
+            return 3
+        if query in rc.provider_name.lower():
+            return 4
+        return 5
+
+    ranked = [(index, rc) for index, rc in enumerate(choices) if _rank(rc) < 5]
+    ranked.sort(key=lambda pair: (_rank(pair[1]), pair[0]))
+    return [rc for _, rc in ranked]
 
 
 def _rank_query_matches(query: str, options: list[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -486,8 +913,23 @@ def _apply_grant(config_dir: Path, registry: ModelRegistry, model_id: str, *, ro
         _grant_discovered_role(config_dir, registry, model_id, role)
 
 
+def _apply_staged_grants(config_dir: Path, registry: ModelRegistry, grants: list[dict]) -> None:
+    """Apply all staged grants from a setup session atomically.
+
+    Each grant dict must have 'model_id', and either 'role' or 'controller'.
+    """
+    for grant in grants:
+        _apply_grant(
+            config_dir, registry, grant["model_id"],
+            role=grant.get("role"), controller=grant.get("controller", False),
+        )
+
+
 def _confirm_and_grant(
-    config_dir: Path, registry: ModelRegistry, model_id: str, *, role: str | None = None, controller: bool = False,
+    config_dir: Path, registry: ModelRegistry, model_id: str, *,
+    role: str | None = None, controller: bool = False,
+    endpoint_id: str = "auto", provider_id: str | None = None,
+    staged_grants: list[dict] | None = None,
 ) -> bool:
     """Gate an uncertified model behind an explicit test-or-override choice.
 
@@ -496,10 +938,10 @@ def _confirm_and_grant(
     operator backed out, so the caller should let them pick a different
     model instead of silently proceeding.
 
-    Selecting a model from the list must never by itself grant it anything
-    -- that was the bug in the original _grant_* wiring, which treated
-    "the user typed this model's number" as equivalent to "this model is
-    certified for this role."
+    When *staged_grants* is provided (a mutable list), grants are appended
+    to the list rather than applied immediately. The caller applies them all
+    at once via _apply_staged_grants(). This prevents back/cancel from
+    leaving accidental authority grants behind.
     """
     target = _target_label(role, controller)
     spec = registry.get_model(model_id)
@@ -519,12 +961,18 @@ def _confirm_and_grant(
     if choice == "t":
         from enhanced_router.model_probe import probe_model
 
-        print(f"Probing '{model_id}' for {target} compatibility...")
-        result = probe_model(model_id, spec, config_dir=str(config_dir))
+        print(f"Probing '{model_id}' (endpoint: {endpoint_id}) for {target} compatibility...")
+        result = probe_model(model_id, spec, endpoint_id=endpoint_id, config_dir=str(config_dir))
         _record_certification(config_dir, model_id, target, result.to_record())
         if result.passed:
             print(f"Passed: {model_id} demonstrated tool-call support for {target}.")
-            _apply_grant(config_dir, registry, model_id, role=role, controller=controller)
+            if staged_grants is not None:
+                staged_grants.append({
+                    "model_id": model_id, "role": role, "controller": controller,
+                })
+                print(f"(Grant for {target} will be saved when you confirm the profile.)")
+            else:
+                _apply_grant(config_dir, registry, model_id, role=role, controller=controller)
             return True
         print(f"Failed: {result.error or 'no tool call observed'}.")
         if input("Override and use it anyway despite the failed test? [y/N]: ").strip().lower() != "y":
@@ -541,7 +989,13 @@ def _confirm_and_grant(
             print("Not confirmed; cancelled.")
             return False
         _record_override(config_dir, model_id, target, reason)
-        _apply_grant(config_dir, registry, model_id, role=role, controller=controller)
+        if staged_grants is not None:
+            staged_grants.append({
+                "model_id": model_id, "role": role, "controller": controller,
+            })
+            print(f"(Grant for {target} will be saved when you confirm the profile.)")
+        else:
+            _apply_grant(config_dir, registry, model_id, role=role, controller=controller)
         return True
 
     return False
@@ -660,6 +1114,20 @@ def _choose_or_create_id(kind: str, existing: list[str], default_new: str) -> st
     return name
 
 
+def _role_label(profile: dict, role: str) -> str:
+    """Format a role's current assignment for the dashboard display."""
+    raw = profile.get(role, "")
+    if isinstance(raw, dict):
+        model = raw.get("model", "(unset)")
+        endpoint = raw.get("endpoint", "auto")
+    elif isinstance(raw, str) and raw:
+        model = raw
+        endpoint = "auto"
+    else:
+        return "(unset)"
+    return f"{model} · endpoint: {endpoint}"
+
+
 def configure_inference(config_dir: Path, registry: ModelRegistry) -> str:
     raw = _read_yaml(config_dir / "profiles.yaml")
     profiles = raw.setdefault("profiles", {})
@@ -667,79 +1135,232 @@ def configure_inference(config_dir: Path, registry: ModelRegistry) -> str:
         profiles = {}
         raw["profiles"] = profiles
     existing = sorted(str(item) for item in profiles)
-    print(
-        "\nA profile is a named, reusable set of controller + role model "
-        "assignments -- the actual model choices come next, right after this."
-    )
-    if not existing:
-        print("No profiles saved yet -- name this one (letters, numbers, '.', '_', '-').")
     profile_id = _choose_or_create_id("Inference profile", existing, "my-profile")
     current = dict(profiles.get(profile_id) or {})
-    print("\n=== Main models: controller + recon/implementer/adversary/repairer ===")
-    print("For each, type part of a name to search, or press Enter to list everything.")
-    controller_default = str(current.get("controller_model") or (current.get("controller") or {}).get("model") or "")
-    controller_choices = _model_choices(registry, controller=True)
-    if controller_choices:
-        while True:
-            controller_model = _choose_model(
-                "Controller model", controller_choices,
-                controller_default,
-            )
-            if _confirm_and_grant(config_dir, registry, controller_model, controller=True):
-                break
-        controller_fallback_options = [item for item in controller_choices if item[0] != controller_model]
-        controller_fallbacks = _edit_fallbacks(
-            config_dir, registry, role=None, controller=True,
-            fallback_options=controller_fallback_options,
-            previous=_profile_fallback_routes(current, "controller"),
-        )
-        current.pop("controller_model", None)
-        current.pop("controller", None)
-        if controller_fallbacks:
-            current["controller"] = {
-                "model": controller_model, "endpoint": "auto",
-                "fallback_models": controller_fallbacks,
-            }
+
+    staged_grants: list[dict] = []
+    all_route_choices = generate_route_choices(registry)
+
+    while True:
+        print(f"\n── Main model profile: {profile_id} ──")
+        print(f"  1. Controller    {_format_controller(model_id=current.get('controller_model','') or (current.get('controller') or {}).get('model','') or '(unset)')}")
+        for idx, role in enumerate(_ROLES, start=2):
+            print(f"  {idx}. {role.capitalize():<12s} {_role_label(current, role)}")
+        print(f"  {len(_ROLES) + 2}. Review fallback ladders")
+        print(f"  s. Save profile")
+        print(f"  b. Back without saving")
+
+        choice = input("Choose: ").strip().lower()
+        if choice == "s":
+            profiles[profile_id] = dict(current)
+            _write_yaml(config_dir / "profiles.yaml", raw)
+            if staged_grants:
+                _apply_staged_grants(config_dir, registry, staged_grants)
+            print(f"Saved inference profile '{profile_id}' to {config_dir / 'profiles.yaml'}.")
+            print(f"Use it with: claude-brigade --brigade-profile {profile_id}")
+            return profile_id
+        if choice in ("b", "q"):
+            if staged_grants:
+                print(f"Discarding {len(staged_grants)} pending grant(s) that were not saved.")
+            print("Cancelled.")
+            return profile_id
+
+        if choice == str(len(_ROLES) + 2):
+            # Edit fallback ladders
+            _edit_all_fallbacks(config_dir, registry, current, all_route_choices, staged_grants)
+            continue
+
+        try:
+            role_idx = int(choice) - 1
+        except ValueError:
+            print("Enter 1-6, s, or b.")
+            continue
+        if role_idx == 0:
+            # Controller
+            _edit_role_route(config_dir, registry, current, None, True,
+                             all_route_choices, staged_grants)
+        elif 1 <= role_idx <= len(_ROLES):
+            role = _ROLES[role_idx - 1]
+            _edit_role_route(config_dir, registry, current, role, False,
+                             all_route_choices, staged_grants)
         else:
-            current["controller_model"] = controller_model
-    for role in _ROLES:
-        choices = _model_choices(registry, role=role)
-        if not choices:
-            raise RuntimeError(f"No credential-backed model is available for role '{role}'.")
-        previous, previous_endpoint, _previous_fallbacks = _profile_model(current, role)
-        while True:
-            selected = _choose_model(
-                f"{role} model", choices,
-                previous,
-            )
-            if _confirm_and_grant(config_dir, registry, selected, role=role):
-                break
-        model = registry.get_model(selected)
-        endpoints = [("auto", "registry endpoint selection")]
-        endpoints.extend((endpoint_id, f"configured {endpoint.backend} endpoint") for endpoint_id, endpoint in sorted(model.endpoints.items()))
-        endpoint = _choose(
-            f"{role} endpoint for {selected}", endpoints,
-            next((i for i, item in enumerate(endpoints, 1) if item[0] == previous_endpoint), 1),
+            print("Enter 1-6, s, or b.")
+
+
+def _edit_role_route(
+    config_dir: Path, registry: ModelRegistry,
+    current: dict, role: str | None, controller: bool,
+    all_route_choices: list[RouteChoice],
+    staged_grants: list[dict],
+) -> None:
+    """Provider-first route picker for one role or controller.
+
+    Walks provider → model → endpoint → confirm. Returns when the user
+    confirms an assignment or navigates back without changing anything.
+    """
+    purpose = _target_label(role, controller)
+    role_choices = [rc for rc in all_route_choices
+                    if rc.credential_configured and (controller or role is not None)]
+
+    # Get current assignment
+    current_model = ""
+    current_endpoint = "auto"
+    if controller:
+        current_model = current.get("controller_model", "") or (current.get("controller") or {}).get("model", "")
+    elif role:
+        raw = current.get(role, {})
+        if isinstance(raw, dict):
+            current_model = raw.get("model", "")
+            current_endpoint = raw.get("endpoint", "auto")
+        elif isinstance(raw, str):
+            current_model = raw
+
+    while True:
+        # Step 1: choose provider
+        prov_result = choose_provider(role_choices, purpose=purpose)
+        if isinstance(prov_result, NavResult):
+            return  # back/cancel
+        provider_id = prov_result
+
+        # Step 2: choose route (model + endpoint)
+        route_result = choose_route(
+            role_choices, provider_id=provider_id, purpose=purpose,
+            current_model_id=current_model if current_model else None,
         )
-        fallback_options = [item for item in choices if item[0] != selected]
+        if isinstance(route_result, NavResult):
+            if route_result.action == NavigationAction.BACK:
+                continue  # back to providers
+            return  # cancel
+
+        rc = route_result
+
+        # Step 3: confirm
+        if _confirm_assignment(config_dir, registry, rc, purpose, staged_grants):
+            # Save to draft
+            if controller:
+                current.pop("controller_model", None)
+                current["controller"] = {
+                    "model": rc.model_id,
+                    "endpoint": rc.endpoint_id,
+                    "fallback_models": [],
+                }
+            elif role:
+                current[role] = {
+                    "model": rc.model_id,
+                    "endpoint": rc.endpoint_id,
+                    "fallback_models": [],
+                }
+            print(f"Assigned {rc.model_id} via {rc.provider_name}/{rc.endpoint_id} to {purpose}.")
+            return
+
+
+def _confirm_assignment(
+    config_dir: Path, registry: ModelRegistry,
+    rc: RouteChoice, purpose: str,
+    staged_grants: list[dict],
+) -> bool:
+    """Show the assignment details and ask the user to confirm.
+
+    Probes the exact endpoint if certification is needed. Returns True
+    when the assignment is accepted.
+    """
+    target = purpose
+    # Map purpose back to role/controller
+    controller = purpose == "controller"
+    role = None if controller else purpose
+
+    print(f"\n── Assign {purpose.capitalize()} ──")
+    print(f"  Provider:      {rc.provider_name}")
+    print(f"  Model:         {rc.model_id}")
+    print(f"  Endpoint:      {rc.endpoint_id}")
+    print(f"  Certification: {'certified' if rc.certified else 'unverified'}")
+    ctx = rc.context_tokens
+    print(f"  Context:       {f'{ctx:,}' if ctx else 'unknown'}")
+    print(f"  Backend:       {rc.backend}")
+
+    print(f"\n  1. Assign")
+    if not rc.certified:
+        print(f"  2. Test compatibility first")
+    print(f"  b. Back to models")
+    print(f"  q. Cancel")
+
+    choice = input("Choose: ").strip().lower()
+    if choice == "1":
+        if not rc.certified:
+            # Go through _confirm_and_grant for the route
+            return _confirm_and_grant(
+                config_dir, registry, rc.model_id,
+                role=role, controller=controller,
+                endpoint_id=rc.endpoint_id, provider_id=rc.provider_id,
+                staged_grants=staged_grants,
+            )
+        return True
+    if choice == "2" and not rc.certified:
+        return _confirm_and_grant(
+            config_dir, registry, rc.model_id,
+            role=role, controller=controller,
+            endpoint_id=rc.endpoint_id, provider_id=rc.provider_id,
+            staged_grants=staged_grants,
+        )
+    return False
+
+
+def _format_controller(*, model_id: str = "") -> str:
+    if model_id:
+        return model_id
+    return "(unset — uses Claude default)"
+
+
+def _edit_all_fallbacks(
+    config_dir: Path, registry: ModelRegistry,
+    current: dict,
+    all_route_choices: list[RouteChoice],
+    staged_grants: list[dict],
+) -> None:
+    """Edit fallback ladders for all roles + controller."""
+    targets = [("controller", None, True)] + [(r, r, False) for r in _ROLES]
+    for label, role, controller in targets:
+        model_id = ""
+        if controller:
+            model_id = current.get("controller_model", "") or (current.get("controller") or {}).get("model", "")
+        else:
+            raw = current.get(role, {})
+            if isinstance(raw, dict):
+                model_id = raw.get("model", "")
+            elif isinstance(raw, str):
+                model_id = raw
+        if not model_id:
+            continue
+        # Build fallback options excluding the primary route
+        route_key = (model_id, current.get(role, {}).get("endpoint", "auto") if isinstance(current.get(role), dict) else "auto")
+        fallback_candidates = [
+            rc for rc in all_route_choices
+            if rc.route_key() != route_key and rc.credential_configured
+        ]
+        if not fallback_candidates:
+            print(f"\n{label}: no fallback candidates available.")
+            continue
+        # Convert fallback candidates to old format for _edit_fallbacks
+        fb_options = [(rc.model_id, f"{rc.provider_name} · {rc.endpoint_id}")
+                       for rc in fallback_candidates]
+        previous = _profile_fallback_routes(current, label if not controller else "controller")
         fallback_routes = _edit_fallbacks(
-            config_dir, registry, role=role,
-            fallback_options=fallback_options,
-            previous=_profile_fallback_routes(current, role),
+            config_dir, registry, role=role, controller=controller,
+            fallback_options=fb_options, previous=previous,
         )
-        if endpoint == "auto" and not fallback_routes:
-            current[role] = selected
+        # Save back to current
+        if controller:
+            if fallback_routes:
+                ctrl_entry = current.get("controller") or {"model": model_id, "endpoint": current.get("controller", {}).get("endpoint", "auto")}
+                ctrl_entry["fallback_models"] = fallback_routes
+                current["controller"] = ctrl_entry
         else:
-            current[role] = {
-                "model": selected,
-                "endpoint": endpoint,
-                "fallback_models": fallback_routes,
-            }
-    profiles[profile_id] = current
-    _write_yaml(config_dir / "profiles.yaml", raw)
-    print(f"Saved inference profile '{profile_id}' to {config_dir / 'profiles.yaml'}.")
-    print(f"Use it with: claude-brigade --brigade-profile {profile_id}")
-    return profile_id
+            existing = current.get(role, {})
+            if isinstance(existing, dict):
+                existing["fallback_models"] = fallback_routes
+                current[role] = existing
+            else:
+                current[role] = {"model": existing, "endpoint": "auto", "fallback_models": fallback_routes}
 
 
 def configure_fastpath(config_dir: Path, registry: ModelRegistry) -> None:
@@ -858,20 +1479,39 @@ def configure_sidecar_profile(config_dir: Path, registry: ModelRegistry) -> str:
     available_sidecars = sorted(registry.sidecars)
     if not available_sidecars:
         raise RuntimeError("No sidecars are configured yet -- add one with the 'sidecar' menu option first.")
-    print(f"Available sidecars: {', '.join(available_sidecars)}")
-    previous_ids = [str(item) for item in current.get("sidecar_ids", []) if isinstance(item, str)]
-    raw_ids = _prompt(
-        "Sidecar IDs for this profile (comma-separated, blank for all)",
-        ",".join(previous_ids),
-    )
-    if raw_ids.strip():
-        sidecar_ids = [item.strip() for item in raw_ids.split(",") if item.strip()]
-        unknown = [item for item in sidecar_ids if item not in registry.sidecars]
-        if unknown:
-            raise ValueError(f"unknown sidecar ID(s): {', '.join(unknown)}")
-    else:
-        sidecar_ids = available_sidecars
-    current["sidecar_ids"] = sidecar_ids
+
+    # Numbered toggle selector for sidecar membership
+    previous_ids = set(str(item) for item in current.get("sidecar_ids", []) if isinstance(item, str))
+    toggled_ids = set(previous_ids)
+    while True:
+        print(f"\nSelect sidecars included in profile '{profile_id}':")
+        for idx, sc_id in enumerate(available_sidecars, 1):
+            marker = "[x]" if sc_id in toggled_ids else "[ ]"
+            sidecar_entry = registry.sidecars.get(sc_id)
+            mode_label = sidecar_entry.get("mode", "structured") if isinstance(sidecar_entry, dict) else "structured"
+            model_label = sidecar_entry.get("model_id", "") if isinstance(sidecar_entry, dict) else ""
+            extra = f" · {model_label} · {mode_label}" if model_label else ""
+            print(f"  {marker} {idx}. {sc_id}{extra}")
+        print("  d) Done")
+        print("  b) Back (discard changes)")
+        choice = input("Enter numbers to toggle, d when done, b to go back: ").strip().lower()
+        if choice == "d":
+            current["sidecar_ids"] = sorted(toggled_ids)
+            break
+        if choice == "b":
+            return profile_id
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(available_sidecars):
+                sc_id = available_sidecars[idx]
+                if sc_id in toggled_ids:
+                    toggled_ids.remove(sc_id)
+                else:
+                    toggled_ids.add(sc_id)
+            else:
+                print(f"Enter a number 1-{len(available_sidecars)}, d, or b.")
+        except ValueError:
+            print(f"Enter a number 1-{len(available_sidecars)}, d, or b.")
 
     if input("Configure a dedicated fastpath coprocessor for this profile too? [y/N]: ").strip().lower() == "y":
         fastpath = dict(current.get("fastpath") or {})
@@ -948,6 +1588,187 @@ def configure_launch_preset(config_dir: Path, registry: ModelRegistry) -> str:
     _write_yaml(config_dir / "launch_presets.yaml", raw)
     print(f"Saved launch preset '{preset_id}' to {config_dir / 'launch_presets.yaml'}.")
     print(f"Use it with: claude-brigade --launch-preset {preset_id}")
+    return preset_id
+
+
+# ---------------------------------------------------------------------------
+# Unified launch-setup orchestrator
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LaunchSetupResult:
+    """Result of a complete launch-setup wizard invocation.
+
+    Returned by ``configure_launch_setup()`` to the caller (the
+    ``bin/claude-brigade`` launcher), which uses the three IDs to
+    set the corresponding environment variables for the upcoming
+    Claude Code launch.
+    """
+
+    status: Literal["saved", "cancelled"]
+    inference_profile_id: str | None = None
+    sidecar_profile_id: str | None = None
+    launch_preset_id: str | None = None
+
+
+def configure_launch_setup(
+    config_dir: Path,
+    registry: ModelRegistry,
+) -> LaunchSetupResult:
+    """Unified launch-setup orchestrator.
+
+    The user enters through a lane-choice menu, picks one of the two
+    configuration lanes (main models or sidecars), works through it
+    with the dashboard editor, then returns to a setup overview that
+    shows both lanes and offers to review/save.
+
+    This replaces the old embedded ``configure_inference()``-only
+    wizard in ``bin/claude-brigade`` -- that one skipped sidecar
+    profiles altogether except for a single "configure fastpath"
+    checkbox.
+    """
+    inference_profile_id: str | None = None
+    sidecar_profile_id: str | None = None
+    launch_preset_id: str | None = None
+
+    while True:
+        print("\n── Configuration setup ──")
+        if inference_profile_id:
+            _show_inference_summary(registry, inference_profile_id)
+        if sidecar_profile_id:
+            _show_sidecar_summary(registry, sidecar_profile_id)
+
+        print("\nWhat would you like to configure first?")
+        if not inference_profile_id:
+            print("  1. Main models")
+            print("     Controller, recon, implementer, adversary, repairer, and fallbacks")
+        else:
+            print(f"  1. Edit main models ({inference_profile_id})")
+        if not sidecar_profile_id:
+            print("  2. Sidecar models")
+            print("     Fastpath coprocessor and workflow-triggered specialists")
+        else:
+            print(f"  2. Edit sidecar models ({sidecar_profile_id})")
+
+        if inference_profile_id and sidecar_profile_id:
+            print("  3. Create paired launch preset")
+        elif inference_profile_id and not sidecar_profile_id:
+            print("  3. Skip sidecar for now (will use global defaults)")
+        print("  b. Back (discard changes)")
+        print("  q. Cancel")
+
+        choice = input("Choose: ").strip().lower()
+        if choice == "1":
+            inference_profile_id = configure_inference(config_dir, registry)
+            # Reload registry after profile changes
+            registry, _ = _load_registry(config_dir)
+        elif choice == "2":
+            sidecar_profile_id = configure_sidecar_profile(config_dir, registry)
+            registry, _ = _load_registry(config_dir)
+        elif choice == "3" and inference_profile_id and sidecar_profile_id:
+            launch_preset_id = _create_launch_preset_for_setup(
+                config_dir, inference_profile_id, sidecar_profile_id,
+            )
+            print(f"\n── Setup complete ──")
+            print(f"  Inference profile: {inference_profile_id}")
+            print(f"  Sidecar profile:   {sidecar_profile_id}")
+            print(f"  Launch preset:     {launch_preset_id or '(none)'}")
+            print("All saved. Starting Claude Code with this preset.")
+            return LaunchSetupResult(
+                status="saved",
+                inference_profile_id=inference_profile_id,
+                sidecar_profile_id=sidecar_profile_id,
+                launch_preset_id=launch_preset_id,
+            )
+        elif choice == "3":
+            print("Skipping sidecar. Starting Claude Code with main models only.")
+            return LaunchSetupResult(
+                status="saved",
+                inference_profile_id=inference_profile_id,
+                sidecar_profile_id=sidecar_profile_id,
+                launch_preset_id=launch_preset_id,
+            )
+        elif choice in ("b", "q"):
+            print("Setup cancelled.")
+            return LaunchSetupResult(status="cancelled")
+        else:
+            print("Choose 1, 2, or q.")
+
+
+def _show_inference_summary(registry: ModelRegistry, profile_id: str) -> None:
+    """Display a summary of the inference profile for the setup overview."""
+    try:
+        profile = registry.get_profile(profile_id)
+    except (KeyError, LookupError):
+        print(f"\n  Main model profile: {profile_id} (unable to load)")
+        return
+    route = profile.controller_route()
+    controller_str = route.model if route else "(default)"
+    print(f"\n  Main models: {profile_id}")
+    print(f"    Controller:  {controller_str}")
+    for role in _ROLES:
+        target = profile.route_target(role)
+        print(f"    {role.capitalize():<12s} {target.model}")
+    print()
+
+
+def _show_sidecar_summary(registry: ModelRegistry, profile_id: str) -> None:
+    """Display a summary of the sidecar profile for the setup overview."""
+    try:
+        profiles = _read_yaml(registry.config_dir / "sidecar_profiles.yaml")
+        profile = profiles.get("sidecar_profiles", {}).get(profile_id, {})
+    except Exception:
+        print(f"\n  Sidecar profile: {profile_id} (unable to load)")
+        return
+    if not isinstance(profile, dict):
+        print(f"\n  Sidecar profile: {profile_id} (unable to load)")
+        return
+    sidecar_ids = profile.get("sidecar_ids", [])
+    fastpath = profile.get("fastpath", None)
+    fastpath_str = ""
+    if isinstance(fastpath, dict):
+        fastpath_str = f" · {fastpath.get('model_id', '(unset)')}"
+    print(f"\n  Sidecars: {profile_id}")
+    print(f"    Fastpath: {'configured' if fastpath else 'global default'}{fastpath_str}")
+    for sc_id in sidecar_ids:
+        entry = registry.sidecars.get(sc_id)
+        if isinstance(entry, dict):
+            print(f"    {sc_id}: {entry.get('model_id', '?')} · {entry.get('mode', 'structured')}")
+        else:
+            print(f"    {sc_id}")
+    print()
+
+
+def _create_launch_preset_for_setup(
+    config_dir: Path,
+    inference_profile_id: str,
+    sidecar_profile_id: str,
+) -> str:
+    """Create or re-use a launch preset for the given profile pair.
+
+    If an existing launch preset already pairs these two profiles,
+    return its ID. Otherwise create a new one with a generated name.
+    """
+    raw = _read_yaml(config_dir / "launch_presets.yaml")
+    presets = raw.setdefault("launch_presets", {})
+    if not isinstance(presets, dict):
+        presets = {}
+        raw["launch_presets"] = presets
+
+    # Check for an existing preset with this exact pair
+    for preset_id, entry in presets.items():
+        if isinstance(entry, dict):
+            if (entry.get("inference_profile_id") == inference_profile_id
+                    and entry.get("sidecar_profile_id") == sidecar_profile_id):
+                return preset_id
+
+    preset_id = f"{inference_profile_id}-{sidecar_profile_id}"
+    presets[preset_id] = {
+        "inference_profile_id": inference_profile_id,
+        "sidecar_profile_id": sidecar_profile_id,
+    }
+    _write_yaml(config_dir / "launch_presets.yaml", raw)
     return preset_id
 
 
@@ -1161,6 +1982,24 @@ def refresh_catalogs(
 
     if config_dir and any(r.status == "success" for r in results):
         _save_catalog_refresh_state(config_dir, refresh_state)
+
+    # Print configured-provider summary before the per-provider detail lines.
+    all_providers = sorted(registry.providers.keys())
+    discovery_providers = {r.provider_id for r in results}
+    no_discovery = [
+        pid for pid in all_providers
+        if pid not in discovery_providers
+        and registry.providers[pid].discovery.get("type") != "openai-models"
+    ]
+    if all_providers:
+        print(f"\nConfigured providers: {', '.join(all_providers)}")
+    if results:
+        live = [r.provider_id for r in results if r.status in ("success", "cached", "error")]
+        if live:
+            print(f"Live catalogs refreshed: {', '.join(live)}")
+    if no_discovery:
+        print(f"No live discovery configured: {', '.join(no_discovery)}")
+    print()
 
     for result in sorted(results, key=lambda r: r.provider_id):
         if result.status == "success":
@@ -1379,18 +2218,42 @@ def main(argv: list[str] | None = None) -> int:
         "command", nargs="?",
         choices=(
             "menu", "keys", "import-env", "refresh", "sidecar", "inference",
-            "fastpath", "sidecar-profile", "launch-preset", "show",
+            "fastpath", "sidecar-profile", "launch-preset", "launch-wizard", "show",
         ),
         default="menu",
     )
     parser.add_argument("--config-dir", help="BRIGADE_CONFIG_DIR override")
+    parser.add_argument("--output-json", help="Write result as JSON to this path (for launcher integration)")
     args = parser.parse_args(argv)
     config_dir = _config_dir(args.config_dir)
     if args.command == "menu":
         return menu(config_dir)
     registry, provider_keys = _load_registry(config_dir)
+
+    def _output_result(data: dict) -> None:
+        if args.output_json:
+            with open(args.output_json, "w") as fh:
+                json.dump(data, fh, default=str)
+            os.chmod(args.output_json, 0o600)
+
     try:
-        if args.command == "keys":
+        if args.command == "launch-wizard":
+            # Refresh catalogs first
+            print("Refreshing model catalogs...")
+            refresh_catalogs(registry)
+            # Reload so newly discovered models are selectable
+            registry, _ = _load_registry(config_dir)
+            result = configure_launch_setup(config_dir, registry)
+            out = {
+                "status": result.status,
+                "inference_profile_id": result.inference_profile_id,
+                "sidecar_profile_id": result.sidecar_profile_id,
+                "launch_preset_id": result.launch_preset_id,
+            }
+            _output_result(out)
+            print(json.dumps(out, indent=2))
+            return 0 if result.status == "saved" else 1
+        elif args.command == "keys":
             configure_keys(config_dir, registry)
         elif args.command == "import-env":
             import_environment_credentials(config_dir, registry)

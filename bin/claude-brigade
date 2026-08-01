@@ -21,6 +21,18 @@ TOKEN_FILE="$CONFIG_DIR/router.token"
 PORT_FILE="$CACHE_DIR/router.port"
 _PREFERRED_PORT="${CLAUDE_ENHANCED_PORT:-8787}"
 
+# Source detection: when running from a checkout, the bin/ directory is inside
+# it; the installed copy has the script in ~/.local/bin, not under $APP_DIR.
+_SOURCE_DIR=""
+if [[ "$(realpath "$0" 2>/dev/null)" != "$APP_DIR"/* ]]; then
+  _candidate="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  if [[ -d "$_candidate/router/enhanced_router" ]]; then
+    _SOURCE_DIR="$_candidate"
+  fi
+fi
+_BRIGADE_PYTHON="${CLAUDE_BRIGADE_PYTHON:-$APP_DIR/venv/bin/python}"
+_BRIGADE_PYTHONPATH="${_SOURCE_DIR:-$APP_DIR}/router"
+
 # ---------------------------------------------------------------------------
 # Helper: find free TCP port
 # ---------------------------------------------------------------------------
@@ -444,49 +456,22 @@ if [ -z "$CONTROLLER_MODEL" ] && [ -z "${requested_model:-}" ] && [ -z "$BRIGADE
   printf 'Choice [1]: ' >&2
   read -r _startup_choice || _startup_choice=""
   if [ "$_startup_choice" = "2" ]; then
-    _wizard_profile_file="$(mktemp)"
-    _wizard_script_file="$(mktemp --suffix=.py)"
-    cat > "$_wizard_script_file" <<'PY'
-import os
-import sys
-from pathlib import Path
-
-from enhanced_router.config_cli import _load_registry, configure_fastpath, configure_inference, refresh_catalogs
-
-out_path = Path(sys.argv[1])
-config_dir = Path(os.environ["BRIGADE_CONFIG_DIR"])
-
-registry, _ = _load_registry(config_dir)
-print("Refreshing live model catalogs for credential-backed providers...\n")
-refresh_catalogs(registry)
-print()
-
-# Reload so newly discovered models are selectable in the wizard below.
-registry, _ = _load_registry(config_dir)
-try:
-    profile_id = configure_inference(config_dir, registry)
-    print()
-    if input("Configure the fastpath coprocessor model too (the always-on route/verify model, e.g. DiffusionGemma)? [y/N]: ").strip().lower() == "y":
-        registry, _ = _load_registry(config_dir)
-        configure_fastpath(config_dir, registry)
-        print()
-except (EOFError, KeyboardInterrupt):
-    print()
-    sys.exit(0)
-out_path.write_text(profile_id)
-PY
-    # Run from a real file, not `python - <<heredoc`: piping the script's
-    # own source through stdin leaves nothing on stdin for the wizard's
-    # input() calls to read -- they hit EOF immediately, which silently
-    # aborted the whole wizard (caught by the except EOFError below) and
-    # fell straight through to launching Claude Code with no prompts at all.
-    BRIGADE_CONFIG_DIR="$CONFIG_DIR" PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" \
-      "$_wizard_script_file" "$_wizard_profile_file" < /dev/tty || true
-    rm -f "$_wizard_script_file"
-    if [ -s "$_wizard_profile_file" ]; then
-      BRIGADE_PROFILE="$(cat "$_wizard_profile_file")"
+    _wizard_result_file="$(mktemp)"
+    # Run the unified launch-wizard using the config CLI. Uses --output-json
+    # for machine-readable results. The launcher's stdin is connected to the
+    # terminal (</dev/tty) so the interactive wizard works.
+    BRIGADE_CONFIG_DIR="$CONFIG_DIR" PYTHONPATH="$_BRIGADE_PYTHONPATH" "$_BRIGADE_PYTHON" \
+      -m enhanced_router.config_cli launch-wizard \
+      --output-json "$_wizard_result_file" < /dev/tty || true
+    if [ -s "$_wizard_result_file" ]; then
+      _wizard_status="$(python3 -c "import json; print(json.load(open('$_wizard_result_file'))['status'])" 2>/dev/null || echo "cancelled")"
+      if [ "$_wizard_status" = "saved" ]; then
+        BRIGADE_PROFILE="$(python3 -c "import json; d=json.load(open('$_wizard_result_file')); print(d.get('inference_profile_id',''))" 2>/dev/null || true)"
+        SIDECAR_PROFILE="$(python3 -c "import json; d=json.load(open('$_wizard_result_file')); print(d.get('sidecar_profile_id',''))" 2>/dev/null || true)"
+        LAUNCH_PRESET="$(python3 -c "import json; d=json.load(open('$_wizard_result_file')); print(d.get('launch_preset_id',''))" 2>/dev/null || true)"
+      fi
     fi
-    rm -f "$_wizard_profile_file"
+    rm -f "$_wizard_result_file"
   fi
 fi
 

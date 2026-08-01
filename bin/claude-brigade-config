@@ -4,8 +4,27 @@ set -euo pipefail
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_DIR="${CLAUDE_BRIGADE_APP_DIR:-${CLAUDE_ENHANCED_APP_DIR:-$HOME/.local/share/claude-brigade}}"
 
+# Detect whether we are running from a source checkout or an installed copy.
+# When the executable's parent directory contains the source router module,
+# prefer that over the installed version regardless of PYTHONPATH.
+if [[ -d "$SOURCE_DIR/router/enhanced_router" ]] && [[ "$(realpath "$0")" != "$APP_DIR"/* ]]; then
+  # Running from a source checkout -- use the installed venv if available,
+  # but import config_cli from the checkout's router/ directory.
+  if [[ -x "$APP_DIR/venv/bin/python" ]]; then
+    exec "$APP_DIR/venv/bin/python" -c "
+import sys
+sys.path.insert(0, '$SOURCE_DIR/router')
+from enhanced_router.config_cli import main
+sys.exit(main())
+" "$@"
+  else
+    PYTHONPATH="$SOURCE_DIR/router${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m enhanced_router.config_cli "$@"
+  fi
+fi
+
+# Installed copy path: prefer the app's venv, then system python with APP_DIR on PYTHONPATH.
 if [[ -x "$APP_DIR/venv/bin/python" ]]; then
-  exec "$APP_DIR/venv/bin/python" -m enhanced_router.config_cli "$@"
+  PYTHONPATH="$APP_DIR/router${PYTHONPATH:+:$PYTHONPATH}" exec "$APP_DIR/venv/bin/python" -m enhanced_router.config_cli "$@"
 fi
 
 PYTHONPATH="$SOURCE_DIR/router${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m enhanced_router.config_cli "$@"

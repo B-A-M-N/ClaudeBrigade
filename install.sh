@@ -262,6 +262,17 @@ PY
   fi
 fi
 
+# ---- Write install-info.json metadata --------------------------------------
+if [[ "$APP_DIR" == "$HOME/.local/share/claude-brigade" ]]; then
+  _install_info="{\n  \"installed_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
+  _install_info="$_install_info\n  \"source_path\": \"$SOURCE_DIR\","
+  _install_info="$_install_info\n  \"git_commit\": \"$(cd "$SOURCE_DIR" && git rev-parse HEAD 2>/dev/null || echo 'unknown')\","
+  _install_info="$_install_info\n  \"source_revision\": \"$(cd "$SOURCE_DIR" && git rev-parse --short HEAD 2>/dev/null || echo 'unknown')\""
+  _install_info="$_install_info\n}"
+  printf "%b" "$_install_info\n" > "$APP_DIR/install-info.json"
+  chmod 600 "$APP_DIR/install-info.json"
+fi
+
 # ---- Clean up old managed agent files --------------------------------------
 # These were part of the previous agent naming convention.
 # Agents live under "$PROFILE_DIR/agents/", not "$PROFILE_DIR/" directly.

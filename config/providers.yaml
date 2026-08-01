@@ -6,6 +6,10 @@ providers:
     endpoints:
       anthropic: https://freeinference.org/anthropic
       openai: https://freeinference.org/v1
+    discovery:
+      type: openai-models
+      url: https://freeinference.org/v1/models
+      endpoint_id: openai
     limits:
       # One operator-facing knob. Both agent and upstream request admission use it.
       # The controller consumes one slot when it is a FreeInference model.
