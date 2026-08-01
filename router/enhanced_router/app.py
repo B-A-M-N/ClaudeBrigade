@@ -696,12 +696,26 @@ async def readyz(request: Request) -> Response:
     try:
         from enhanced_router.registry import get_registry
         registry = get_registry()
+        profile_id = os.environ.get("CLAUDE_BRIGADE_PROFILE", "hybrid")
+        profile_readiness = registry.profile_readiness(profile_id)
+        if not profile_readiness["ready"]:
+            raise RuntimeError(
+                f"profile '{profile_id}' is not ready: {profile_readiness['roles']}"
+            )
         controller_models = registry.controller_models()
         if not controller_models:
             raise RuntimeError("no controller-eligible model is configured")
         if not any(spec.has_litellm_endpoint() for _, spec in controller_models) and not os.environ.get("ANTHROPIC_API_KEY"):
             raise RuntimeError("no controller transport is ready")
-        return JSONResponse({"status": "ready"})
+        profile_models = [
+            registry.get_model(registry.get_profile(profile_id).route_target(role).model)
+            for role in ("recon", "implementer", "adversary", "repairer")
+        ]
+        if any(spec.has_litellm_endpoint() for spec in profile_models):
+            supervisor = getattr(app.state, "litellm_supervisor", None)
+            if supervisor is None or supervisor.active_generation is None:
+                raise RuntimeError("profile requires an active LiteLLM generation")
+        return JSONResponse({"status": "ready", "profile": profile_readiness})
     except Exception as exc:
         return JSONResponse(status_code=503, content={"status": "not_ready", "reason": str(exc)})
 
@@ -729,11 +743,14 @@ async def healthz(request: Request) -> dict[str, Any]:
         litellm_port = None
         supervisor = getattr(app.state, "litellm_supervisor", None)
         if supervisor is not None:
-            litellm_status = "ready"
+            litellm_status = getattr(supervisor, "lifecycle_state", "ready")
             litellm_generation = supervisor.active_generation
             litellm_port = supervisor.active_port
             if litellm_port is None:
-                litellm_status = "starting"
+                litellm_status = "degraded" if litellm_status == "active" else litellm_status
+
+        default_profile = os.environ.get("CLAUDE_BRIGADE_PROFILE", "hybrid")
+        profile_readiness = registry.profile_readiness(default_profile)
 
         from enhanced_router.base import BRIGADE_CONFIG_DIR
 
@@ -750,6 +767,7 @@ async def healthz(request: Request) -> dict[str, Any]:
             "litellm_models_configured": litellm_count,
             "healthy_models": healthy_count,
             "configured_models": model_count,
+            "profile": profile_readiness,
             "provider_admission": provider_admission_snapshots(),
             "registry_hash": registry_hash,
             "daemon_metadata": {

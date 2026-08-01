@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -501,6 +502,62 @@ class ModelRegistry:
         if spec is None:
             raise KeyError(f"Unknown profile: {profile_id}")
         return spec
+
+    def profile_readiness(self, profile_id: str) -> dict[str, Any]:
+        """Report whether every mandatory role has a configured transport."""
+        profile = self.get_profile(profile_id)
+        roles: dict[str, dict[str, Any]] = {}
+        for role in _VALID_ROLES:
+            model_id = profile.route_target(role).model
+            reasons: list[str] = []
+            try:
+                spec = self.get_model(model_id)
+            except KeyError:
+                roles[role] = {
+                    "model_id": model_id,
+                    "ready": False,
+                    "reasons": ["model is not in the active registry"],
+                }
+                continue
+            if not spec.enabled:
+                reasons.append("model is disabled")
+            if role in {"implementer", "repairer"} and not spec.capabilities.write_tool_certified:
+                reasons.append("write-tool certification is missing")
+            if spec.provider_id and spec.provider_id not in self._providers:
+                reasons.append(f"provider '{spec.provider_id}' is not configured")
+            endpoint = profile.route_target(role).endpoint
+            endpoint_spec = spec.endpoints.get(endpoint) if endpoint != "auto" else None
+            candidates = [endpoint_spec] if endpoint_spec is not None else list(spec.endpoints.values())
+            if not candidates:
+                candidates = [spec]
+            configured_transport = False
+            for candidate in candidates:
+                backend = getattr(candidate, "backend", spec.backend)
+                api_base = getattr(candidate, "api_base", None) or spec.api_base
+                api_base_env = getattr(candidate, "api_base_env", None) or spec.api_base_env
+                api_key_env = getattr(candidate, "api_key_env", None) or spec.api_key_env
+                if backend == "direct-anthropic" and not (api_base or (api_base_env and os.environ.get(api_base_env))):
+                    continue
+                if api_key_env and not os.environ.get(api_key_env):
+                    continue
+                if backend == "litellm" and not (
+                    getattr(candidate, "litellm_model", None) or spec.litellm_model
+                ):
+                    continue
+                configured_transport = True
+                break
+            if not configured_transport:
+                reasons.append("no configured endpoint with available credentials")
+            roles[role] = {
+                "model_id": model_id,
+                "ready": not reasons,
+                "reasons": reasons,
+            }
+        return {
+            "profile_id": profile_id,
+            "ready": all(item["ready"] for item in roles.values()),
+            "roles": dict(sorted(roles.items())),
+        }
 
     # ------------------------------------------------------------------
     # Deterministic recommendation (NOT LLM-based)

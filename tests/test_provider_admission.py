@@ -95,6 +95,34 @@ async def test_managed_group_admission_is_atomic_and_releases_all_candidates() -
         )
     assert manager.snapshot("openrouter")["active_requests"] == 0
 
+
+@pytest.mark.asyncio
+async def test_managed_group_waiter_is_not_starved_by_single_provider_queue() -> None:
+    manager = ProviderAdmissionManager({
+        "a": ProviderLimits(max_concurrency=1, queue_timeout_seconds=1),
+        "b": ProviderLimits(max_concurrency=1, queue_timeout_seconds=1),
+    })
+    await manager.acquire_request("a", "a1")
+    await manager.acquire_request("b", "b1")
+    group = asyncio.create_task(
+        manager.acquire_request_group(("a", "b"), "group", deadline=monotonic() + 1)
+    )
+    await asyncio.sleep(0)
+
+    single = asyncio.create_task(
+        manager.acquire_request("a", "a2", deadline=monotonic() + 1)
+    )
+    await asyncio.sleep(0)
+    await manager.release_request("b1")
+    await manager.release_request("a1")
+    await asyncio.wait_for(group, 1)
+    assert manager.snapshot("a")["active_requests"] == 1
+    assert manager.snapshot("b")["active_requests"] == 1
+    assert not single.done()
+
+    await manager.release_request_group(("a", "b"), "group")
+    await asyncio.wait_for(single, 1)
+
     await manager.release_request("fi-blocker")
     await manager.acquire_request_group(("freeinference", "openrouter"), "group-2")
     assert manager.snapshot("freeinference")["active_requests"] == 1
@@ -135,6 +163,7 @@ def test_snapshots_are_json_safe() -> None:
         "max_queued_agents": 8,
         "queue_timeout_seconds": 20.0,
     }
+    assert snapshot["queued_group_requests"] == 0
 
 
 def test_freeinference_concurrency_env_override(monkeypatch: pytest.MonkeyPatch) -> None:

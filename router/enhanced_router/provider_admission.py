@@ -69,6 +69,14 @@ class _Waiter:
 
 
 @dataclass
+class _GroupWaiter:
+    provider_ids: tuple[str, ...]
+    item_id: str
+    deadline: float
+    future: asyncio.Future[None]
+
+
+@dataclass
 class _ProviderState:
     limits: ProviderLimits
     active_agents: set[str] = field(default_factory=set)
@@ -87,6 +95,7 @@ class ProviderAdmissionManager:
     def __init__(self, providers: dict[str, ProviderLimits] | None = None) -> None:
         self._providers = dict(providers or {})
         self._states: dict[str, _ProviderState] = {}
+        self._group_queue: deque[_GroupWaiter] = deque()
         self._lock = asyncio.Lock()
 
     def configure(self, provider_id: str, limits: ProviderLimits) -> None:
@@ -94,6 +103,7 @@ class ProviderAdmissionManager:
         state = self._states.get(provider_id)
         if state is not None:
             state.limits = limits
+            self._pump_group_queue()
             self._pump(state, state.agent_queue, state.active_agents, limits.max_active_agents)
             self._pump(state, state.request_queue, state.active_requests, limits.max_inflight_requests)
 
@@ -160,35 +170,74 @@ class ProviderAdmissionManager:
         end = deadline if deadline is not None else monotonic() + min(
             limit.queue_timeout_seconds for limit in limits
         )
-        while True:
+        loop = asyncio.get_running_loop()
+        waiter = _GroupWaiter(
+            provider_ids=ordered,
+            item_id=request_id,
+            deadline=end,
+            future=loop.create_future(),
+        )
+        async with self._lock:
+            self._group_queue.append(waiter)
+            self._pump_group_queue()
+        try:
+            remaining = max(0.0, waiter.deadline - monotonic())
+            await asyncio.wait_for(waiter.future, timeout=remaining)
+        except asyncio.CancelledError:
             async with self._lock:
-                now = monotonic()
-                states = [self._state(provider_id) for provider_id in ordered]
-                ready = True
-                for state in states:
-                    if state.circuit_state == "open":
-                        if state.circuit_open_until is not None and now < state.circuit_open_until:
-                            ready = False
-                            break
-                        state.circuit_state = "half-open"
-                    if state.circuit_state == "half-open" and state.half_open_probe not in {None, request_id}:
+                try:
+                    self._group_queue.remove(waiter)
+                except ValueError:
+                    pass
+                self._pump_group_queue()
+            raise
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            async with self._lock:
+                try:
+                    self._group_queue.remove(waiter)
+                except ValueError:
+                    pass
+                self._pump_group_queue()
+            raise AdmissionTimeout(
+                f"managed provider-group admission timed out for {request_id}"
+            ) from exc
+
+    def _pump_group_queue(self) -> None:
+        """Admit ready groups without holding partial provider capacity."""
+        now = monotonic()
+        for waiter in tuple(self._group_queue):
+            if waiter.future.cancelled() or waiter.deadline <= now:
+                self._group_queue.remove(waiter)
+                if not waiter.future.done():
+                    waiter.future.set_exception(
+                        AdmissionTimeout(
+                            f"managed provider-group admission timed out for {waiter.item_id}"
+                        )
+                    )
+                continue
+            states = [self._state(provider_id) for provider_id in waiter.provider_ids]
+            ready = True
+            for state in states:
+                if state.circuit_state == "open":
+                    if state.circuit_open_until is not None and now < state.circuit_open_until:
                         ready = False
                         break
-                    if state.request_queue or request_id not in state.active_requests and len(state.active_requests) >= state.limits.max_inflight_requests:
-                        ready = False
-                        break
-                if ready:
-                    for state in states:
-                        state.active_requests.add(request_id)
-                        if state.circuit_state == "half-open":
-                            state.half_open_probe = request_id
-                    return
-            remaining = end - monotonic()
-            if remaining <= 0:
-                raise AdmissionTimeout(
-                    f"managed provider-group admission timed out for {request_id}"
-                )
-            await asyncio.sleep(min(0.05, remaining))
+                    state.circuit_state = "half-open"
+                if state.circuit_state == "half-open" and state.half_open_probe not in {None, waiter.item_id}:
+                    ready = False
+                    break
+                if len(state.active_requests) >= state.limits.max_inflight_requests:
+                    ready = False
+                    break
+            if not ready:
+                continue
+            self._group_queue.remove(waiter)
+            for state in states:
+                state.active_requests.add(waiter.item_id)
+                if state.circuit_state == "half-open":
+                    state.half_open_probe = waiter.item_id
+            if not waiter.future.done():
+                waiter.future.set_result(None)
 
     async def _admit_circuit(self, state: _ProviderState, request_id: str) -> None:
         """Gate new upstream requests on provider-wide circuit state."""
@@ -264,6 +313,8 @@ class ProviderAdmissionManager:
         deadline: float | None,
     ) -> None:
         async with self._lock:
+            if queue is state.request_queue and self._group_queue:
+                self._pump_group_queue()
             if item_id in active:
                 return
             if not queue and len(active) < capacity:
@@ -323,6 +374,7 @@ class ProviderAdmissionManager:
                     state.active_requests.remove(request_id)
                     if state.half_open_probe == request_id:
                         state.half_open_probe = None
+                    self._pump_group_queue()
                     self._pump(state, state.request_queue, state.active_requests, state.limits.max_inflight_requests)
                     return
 
@@ -342,6 +394,11 @@ class ProviderAdmissionManager:
                 state.active_requests.remove(request_id)
                 if state.half_open_probe == request_id:
                     state.half_open_probe = None
+            self._pump_group_queue()
+            for provider_id in ordered:
+                state = self._states.get(provider_id)
+                if state is None:
+                    continue
                 self._pump(
                     state, state.request_queue, state.active_requests,
                     state.limits.max_inflight_requests,
@@ -349,6 +406,13 @@ class ProviderAdmissionManager:
 
     async def cancel(self, item_id: str) -> bool:
         async with self._lock:
+            for waiter in tuple(self._group_queue):
+                if waiter.item_id == item_id:
+                    self._group_queue.remove(waiter)
+                    if not waiter.future.done():
+                        waiter.future.cancel()
+                    self._pump_group_queue()
+                    return True
             for state in self._states.values():
                 for queue in (state.agent_queue, state.request_queue):
                     for waiter in tuple(queue):
@@ -364,17 +428,22 @@ class ProviderAdmissionManager:
             self._providers[provider_id] = new_limits
             state = self._state(provider_id)
             state.limits = new_limits
+            self._pump_group_queue()
             self._pump(state, state.agent_queue, state.active_agents, new_limits.max_active_agents)
             self._pump(state, state.request_queue, state.active_requests, new_limits.max_inflight_requests)
 
     def snapshot(self, provider_id: str) -> dict[str, object]:
         state = self._state(provider_id)
+        queued_groups = sum(
+            provider_id in waiter.provider_ids for waiter in self._group_queue
+        )
         return {
             "provider_id": provider_id,
             "active_agents": len(state.active_agents),
             "active_requests": len(state.active_requests),
             "queued_agents": len(state.agent_queue),
             "queued_requests": len(state.request_queue),
+            "queued_group_requests": queued_groups,
             "limits": asdict(state.limits),
             "circuit": {
                 "state": state.circuit_state,
