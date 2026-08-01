@@ -290,7 +290,6 @@ async def _run_fastpath_route(packet: dict[str, Any]) -> dict[str, Any]:
     """Execute one advisory route call after its request has been detached."""
     from enhanced_router.fastpath import FastpathClient, FastpathLimits, FastpathPolicyValidator, FastpathRouteProposal
     from enhanced_router.registry import get_registry
-    from enhanced_router.backends import _provider_admission
 
     registry = get_registry()
     config = registry.fastpath
@@ -326,16 +325,11 @@ async def _run_fastpath_route(packet: dict[str, Any]) -> dict[str, Any]:
             timeout_seconds=config.timeout_seconds,
             max_packet_bytes=config.max_packet_bytes,
         ),
+        provider_id=provider_id,
+        endpoint_id=selected.endpoint_id,
         system_prompts=config.system_prompts,
         max_output_tokens=config.max_output_tokens,
     )
-    request_id = f"fastpath:{packet.get('intake_id', 'unknown')}"
-    try:
-        await _provider_admission.acquire_request(
-            provider_id, request_id, deadline=asyncio.get_running_loop().time() + config.timeout_seconds
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail="fastpath provider capacity unavailable") from exc
     try:
         result = await client.request("route", packet)
         proposal = FastpathRouteProposal.model_validate(result)
@@ -360,8 +354,6 @@ async def _run_fastpath_route(packet: dict[str, Any]) -> dict[str, Any]:
             "fastpath_model_id": config.model_id,
             "confidence": 0.0,
         }
-    finally:
-        await _provider_admission.release_request(request_id)
     proposal_id = packet.get("proposal_id")
     intake_id = packet.get("intake_id")
     run_id = packet.get("run_id")
@@ -429,7 +421,6 @@ async def _run_fastpath_verify(body: dict[str, Any]) -> dict[str, Any]:
         FastpathVerification,
     )
     from enhanced_router.registry import get_registry
-    from enhanced_router.backends import _provider_admission
 
     registry = get_registry()
     config = registry.fastpath
@@ -456,15 +447,12 @@ async def _run_fastpath_verify(body: dict[str, Any]) -> dict[str, Any]:
         model=(selected.spec.litellm_model or model.litellm_model or config.model_id).removeprefix("openai/"),
         api_key_env=selected.spec.api_key_env or model.api_key_env or "FREEINFERENCE_API_KEY",
         limits=FastpathLimits(timeout_seconds=config.timeout_seconds, max_packet_bytes=config.max_packet_bytes),
+        provider_id=provider_id,
+        endpoint_id=selected.endpoint_id,
         system_prompts=config.system_prompts,
         max_output_tokens=config.max_output_tokens,
     )
-    request_id = f"fastpath-verify:{body.get('verification_id', body.get('epoch_id', 'unknown'))}"
     try:
-        await _provider_admission.acquire_request(
-            provider_id, request_id,
-            deadline=asyncio.get_running_loop().time() + config.timeout_seconds,
-        )
         result = await client.request("verify", packet)
         verification = FastpathVerification.model_validate(result)
         FastpathPolicyValidator().validate_verification(
@@ -482,7 +470,9 @@ async def _run_fastpath_verify(body: dict[str, Any]) -> dict[str, Any]:
         epoch_id = body.get("epoch_id")
         if isinstance(run_id, str) and isinstance(epoch_id, str):
             state = get_state()
-            verification_id = str(body.get("verification_id") or f"verify:{request_id}")
+            verification_id = str(
+                body.get("verification_id") or f"verify:{body.get('epoch_id', 'unknown')}"
+            )
             state.create_fastpath_verification(
                 verification_id=verification_id,
                 run_id=run_id,
@@ -511,8 +501,6 @@ async def _run_fastpath_verify(body: dict[str, Any]) -> dict[str, Any]:
             "fastpath_model_id": config.model_id,
             "confidence": 0.0,
         }
-    finally:
-        await _provider_admission.release_request(request_id)
 
 
 @app.post("/internal/catalog/sync")

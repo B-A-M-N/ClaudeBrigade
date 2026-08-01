@@ -230,6 +230,69 @@ class TestResolvedRoute:
         await backends._release_provider_request(route, request_id)
         assert backends.provider_admission_snapshots()["anthropic"]["active_requests"] == 0
 
+    @pytest.mark.asyncio
+    async def test_openai_compatible_specialist_uses_shared_transport_controls(self, monkeypatch):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        import enhanced_router.backends as backends
+
+        response = SimpleNamespace(
+            headers={},
+            status_code=200,
+            raise_for_status=lambda: None,
+            aclose=AsyncMock(),
+        )
+        released: list[str] = []
+
+        monkeypatch.setattr(backends, "_credential_value", lambda name: "secret")
+        monkeypatch.setattr(
+            backends,
+            "get_upstream_client",
+            lambda: SimpleNamespace(
+                build_request=lambda method, url, **kwargs: httpx.Request(
+                    method, url, **kwargs,
+                ),
+            ),
+        )
+
+        async def acquire(route, request, *, streaming=False):
+            assert route.provider_id == "freeinference"
+            assert route.endpoint_id == "openai"
+            assert request.headers["authorization"] == "Bearer secret"
+            return "admission-1"
+
+        async def release(route, request_id):
+            released.append(request_id or "")
+
+        async def send(client, builder, route, started_at, request_id):
+            request = builder()
+            assert str(request.url) == "https://provider.test/chat/completions"
+            assert b'"model":"diffusiongemma"' in request.content
+            return response
+
+        async def read(response_arg, route, started_at):
+            return b'{"choices":[{"message":{"content":"{}"}}]}'
+
+        monkeypatch.setattr(backends, "_acquire_provider_request", acquire)
+        monkeypatch.setattr(backends, "_release_provider_request", release)
+        monkeypatch.setattr(backends, "_send_with_provider_retry", send)
+        monkeypatch.setattr(backends, "_read_with_deadline", read)
+        monkeypatch.setattr(backends, "_record_endpoint_usage", lambda *args, **kwargs: None)
+
+        result = await backends.post_openai_compatible_json(
+            api_base="https://provider.test",
+            model="diffusiongemma",
+            api_key_env="FREEINFERENCE_API_KEY",
+            provider_id="freeinference",
+            endpoint_id="openai",
+            payload={"messages": [], "stream": False},
+            request_id="fastpath:route",
+        )
+
+        assert result == {"choices": [{"message": {"content": "{}"}}]}
+        assert released == ["admission-1"]
+
     def test_minimal_route(self):
         """Route with just kind and model_id."""
         route = ResolvedRoute(

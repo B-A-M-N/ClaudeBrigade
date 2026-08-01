@@ -326,6 +326,8 @@ Implemented in the current working tree:
 - one shared external HTTP client and response-header copier;
 - bounded streaming deadlines, incremental SSE usage parsing, and provider
   admission/circuit state, including atomic managed-group reservations;
+- OpenAI-compatible fastpath transport routed through shared admission,
+  provider retry/circuit, deadline, and usage accounting;
 - Claude subscription passthrough requests admitted and accounted through the
   shared synthetic `anthropic` provider lane;
 - model-qualified visible agents, execution lifecycle hooks, mutation leases,
@@ -369,8 +371,8 @@ Remaining work before a production-quality proving ground:
    changeset path, persisted patches, overlap classification, deterministic
    preflight, and controller-action gate are implemented; semantic conflict
    resolution is intentionally not automatic.
-3. Route fastpath's specialized OpenAI-compatible transport through the common
-   outbound executor and add a bounded retry action for failed detached jobs.
+3. Add a bounded controller-visible retry action for failed detached fastpath
+   jobs.
 4. Expand the local fixture integration suite for tools, parallel tools,
    tool-result continuation, structured output, cancellation, SSE usage, 401,
    429, 503, and generation pinning.

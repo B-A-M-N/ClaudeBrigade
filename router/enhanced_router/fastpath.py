@@ -8,11 +8,9 @@ replace mandatory controller/adversary decisions.
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
 from typing import Any, Literal
 
-import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 class FastpathRoleProposal(BaseModel):
@@ -199,41 +197,44 @@ class FastpathClient:
     """Bounded, credential-owning client for internal route/verify calls."""
 
     def __init__(self, *, api_base: str, model: str, api_key_env: str,
+                 provider_id: str, endpoint_id: str | None = None,
                  limits: FastpathLimits | None = None,
                  system_prompts: dict[str, str] | None = None,
                  max_output_tokens: int = 1024) -> None:
         self.api_base = api_base.rstrip("/")
         self.model = model
         self.api_key_env = api_key_env
+        self.provider_id = provider_id
+        self.endpoint_id = endpoint_id
         self.limits = limits or FastpathLimits()
         self.system_prompts = dict(system_prompts or {})
         self.max_output_tokens = max_output_tokens
 
     async def request(self, mode: Literal["route", "verify"], packet: dict[str, Any]) -> dict[str, Any]:
-        try:
-            from enhanced_router.credential_store import resolve_loaded
-
-            key = resolve_loaded(self.api_key_env)
-        except Exception:
-            key = os.environ.get(self.api_key_env)
-        if not key:
-            raise RuntimeError(f"fastpath credential '{self.api_key_env}' is unavailable")
         prompt = json.dumps(packet, separators=(",", ":"), ensure_ascii=False)
         messages: list[dict[str, str]] = []
         system = self.system_prompts.get(mode)
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
-        async with httpx.AsyncClient(timeout=self.limits.timeout_seconds, follow_redirects=False) as client:
-            response = await client.post(
-                f"{self.api_base}/chat/completions",
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", "X-Brigade-Fastpath": mode},
-                json={"model": self.model, "messages": messages,
-                      "max_tokens": self.max_output_tokens,
-                      "response_format": {"type": "json_object"}, "stream": False},
-            )
-            response.raise_for_status()
-            payload = response.json()
+        from enhanced_router.backends import post_openai_compatible_json
+
+        payload = await post_openai_compatible_json(
+            api_base=self.api_base,
+            model=self.model,
+            api_key_env=self.api_key_env,
+            provider_id=self.provider_id,
+            endpoint_id=self.endpoint_id,
+            payload={
+                "messages": messages,
+                "max_tokens": self.max_output_tokens,
+                "response_format": {"type": "json_object"},
+                "stream": False,
+            },
+            request_id=f"fastpath:{mode}",
+            extra_headers={"X-Brigade-Fastpath": mode},
+            timeout_seconds=self.limits.timeout_seconds,
+        )
         choices = payload.get("choices")
         content = choices[0].get("message", {}).get("content") if isinstance(choices, list) and choices else None
         if not isinstance(content, str):

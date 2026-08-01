@@ -715,6 +715,105 @@ async def _send_with_provider_retry(
     raise RuntimeError("provider request exhausted its retry budget") from last_error
 
 
+async def post_openai_compatible_json(
+    *,
+    api_base: str,
+    model: str,
+    api_key_env: str,
+    provider_id: str,
+    endpoint_id: str | None,
+    payload: dict[str, Any],
+    request_id: str,
+    extra_headers: dict[str, str] | None = None,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Send one bounded non-streaming OpenAI-compatible request.
+
+    This is the protocol adapter for router-owned JSON specialists such as
+    fastpath. Admission, provider retry/circuit checks, absolute deadlines,
+    response accounting, and permit release remain shared with normal model
+    backends.
+    """
+    key = _credential_value(api_key_env)
+    if not key:
+        raise RuntimeError(f"credential '{api_key_env}' is unavailable")
+    route = ResolvedRoute(
+        kind=BackendType.LITELLM,
+        model_id=model,
+        api_base=api_base.rstrip("/"),
+        api_key_env=api_key_env,
+        provider_id=provider_id,
+        endpoint_id=endpoint_id or "openai-chat",
+    )
+    headers = {
+        "authorization": f"Bearer {key}",
+        "content-type": "application/json",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    body = json.dumps({**payload, "model": model}, separators=(",", ":")).encode("utf-8")
+    request = httpx.Request(
+        "POST", f"{route.api_base}/chat/completions", headers=headers, content=body,
+    )
+    started_at = time.perf_counter()
+    admission_id = await _acquire_provider_request(route, request, streaming=False)
+    if admission_id is None:
+        raise RuntimeError("OpenAI-compatible request admission did not return a request ID")
+    client = get_upstream_client()
+    upstream_response: Any | None = None
+    try:
+        send = _send_with_provider_retry(
+            client,
+            lambda: client.build_request(
+                request.method,
+                str(request.url),
+                headers=dict(request.headers),
+                content=body,
+            ),
+            route,
+            started_at,
+            admission_id,
+        )
+        if timeout_seconds is not None:
+            upstream_response = await asyncio.wait_for(
+                send,
+                timeout=max(0.001, timeout_seconds - (time.perf_counter() - started_at)),
+            )
+        else:
+            upstream_response = await send
+        if upstream_response is None:
+            raise RuntimeError("OpenAI-compatible upstream returned no response")
+        read = _read_with_deadline(upstream_response, route, started_at)
+        if timeout_seconds is not None:
+            content = await asyncio.wait_for(
+                read,
+                timeout=max(0.001, timeout_seconds - (time.perf_counter() - started_at)),
+            )
+        else:
+            content = await read
+        upstream_response.raise_for_status()
+    finally:
+        try:
+            if upstream_response is not None:
+                await upstream_response.aclose()
+        finally:
+            await _release_provider_request(route, admission_id)
+    try:
+        parsed = json.loads(content)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("OpenAI-compatible response was malformed JSON") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("OpenAI-compatible response was not an object")
+    _record_endpoint_usage(
+        route,
+        admission_id,
+        parsed,
+        started_at,
+        succeeded=True,
+    )
+    return parsed
+
+
 def _retry_after_seconds(value: object) -> float | None:
     """Parse both RFC 7231 delta-seconds and HTTP-date Retry-After values."""
     if value is None:
