@@ -1771,9 +1771,15 @@ class RouteState:
                 })
             actions.append(action)
         for phase in self.get_ready_phases(run_id, epoch_id) + self.get_active_phases(run_id, epoch_id):
-            if phase.get("required_actor") or phase.get("actor"):
+            actor_contract = str(phase.get("required_actor") or phase.get("actor") or "")
+            controller_phase = actor_contract == "controller"
+            if actor_contract and not controller_phase:
                 continue
-            allowed_roles = json.loads(phase.get("allowed_roles_json") or "[]")
+            if controller_phase and phase.get("status") != "active":
+                continue
+            allowed_roles = ["controller"] if controller_phase else json.loads(
+                phase.get("allowed_roles_json") or "[]"
+            )
             executions = self.get_agent_executions(
                 run_id, epoch_id=epoch_id, phase_id=phase["phase_id"]
             )
@@ -1795,9 +1801,21 @@ class RouteState:
                                   for item in executions) and not fallback_policy:
                 continue
             for role in allowed_roles:
-                route = self.get_role_route(run_id, epoch_id, role)
-                if not route:
-                    continue
+                controller_binding = None
+                if controller_phase:
+                    run = self.get_run(run_id)
+                    session_id = str(run.get("claude_session_id")) if run and run.get("claude_session_id") else ""
+                    controller_binding = self.get_controller_binding(run_id, session_id) if session_id else None
+                    if not controller_binding or not controller_binding.get("registry_model_id"):
+                        continue
+                    route = {
+                        "endpoint_override": controller_binding.get("endpoint_id"),
+                        "model_id": controller_binding["registry_model_id"],
+                    }
+                else:
+                    route = self.get_role_route(run_id, epoch_id, role)
+                    if not route:
+                        continue
                 model_id = str(route["model_id"])
                 if max_attempts_per_model is not None:
                     model_attempts = sum(
@@ -1806,9 +1824,14 @@ class RouteState:
                     if model_attempts >= int(max_attempts_per_model):
                         continue
                 model = registry.get_model(model_id)
-                provider_id = model.provider_id
+                provider_value = (
+                    (controller_binding or {}).get("provider_id") or model.provider_id
+                ) if model else None
+                provider_id = str(provider_value) if provider_value else None
                 provider = registry.providers.get(provider_id) if provider_id else None
                 execution_kind = str(phase.get("execution_kind") or "native_agent")
+                if controller_phase:
+                    execution_kind = "native_agent"
                 if execution_kind not in {"native_agent", "sidecar_call"}:
                     continue
                 if (
@@ -1820,14 +1843,14 @@ class RouteState:
                     )
                 ):
                     continue
-                native_name = next(
+                native_name = "controller-direct" if controller_phase else next(
                     (
                         name for name, bound_model in ROLE_MODEL_BINDINGS.items()
                         if bound_model == model_id and name.startswith("brigade-")
                     ),
                     f"brigade-{role}",
                 )
-                if execution_kind == "sidecar_call":
+                if execution_kind == "sidecar_call" and not controller_phase:
                     native_name = f"sidecar-{role}"
                 action_id = (
                     f"action:{run_id}:{epoch_id}:{phase['phase_id']}:{role}:{len(executions)}"
@@ -1847,7 +1870,7 @@ class RouteState:
                     "status": "ready",
                     "max_fanout": phase.get("max_fanout"),
                     "current_fanout": len(executions),
-                    "requires_main_controller": False,
+                    "requires_main_controller": controller_phase,
                 }
                 if claim is not None:
                     action.update({

@@ -699,6 +699,39 @@ def test_runnable_native_action_requires_claim_and_is_consumed_once(
     assert finished["status"] == "consumed"
 
 
+def test_controller_phase_generates_controlled_native_mutator_action(
+    state: RouteState, monkeypatch: pytest.MonkeyPatch,
+):
+    state.create_run("r1", session_id="session-1")
+    state.create_epoch("r1", "ep-1", "trivial", "hybrid")
+    state.bind_or_get_controller(
+        run_id="r1", client_session_id="session-1", public_model="controller-model",
+        registry_model_id="model-a", backend="anthropic-passthrough", upstream_model="claude",
+        provider_id=None, api_base=None, catalog_generation=None, registry_hash="hash",
+        certification_id=None, auth_spec_json=None, api_key_env=None,
+    )
+    state.initialize_workflow_phases(
+        "r1", "ep-1", [{"id": "implementation", "actor": "controller", "mutation": True}],
+    )
+    state.start_phase("r1", "ep-1", "implementation", actor="controller")
+
+    class FakeRegistry:
+        providers: dict = {}
+
+        @staticmethod
+        def get_model(model_id: str) -> SimpleNamespace:
+            return SimpleNamespace(provider_id=None)
+
+    import enhanced_router.registry as registry_module
+    monkeypatch.setattr(registry_module, "get_registry", lambda: FakeRegistry())
+
+    action = next(item for item in state.get_runnable_actions("r1", "ep-1"))
+    assert action["action_kind"] == "native_agent"
+    assert action["native_agent_name"] == "controller-direct"
+    assert action["role"] == "controller"
+    assert action["requires_main_controller"] is True
+
+
 def test_unclaimed_native_action_is_not_spawnable(state: RouteState, monkeypatch: pytest.MonkeyPatch):
     state.create_run("r1")
     state.create_epoch("r1", "ep-1", "normal", "hybrid")
