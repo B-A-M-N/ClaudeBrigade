@@ -93,6 +93,34 @@ def test_set_run_selection_unknown_run_returns_none(state: RouteState):
     assert state.set_run_selection("no-such-run", inference_profile_id="x") is None
 
 
+def test_active_run_selections_returns_only_open_runs(state: RouteState):
+    state.create_run(
+        "run-open", inference_profile_id="cloud-build", sidecar_profile_id="deep-review",
+    )
+    state.create_run("run-closed", inference_profile_id="local-build")
+    state.close_run("run-closed")
+
+    selections = state.active_run_selections()
+    assert selections == [
+        {"inference_profile_id": "cloud-build", "sidecar_profile_id": "deep-review"},
+    ]
+
+
+def test_active_run_selections_empty_with_no_open_runs(state: RouteState):
+    assert state.active_run_selections() == []
+
+
+def test_active_run_selections_includes_runs_without_a_profile(state: RouteState):
+    """A bare `--model` launch never sets a profile; the scoping consumer
+    must be able to see that and widen back out rather than mistake an
+    empty list entry for 'no runs open'.
+    """
+    state.create_run("run-no-profile")
+    assert state.active_run_selections() == [
+        {"inference_profile_id": None, "sidecar_profile_id": None},
+    ]
+
+
 # ================================================================== Epoch lifecycle
 # ==================================================================
 
@@ -1007,7 +1035,7 @@ def test_v29_to_current_adds_binding_and_group_columns(tmp_path: Path):
         assert "configuration_hash" in columns
         assert "routing_mode" in columns
         assert "deployment_group" in columns
-        assert version == 38
+        assert version == 39
     finally:
         conn.close()
 
@@ -1157,6 +1185,93 @@ def test_sidecar_claim_creates_scoped_execution_events(
     assert events[0]["payload"] == {"task": "inspect"}
 
 
+def test_sidecar_call_outside_runs_sidecar_profile_never_becomes_runnable(
+    state: RouteState, monkeypatch: pytest.MonkeyPatch,
+):
+    """A run bounded to a sidecar_profile_id must not be offered a
+    workflow phase naming a sidecar outside that profile's allow-list --
+    otherwise sidecar_profiles.yaml's bound is advisory in name only.
+    """
+    state.create_run("r1", sidecar_profile_id="lightweight")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    state.set_role_route("r1", "ep-1", "recon", "model-a", "manual")
+    state.initialize_workflow_phases(
+        "r1", "ep-1", [{
+            "id": "recon", "roles": ["recon"], "execution_kind": "sidecar_call",
+            "sidecar_id": "verifier",
+        }],
+    )
+    state.start_phase("r1", "ep-1", "recon")
+
+    class FakeRegistry:
+        providers: dict = {}
+
+        @staticmethod
+        def get_model(model_id: str) -> SimpleNamespace:
+            return SimpleNamespace(provider_id=None)
+
+        @staticmethod
+        def get_sidecar(sidecar_id: str) -> SimpleNamespace:
+            return SimpleNamespace(
+                model_id="model-b", endpoint="auto", enabled=True, mode="structured",
+                timeout_seconds=45.0, max_packet_bytes=64_000, max_output_tokens=2_048,
+            )
+
+        @staticmethod
+        def resolve_sidecars(sidecar_profile_id: str | None) -> dict:
+            # "lightweight" only allows "reviewer" -- "verifier" is outside it.
+            if sidecar_profile_id == "lightweight":
+                return {"reviewer": SimpleNamespace()}
+            return {"reviewer": SimpleNamespace(), "verifier": SimpleNamespace()}
+
+    import enhanced_router.registry as registry_module
+    monkeypatch.setattr(registry_module, "get_registry", lambda: FakeRegistry())
+
+    actions = state.get_runnable_actions("r1", "ep-1")
+    assert not any(item["action_kind"] == "sidecar_call" for item in actions)
+
+
+def test_sidecar_call_inside_runs_sidecar_profile_is_runnable(
+    state: RouteState, monkeypatch: pytest.MonkeyPatch,
+):
+    state.create_run("r1", sidecar_profile_id="lightweight")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    state.set_role_route("r1", "ep-1", "recon", "model-a", "manual")
+    state.initialize_workflow_phases(
+        "r1", "ep-1", [{
+            "id": "recon", "roles": ["recon"], "execution_kind": "sidecar_call",
+            "sidecar_id": "reviewer",
+        }],
+    )
+    state.start_phase("r1", "ep-1", "recon")
+
+    class FakeRegistry:
+        providers: dict = {}
+
+        @staticmethod
+        def get_model(model_id: str) -> SimpleNamespace:
+            return SimpleNamespace(provider_id=None)
+
+        @staticmethod
+        def get_sidecar(sidecar_id: str) -> SimpleNamespace:
+            return SimpleNamespace(
+                model_id="model-b", endpoint="auto", enabled=True, mode="structured",
+                timeout_seconds=45.0, max_packet_bytes=64_000, max_output_tokens=2_048,
+            )
+
+        @staticmethod
+        def resolve_sidecars(sidecar_profile_id: str | None) -> dict:
+            if sidecar_profile_id == "lightweight":
+                return {"reviewer": SimpleNamespace()}
+            return {"reviewer": SimpleNamespace(), "verifier": SimpleNamespace()}
+
+    import enhanced_router.registry as registry_module
+    monkeypatch.setattr(registry_module, "get_registry", lambda: FakeRegistry())
+
+    actions = state.get_runnable_actions("r1", "ep-1")
+    assert any(item["action_kind"] == "sidecar_call" for item in actions)
+
+
 def test_retry_policy_keeps_phase_active_until_attempt_budget_is_exhausted(
     state: RouteState, monkeypatch: pytest.MonkeyPatch,
 ):
@@ -1246,6 +1361,122 @@ def test_role_route_fallback_is_used_without_phase_retry_policy(
     assert second["model_id"] == "model-b"
 
 
+def test_fallback_activation_preserves_candidate_endpoint(
+    state: RouteState, monkeypatch: pytest.MonkeyPatch,
+):
+    """A fallback candidate with its own endpoint must not be forced back to
+    'auto' when it's activated -- fallbacks must be able to pin a different
+    provider/endpoint than the primary route."""
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    state.set_role_route(
+        "r1", "ep-1", "recon", "model-a", "manual",
+        fallback_routes=[{"model": "model-b", "endpoint": "provider-b"}],
+    )
+    state.initialize_workflow_phases(
+        "r1", "ep-1", [{"id": "recon", "roles": ["recon"], "max_fanout": 1, "max_attempts": 2}],
+    )
+    state.start_phase("r1", "ep-1", "recon")
+
+    class FakeRegistry:
+        providers: dict = {}
+
+        @staticmethod
+        def get_model(model_id: str) -> SimpleNamespace:
+            return SimpleNamespace(provider_id=None)
+
+        @staticmethod
+        def native_agent_name(model_id: str, role: str) -> str:
+            return f"brigade-{model_id}-{role}"
+
+    import enhanced_router.registry as registry_module
+    monkeypatch.setattr(registry_module, "get_registry", lambda: FakeRegistry())
+
+    execution = state.create_agent_execution(
+        "ex-fallback-1", "r1", "ep-1", "agent-fallback-1", "recon", "model-a",
+        phase_id="recon",
+    )
+    state.update_agent_execution(execution["execution_id"], status="failed")
+
+    second = next(item for item in state.get_runnable_actions("r1", "ep-1"))
+    assert second["model_id"] == "model-b"
+    assert second["endpoint"] == "provider-b"
+
+
+def test_fallback_activation_legacy_rows_still_work(
+    state: RouteState, monkeypatch: pytest.MonkeyPatch,
+):
+    """A role route written with only fallback_models (no fallback_routes,
+    e.g. from before this migration) must still activate its fallback, with
+    the endpoint treated as auto."""
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    state.set_role_route(
+        "r1", "ep-1", "recon", "model-a", "manual",
+        fallback_models=["model-b"],
+    )
+    # Simulate a pre-migration row: clear fallback_routes_json directly.
+    conn = state._new_conn()
+    try:
+        conn.execute(
+            "UPDATE role_routes SET fallback_routes_json = NULL "
+            "WHERE run_id='r1' AND epoch_id='ep-1' AND role='recon'",
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    state.initialize_workflow_phases(
+        "r1", "ep-1", [{"id": "recon", "roles": ["recon"], "max_fanout": 1, "max_attempts": 2}],
+    )
+    state.start_phase("r1", "ep-1", "recon")
+
+    class FakeRegistry:
+        providers: dict = {}
+
+        @staticmethod
+        def get_model(model_id: str) -> SimpleNamespace:
+            return SimpleNamespace(provider_id=None)
+
+        @staticmethod
+        def native_agent_name(model_id: str, role: str) -> str:
+            return f"brigade-{model_id}-{role}"
+
+    import enhanced_router.registry as registry_module
+    monkeypatch.setattr(registry_module, "get_registry", lambda: FakeRegistry())
+
+    execution = state.create_agent_execution(
+        "ex-fallback-1", "r1", "ep-1", "agent-fallback-1", "recon", "model-a",
+        phase_id="recon",
+    )
+    state.update_agent_execution(execution["execution_id"], status="failed")
+
+    second = next(item for item in state.get_runnable_actions("r1", "ep-1"))
+    assert second["model_id"] == "model-b"
+    assert second["endpoint"] == "auto"
+
+
+def test_migration_v39_adds_fallback_routes_column(tmp_path: Path):
+    db = tmp_path / "v38.db"
+    state = RouteState(db)
+    conn = state._new_conn()
+    try:
+        conn.execute("ALTER TABLE role_routes DROP COLUMN fallback_routes_json")
+        conn.execute("PRAGMA user_version = 38")
+        conn.commit()
+    finally:
+        conn.close()
+
+    upgraded = RouteState(db)
+    conn = upgraded._new_conn()
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(role_routes)")}
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        assert "fallback_routes_json" in columns
+        assert version == 39
+    finally:
+        conn.close()
+
+
 def test_completion_token_is_bound_to_workspace_and_consumed_once(state: RouteState):
     state.create_run("r1")
     state.create_epoch("r1", "ep-1", "normal", "hybrid")
@@ -1321,6 +1552,37 @@ def test_stale_lease_expiry(state: RouteState):
     count = state.expire_stale_leases("r1", max_age_seconds=0)
     assert count == 1
     assert state.get_active_mutator("r1") is None
+
+
+def test_acquire_mutation_lease_reclaims_a_lease_from_a_crashed_holder(state: RouteState):
+    """A hard-killed lease holder (no clean release, stale heartbeat) must
+    not permanently block every future writer -- acquire_mutation_lease
+    itself expires a stale lease on this workspace before checking for an
+    active one, the same lazy-expiry-on-read shape as
+    _active_action_claims for runnable_action_claims."""
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+
+    assert state.acquire_mutation_lease("r1", "ep-1", "agent-1", "implementer") is True
+
+    # Simulate a crash: no release_mutation_lease call, heartbeat frozen far
+    # in the past (older than mutation_lease_state._STALE_LEASE_MAX_AGE_SECONDS).
+    conn = state._new_conn()
+    conn.execute(
+        "UPDATE mutation_leases SET heartbeat_at = '2000-01-01T00:00:00+00:00' "
+        "WHERE run_id='r1' AND agent_id='agent-1'",
+    )
+    conn.commit()
+    conn.close()
+
+    assert state.acquire_mutation_lease("r1", "ep-1", "agent-2", "repairer") is True
+    mutator = state.get_active_mutator("r1")
+    assert mutator is not None
+    assert mutator["agent_id"] == "agent-2"
+
+    old_lease = state.get_mutation_lease("r1", "agent-1")
+    assert old_lease is not None
+    assert old_lease["released_at"] is not None
 
 
 def test_get_active_mutator(state: RouteState):
