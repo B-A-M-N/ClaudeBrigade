@@ -33,6 +33,7 @@ def _fastpath_route(packet: dict) -> dict | None:
         headers={
             "Content-Type": "application/json",
             "X-Enhanced-Token": os.environ.get("ENHANCED_ROUTER_TOKEN", ""),
+            "X-Brigade-Fastpath-Async": "1",
         },
         method="POST",
     )
@@ -96,6 +97,8 @@ def main() -> int:
 
     fastpath = _fastpath_route({
         "intake_id": intake_id,
+        "run_id": run_id,
+        "proposal_id": f"proposal_{uuid.uuid4().hex}",
         "task": prompt[:8_000],
         "repository": {
             "languages": features.languages,
@@ -108,19 +111,8 @@ def main() -> int:
         "required_capabilities": features.required_capabilities,
     })
     proposal_id = None
-    if fastpath:
-        proposal_id = f"proposal_{uuid.uuid4().hex}"
-        state.create_route_proposal(
-            proposal_id=proposal_id,
-            intake_id=intake_id,
-            source="fastpath",
-            parsed_proposal=fastpath,
-            validation_status=str(fastpath.get("validation_status", "pending")),
-            validation_reason=str(fastpath.get("validation_reason", "")),
-            fastpath_model_id=str(fastpath.get("fastpath_model_id", "diffusiongemma")),
-            fastpath_endpoint_id=str(fastpath.get("fastpath_endpoint_id", "")) or None,
-            confidence=float(fastpath.get("confidence", 0.0) or 0.0),
-        )
+    if fastpath and fastpath.get("validation_status") == "queued":
+        proposal_id = str(fastpath.get("proposal_id") or "") or None
 
     active = state.get_active_epoch(run_id)
     if active is None:

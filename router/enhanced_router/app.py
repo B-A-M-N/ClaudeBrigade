@@ -43,6 +43,14 @@ ROUTER_TOKEN_ENV = "ENHANCED_ROUTER_TOKEN"
 LONGCAT_PUBLIC_ID = os.getenv("LONGCAT_PUBLIC_ID", "anthropic-longcat-2-0")
 LONGCAT_UPSTREAM_ID = os.getenv("LONGCAT_UPSTREAM_ID", "LongCat-2.0")
 
+_FASTPATH_TASKS: set[asyncio.Task[object]] = set()
+
+
+def _finish_fastpath_task(task: asyncio.Task[object]) -> None:
+    _FASTPATH_TASKS.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        LOGGER.error("fastpath sidecar task failed: %s", task.exception())
+
 async def _init_litellm_supervisor(app: FastAPI) -> None:
     """Initialise the LiteLLM supervisor if BRIGADE_LITELLM_KEY is set.
 
@@ -103,6 +111,16 @@ async def _shutdown_litellm(app: FastAPI) -> None:
     configure_litellm_supervisor(None)
 
 
+async def _shutdown_fastpath_tasks() -> None:
+    tasks = list(_FASTPATH_TASKS)
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _FASTPATH_TASKS.clear()
+
+
 def _configure_provider_admission() -> None:
     """Load provider limits before any request can enter a backend."""
     from enhanced_router.backends import configure_provider_admission
@@ -148,6 +166,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await _shutdown_fastpath_tasks()
         from enhanced_router.sidecar_executor import shutdown_sidecar_executor
         await shutdown_sidecar_executor()
         await _shutdown_litellm(app)
@@ -185,8 +204,31 @@ def _require_local(request: Request) -> None:
 
 @app.post("/internal/fastpath/route")
 async def internal_fastpath_route(request: Request) -> JSONResponse:
-    """Run the optional advisory fastpath on bounded loopback input."""
+    """Queue or run the optional advisory fastpath on bounded input."""
     _require_local(request)
+    try:
+        packet = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="fastpath packet must be JSON") from exc
+    if not isinstance(packet, dict):
+        raise HTTPException(status_code=400, detail="fastpath packet must be an object")
+    encoded = json.dumps(packet, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if len(encoded) > 64_000:
+        raise HTTPException(status_code=413, detail="fastpath packet exceeds byte limit")
+    if request.headers.get("x-brigade-fastpath-async") == "1":
+        task = asyncio.create_task(_run_fastpath_route(packet), name="brigade-fastpath-route")
+        _FASTPATH_TASKS.add(task)
+        task.add_done_callback(_finish_fastpath_task)
+        return JSONResponse({
+            "validation_status": "queued",
+            "proposal_id": packet.get("proposal_id"),
+            "intake_id": packet.get("intake_id"),
+        }, status_code=202)
+    return JSONResponse(await _run_fastpath_route(packet))
+
+
+async def _run_fastpath_route(packet: dict[str, Any]) -> dict[str, Any]:
+    """Execute one advisory route call after its request has been detached."""
     from enhanced_router.fastpath import FastpathClient, FastpathLimits, FastpathPolicyValidator, FastpathRouteProposal
     from enhanced_router.registry import get_registry
     from enhanced_router.backends import _provider_admission
@@ -195,12 +237,6 @@ async def internal_fastpath_route(request: Request) -> JSONResponse:
     config = registry.fastpath
     if config is None or not config.enabled or "route" not in config.modes:
         raise HTTPException(status_code=404, detail="fastpath route mode is disabled")
-    try:
-        packet = await request.json()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="fastpath packet must be JSON") from exc
-    if not isinstance(packet, dict):
-        raise HTTPException(status_code=400, detail="fastpath packet must be an object")
     encoded = json.dumps(packet, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     if len(encoded) > config.max_packet_bytes:
         raise HTTPException(status_code=413, detail="fastpath packet exceeds byte limit")
@@ -250,23 +286,42 @@ async def internal_fastpath_route(request: Request) -> JSONResponse:
             configuration_hash=registry.registry_hash(),
             confidence_threshold=config.route_confidence_threshold,
         )
-        return JSONResponse({
+        result_payload = {
             **proposal.model_dump(),
             "validation_status": "accepted_for_controller_review",
             "fastpath_model_id": config.model_id,
             "fastpath_endpoint_id": selected.endpoint_id,
-        })
+        }
     except Exception as exc:
         if config.failure_policy == "fail":
             raise HTTPException(status_code=502, detail=f"fastpath validation failed: {exc}") from exc
-        return JSONResponse({
+        result_payload = {
             "validation_status": "bypassed",
             "validation_reason": str(exc)[:500],
             "fastpath_model_id": config.model_id,
             "confidence": 0.0,
-        })
+        }
     finally:
         await _provider_admission.release_request(request_id)
+    proposal_id = packet.get("proposal_id")
+    intake_id = packet.get("intake_id")
+    run_id = packet.get("run_id")
+    if all(isinstance(value, str) and value for value in (proposal_id, intake_id, run_id)):
+        try:
+            get_state().create_route_proposal(
+                proposal_id=str(proposal_id),
+                intake_id=str(intake_id),
+                source="fastpath",
+                parsed_proposal=result_payload,
+                validation_status=str(result_payload.get("validation_status", "bypassed")),
+                validation_reason=str(result_payload.get("validation_reason", "")),
+                fastpath_model_id=str(result_payload.get("fastpath_model_id", config.model_id)),
+                fastpath_endpoint_id=str(result_payload.get("fastpath_endpoint_id", "")) or None,
+                confidence=float(result_payload.get("confidence", 0.0) or 0.0),
+            )
+        except Exception:
+            LOGGER.exception("failed to persist detached fastpath proposal=%s", proposal_id)
+    return result_payload
 
 
 @app.post("/internal/fastpath/verify")

@@ -123,6 +123,30 @@ def test_router_head_probe(monkeypatch):
     assert resp.status_code == 200
 
 
+def test_fastpath_route_can_detach_from_prompt_intake(monkeypatch):
+    """Prompt intake receives a job receipt instead of waiting on inference."""
+    import asyncio
+
+    observed: list[dict] = []
+
+    async def fake_run(packet: dict) -> dict:
+        observed.append(packet)
+        await asyncio.sleep(0)
+        return {"validation_status": "accepted_for_controller_review"}
+
+    monkeypatch.setattr("enhanced_router.app._run_fastpath_route", fake_run)
+    monkeypatch.setenv("ENHANCED_ROUTER_TOKEN", "")
+    client = TestClient(app)
+    response = client.post(
+        "/internal/fastpath/route",
+        headers={"x-brigade-fastpath-async": "1"},
+        json={"run_id": "run-1", "intake_id": "intake-1", "proposal_id": "proposal-1"},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["proposal_id"] == "proposal-1"
+
+
 # ==================================================================
 # Anthropic passthrough backend tests
 # ==================================================================
