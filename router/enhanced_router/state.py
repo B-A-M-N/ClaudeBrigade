@@ -1864,9 +1864,17 @@ class RouteState:
                     route = self.get_role_route(run_id, epoch_id, role)
                     if not route:
                         continue
-                if executions and any(
+                # Fallback ladders and per-model attempt caps are keyed by
+                # role_routes (one route per role), so the failure/attempt
+                # counts used to index into them must also be role-scoped.
+                # `executions` is phase-wide -- every configured phase today
+                # has exactly one role, so this is a no-op change for the
+                # current config, but a multi-role phase would otherwise mix
+                # another role's failures into this role's fallback index.
+                role_executions = [item for item in executions if item.get("role") == role]
+                if role_executions and any(
                     item.get("status") in {"failed", "timeout", "timed_out", "cancelled", "orphaned"}
-                    for item in executions
+                    for item in role_executions
                 ) and not fallback_policy:
                     try:
                         route_fallbacks = json.loads(route.get("fallback_models_json") or "[]")
@@ -1888,7 +1896,7 @@ class RouteState:
                         fallback_models = []
                     failed_attempts = sum(
                         item.get("status") in {"failed", "timeout", "timed_out", "cancelled", "orphaned"}
-                        for item in executions
+                        for item in role_executions
                     )
                     if fallback_models and failed_attempts > len(fallback_models):
                         continue
@@ -1902,7 +1910,7 @@ class RouteState:
                 model_id = str(route["model_id"])
                 if max_attempts_per_model is not None:
                     model_attempts = sum(
-                        item.get("model_id") == model_id for item in executions
+                        item.get("model_id") == model_id for item in role_executions
                     )
                     if model_attempts >= int(max_attempts_per_model):
                         continue

@@ -857,6 +857,64 @@ def test_reconcile_lifecycle_skips_already_terminal_execution(state: RouteState)
     assert state.get_agent_execution("exec-1")["status"] == "completed"  # type: ignore[index]
 
 
+def test_fallback_accounting_is_scoped_per_role_in_multi_role_phase(
+    state: RouteState, monkeypatch: pytest.MonkeyPatch,
+):
+    """A phase with more than one allowed role must not let one role's
+    failures shift another role's fallback-model index -- each role has
+    its own independent fallback ladder in role_routes.  No workflow in
+    config/workflows.yaml currently declares a multi-role phase, so this
+    exercises a latent path rather than today's actual configuration.
+    """
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    state.set_role_route(
+        "r1", "ep-1", "implementer", "model-a", "manual",
+        fallback_models=["model-a-fallback"],
+    )
+    state.set_role_route(
+        "r1", "ep-1", "repairer", "model-b", "manual",
+        fallback_models=["model-b-fallback"],
+    )
+    state.initialize_workflow_phases(
+        "r1", "ep-1",
+        [{"id": "mixed", "roles": ["implementer", "repairer"], "max_fanout": 5, "max_attempts": 5}],
+    )
+    state.start_phase("r1", "ep-1", "mixed")
+
+    class FakeRegistry:
+        providers: dict = {}
+
+        @staticmethod
+        def get_model(model_id: str) -> SimpleNamespace:
+            return SimpleNamespace(provider_id=None)
+
+    import enhanced_router.registry as registry_module
+    monkeypatch.setattr(registry_module, "get_registry", lambda: FakeRegistry())
+
+    # Record a failed implementer attempt directly in agent_executions --
+    # that's what get_runnable_actions actually reads for fallback/attempt
+    # accounting, not the runnable_action_claims ledger.
+    state.create_workspace(
+        workspace_id="ws-impl-1", run_id="r1", epoch_id="ep-1", kind="shadow",
+        path="/tmp/shadow-impl-1", base_sha="sha-0", dirty_patch_hash="dirty-0",
+        status="active", owner_execution_id="exec-impl-1",
+    )
+    state.create_agent_execution(
+        execution_id="exec-impl-1", run_id="r1", epoch_id="ep-1",
+        claude_agent_id="agent-impl-1", role="implementer", model_id="model-a",
+        phase_id="mixed", workspace_id="ws-impl-1",
+    )
+    state.update_agent_execution(execution_id="exec-impl-1", status="failed")
+
+    # repairer has had zero failures of its own -- it must still be offered
+    # its PRIMARY model, not skip straight to its fallback because
+    # implementer failed in the same phase.
+    actions = state.get_runnable_actions("r1", "ep-1")
+    repairer_action = next(a for a in actions if a["role"] == "repairer")
+    assert repairer_action["model_id"] == "model-b"
+
+
 def test_v29_to_current_adds_binding_and_group_columns(tmp_path: Path):
     db = tmp_path / "v29.db"
     state = RouteState(db)
