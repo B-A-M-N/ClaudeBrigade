@@ -13,7 +13,7 @@ LOGGER = logging.getLogger(__name__)
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from workspace_fingerprint import fingerprint  # noqa: E402
 from ledger_io import append_jsonl  # noqa: E402
-from enhanced_router.base import MUTATORS  # noqa: E402
+from enhanced_router.base import agent_role, mutating_agents  # noqa: E402
 
 
 def record_ledger(session_dir: pathlib.Path, record: dict) -> None:
@@ -21,9 +21,7 @@ def record_ledger(session_dir: pathlib.Path, record: dict) -> None:
 
 
 def _role(agent_type: str) -> str:
-    if agent_type == "controller-direct":
-        return "controller"
-    return next((candidate for candidate in ("recon", "implementer", "adversary", "repairer") if candidate in agent_type), "recon")
+    return agent_role(agent_type)
 
 
 class WorkspaceIsolationError(RuntimeError):
@@ -38,7 +36,7 @@ def _execution_workspace(state: object, run_id: str, epoch_id: str, execution_id
     not create a second worktree; it records the child worktree and lets the
     router integrate its changeset when the child terminates.
     """
-    if agent_type not in MUTATORS:
+    if agent_type not in mutating_agents():
         return None
     from enhanced_router.shadow_worktree import ShadowWorktreeManager
 

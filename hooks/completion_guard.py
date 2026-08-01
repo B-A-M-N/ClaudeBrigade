@@ -17,7 +17,7 @@ from typing import Any
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from workspace_fingerprint import fingerprint, repository_root, clear_fingerprint_cache
 from ledger_io import append_jsonl, read_jsonl
-from enhanced_router.base import IMPLEMENTATION_AGENTS
+from enhanced_router.base import implementation_agents
 
 LOGGER = logging.getLogger(__name__)
 
@@ -114,7 +114,7 @@ def completed_agents(session_dir: pathlib.Path, active_epoch_id: str) -> Counter
 def validate_ledger_sequence(parsed: dict[str, str], session_dir: pathlib.Path, active_epoch_id: str) -> str | None:
     tier = parsed["Workflow-Tier"]
     implementation_agent = parsed["Implementation-Agent"]
-    if implementation_agent not in IMPLEMENTATION_AGENTS:
+    if implementation_agent not in implementation_agents():
         return f"Unknown implementation agent: {implementation_agent}"
 
     completed = completed_agents(session_dir, active_epoch_id)

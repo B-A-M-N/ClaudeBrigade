@@ -83,6 +83,55 @@ IMPLEMENTATION_AGENTS: frozenset[str] = frozenset({
     "brigade-fi-glm-fast-repairer",
 })
 
+
+def _registry_agent_manifest() -> dict[str, dict[str, str]]:
+    """Load configured specialist identities when a hook sees one.
+
+    Static role names remain available during bootstrap and when the registry
+    is unavailable. Dynamic names are only authorized after the registry has
+    described them, so a typo cannot become an implicit agent capability.
+    """
+    try:
+        from enhanced_router.registry import get_registry
+
+        return get_registry().specialist_manifest()
+    except Exception:
+        return {}
+
+
+def authorized_subagents() -> frozenset[str]:
+    return ALLOWED_SUBAGENTS | frozenset(_registry_agent_manifest())
+
+
+def mutating_agents() -> frozenset[str]:
+    dynamic = {
+        name for name, entry in _registry_agent_manifest().items()
+        if entry.get("role") in {"implementer", "repairer", "controller"}
+    }
+    return MUTATORS | frozenset(dynamic)
+
+
+def implementation_agents() -> frozenset[str]:
+    dynamic = {
+        name for name, entry in _registry_agent_manifest().items()
+        if entry.get("role") in {"implementer", "repairer", "controller"}
+    }
+    return IMPLEMENTATION_AGENTS | frozenset(dynamic)
+
+
+def agent_role(agent_type: str) -> str:
+    """Resolve a native name's role, including registry-generated names."""
+    if agent_type == "controller-direct":
+        return "controller"
+    entry = _registry_agent_manifest().get(agent_type)
+    if entry is not None:
+        return entry["role"]
+    return next(
+        (candidate for candidate in ("recon", "implementer", "adversary", "repairer")
+         if candidate in agent_type),
+        "recon",
+    )
+
 #: HTTP headers that MUST NOT be forwarded to upstream backends (RFC 9113 ?8.2.2).
 HOP_BY_HOP: frozenset[str] = frozenset({
     "connection", "keep-alive", "proxy-authenticate",

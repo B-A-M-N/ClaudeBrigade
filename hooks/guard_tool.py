@@ -11,7 +11,7 @@ import uuid
 
 from ledger_io import append_jsonl
 
-from enhanced_router.base import ALLOWED_SUBAGENTS, MUTATORS
+from enhanced_router.base import authorized_subagents, mutating_agents
 
 # ---------------------------------------------------------------------------
 # Shell-structure-aware mutation detector
@@ -226,7 +226,7 @@ def _ensure_mutation_lease(data: dict, agent_type: str, cwd: pathlib.Path) -> bo
             ),
             None,
         )
-        if agent_type in MUTATORS and owned_shadow is None:
+        if agent_type in mutating_agents() and owned_shadow is None:
             deny(
                 "Mutation blocked: mutating executions must own an active shadow worktree; "
                 "canonical or unregistered workspaces are not writable."
@@ -313,14 +313,14 @@ def main() -> int:
 
     if tool == "Agent":
         subagent_type = str((data.get("tool_input") or {}).get("subagent_type") or (data.get("tool_input") or {}).get("agent_type") or "")
-        if subagent_type and subagent_type not in ALLOWED_SUBAGENTS:
+        if subagent_type and subagent_type not in authorized_subagents():
             deny(f"Subagent role '{subagent_type}' is not in the authorized enhanced subagent allowlist.")
             return 0
         if not _reserve_agent_slot(data, subagent_type, session_id):
             return 0
 
     if tool in {"Write", "Edit", "NotebookEdit"}:
-        if agent_type not in MUTATORS:
+        if agent_type not in mutating_agents():
             deny(f"{agent_type} is read-only. Delegate source mutation to an authorized implementation agent.")
             return 0
         cwd = pathlib.Path(str(data.get("cwd", "."))).resolve()
@@ -349,7 +349,7 @@ def main() -> int:
         except Exception:
             pass
 
-        if agent_type not in MUTATORS:
+        if agent_type not in mutating_agents():
             if not _is_read_only_shell(command):
                 deny(
                     f"Bash blocked for read-only role {agent_type}: command is not in "
