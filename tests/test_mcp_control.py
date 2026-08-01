@@ -417,3 +417,264 @@ def test_worker_principal_cannot_adjudicate_finding(state: RouteState, monkeypat
         assert result["error"] == "operation requires the authenticated main controller"
     finally:
         mcp_control.set_current_principal(None)
+
+
+# ==================================================================
+# Controller-integration action claim lifecycle
+#
+# integrate_shadow_changeset / resolve_shadow_candidate consume a
+# runnable_action_claims row ('claimed' -> 'consumed') before acting, then
+# must terminalize it ('consumed' -> 'completed'/'failed') on every exit
+# path so the candidate becomes claimable again after a failure, a retry,
+# or is closed for good after a discard.  This is enforced with a
+# try/finally in mcp_control.py so no early return or exception can strand
+# a claim in 'consumed'.
+# ==================================================================
+
+
+def _claim_row(state: RouteState, action_id: str) -> dict:
+    conn = state._new_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM runnable_action_claims WHERE action_id=?", (action_id,),
+        ).fetchone()
+        assert row is not None
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def _setup_integration_candidate(
+    state: RouteState,
+    tmp_path: Path,
+    *,
+    disposition: str = "yellow",
+    with_active_main_workspace: bool = True,
+) -> dict:
+    """Build a run/epoch/controller-binding/changeset/candidate and claim its action."""
+    import subprocess
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(repo_dir), check=True)
+
+    state.create_run("r1", session_id="main-session", cwd=str(repo_dir))
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    state.bind_or_get_controller(
+        run_id="r1", client_session_id="main-session", public_model="longcat-2",
+        registry_model_id="longcat-2", backend="direct-anthropic",
+        upstream_model="LongCat-2.0", provider_id=None,
+        api_base="https://api.longcat.chat/anthropic", catalog_generation=None,
+        registry_hash="test-registry", certification_id=None,
+        auth_spec_json=None, api_key_env="LONGCAT_API_KEY",
+    )
+    shadow_workspace_id = "ws-shadow-1"
+    state.create_workspace(
+        workspace_id=shadow_workspace_id, run_id="r1", epoch_id="ep-1", kind="shadow",
+        path="/tmp/shadow-1", base_sha="base-sha", dirty_patch_hash="dirty-sha",
+    )
+    if with_active_main_workspace:
+        state.create_workspace(
+            workspace_id="ws-main", run_id="r1", epoch_id="ep-1", kind="main",
+            path="/tmp/main", base_sha="base-sha", dirty_patch_hash="dirty-sha",
+            status="active",
+        )
+    changeset_id = "cs-1"
+    state.create_changeset(
+        changeset_id=changeset_id, execution_id="exec-1", workspace_id=shadow_workspace_id,
+        base_sha="base-sha", patch_digest="digest-1", changed_files=["a.py"],
+        result={"validation": {"valid": True}}, status="validated",
+        patch=b"--- a\n+++ b\n",
+    )
+    candidate = state.create_integration_candidate(
+        candidate_id="cand-1", run_id="r1", epoch_id="ep-1", changeset_id=changeset_id,
+        overlap={}, validation={}, disposition=disposition,
+    )
+    action_id = f"integration:{candidate['candidate_id']}"
+    actions = state.get_runnable_actions("r1", "ep-1")
+    assert any(item["action_id"] == action_id for item in actions), (
+        "candidate must be claimable before the test claims it"
+    )
+    state.claim_runnable_action("r1", "ep-1", action_id)
+    return {
+        "changeset_id": changeset_id,
+        "candidate_id": candidate["candidate_id"],
+        "action_id": action_id,
+        "workspace_id": shadow_workspace_id,
+    }
+
+
+def test_failed_yellow_integration_terminalizes_claim_and_reexposes_candidate(
+    state: RouteState, tmp_path: Path, monkeypatch,
+):
+    from enhanced_router import mcp_control
+    from enhanced_router.shadow_worktree import ShadowWorktreeManager
+
+    ctx = _setup_integration_candidate(state, tmp_path)
+
+    def _boom(self, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(ShadowWorktreeManager, "integrate_green", _boom)
+    monkeypatch.setattr(mcp_control, "get_state", lambda: state)
+    mcp_control.set_current_run_id("r1")
+    try:
+        result = asyncio.run(mcp_control.integrate_shadow_changeset(
+            "r1", "ep-1", ctx["changeset_id"], controller_approval=True,
+        ))
+        assert result["integrated"] is False
+        assert result["conflict"] is True
+
+        claim = _claim_row(state, ctx["action_id"])
+        assert claim["status"] == "failed"
+
+        candidates = state.get_integration_candidates(run_id="r1", epoch_id="ep-1")
+        candidate = next(c for c in candidates if c["candidate_id"] == ctx["candidate_id"])
+        assert candidate["disposition"] == "red"
+
+        runnable = state.get_runnable_actions("r1", "ep-1")
+        assert any(item["action_id"] == ctx["action_id"] for item in runnable)
+    finally:
+        mcp_control.set_current_run_id(None)
+
+
+def test_missing_active_main_workspace_still_terminalizes_claim(
+    state: RouteState, tmp_path: Path, monkeypatch,
+):
+    """Regression test: this early return used to strand the claim in 'consumed'."""
+    from enhanced_router import mcp_control
+
+    ctx = _setup_integration_candidate(state, tmp_path, with_active_main_workspace=False)
+
+    monkeypatch.setattr(mcp_control, "get_state", lambda: state)
+    mcp_control.set_current_run_id("r1")
+    try:
+        result = asyncio.run(mcp_control.integrate_shadow_changeset(
+            "r1", "ep-1", ctx["changeset_id"], controller_approval=True,
+        ))
+        assert result["integrated"] is False
+        assert result["error"] == "canonical workspace is not active"
+
+        claim = _claim_row(state, ctx["action_id"])
+        assert claim["status"] == "failed"
+    finally:
+        mcp_control.set_current_run_id(None)
+
+
+def test_retry_resolution_terminalizes_claim_and_produces_new_claimable_action(
+    state: RouteState, tmp_path: Path, monkeypatch,
+):
+    from enhanced_router import mcp_control
+
+    ctx = _setup_integration_candidate(state, tmp_path)
+
+    monkeypatch.setattr(mcp_control, "get_state", lambda: state)
+    mcp_control.set_current_run_id("r1")
+    try:
+        result = asyncio.run(mcp_control.resolve_shadow_candidate(
+            "r1", "ep-1", ctx["changeset_id"], "retry", "needs another attempt",
+        ))
+        assert result["resolved"] is True
+        assert result["status"] == "pending"
+
+        claim = _claim_row(state, ctx["action_id"])
+        assert claim["status"] == "completed"
+
+        candidates = state.get_integration_candidates(run_id="r1", epoch_id="ep-1")
+        candidate = next(c for c in candidates if c["candidate_id"] == ctx["candidate_id"])
+        assert candidate["disposition"] == "pending"
+
+        runnable = state.get_runnable_actions("r1", "ep-1")
+        assert any(item["action_id"] == ctx["action_id"] for item in runnable)
+    finally:
+        mcp_control.set_current_run_id(None)
+
+
+def test_discard_resolution_terminalizes_claim_and_closes_candidate(
+    state: RouteState, tmp_path: Path, monkeypatch,
+):
+    from enhanced_router import mcp_control
+
+    ctx = _setup_integration_candidate(state, tmp_path)
+
+    monkeypatch.setattr(mcp_control, "get_state", lambda: state)
+    mcp_control.set_current_run_id("r1")
+    try:
+        result = asyncio.run(mcp_control.resolve_shadow_candidate(
+            "r1", "ep-1", ctx["changeset_id"], "discard", "not usable",
+        ))
+        assert result["resolved"] is True
+        assert result["decision"] == "discard"
+
+        claim = _claim_row(state, ctx["action_id"])
+        assert claim["status"] == "completed"
+
+        changeset = state.get_changeset(ctx["changeset_id"])
+        assert changeset["status"] == "rejected"
+
+        workspace = state.get_workspace(ctx["workspace_id"])
+        assert workspace["status"] == "discarded"
+
+        candidates = state.get_integration_candidates(run_id="r1", epoch_id="ep-1")
+        candidate = next(c for c in candidates if c["candidate_id"] == ctx["candidate_id"])
+        assert candidate["disposition"] == "resolved"
+
+        runnable = state.get_runnable_actions("r1", "ep-1")
+        assert not any(item["action_id"] == ctx["action_id"] for item in runnable)
+    finally:
+        mcp_control.set_current_run_id(None)
+
+
+def test_replaying_an_already_terminal_claim_is_rejected(
+    state: RouteState, tmp_path: Path, monkeypatch,
+):
+    from enhanced_router import mcp_control
+
+    ctx = _setup_integration_candidate(state, tmp_path)
+
+    monkeypatch.setattr(mcp_control, "get_state", lambda: state)
+    mcp_control.set_current_run_id("r1")
+    try:
+        first = asyncio.run(mcp_control.resolve_shadow_candidate(
+            "r1", "ep-1", ctx["changeset_id"], "discard", "not usable",
+        ))
+        assert first["resolved"] is True
+
+        second = asyncio.run(mcp_control.resolve_shadow_candidate(
+            "r1", "ep-1", ctx["changeset_id"], "discard", "not usable",
+        ))
+        assert second["resolved"] is False
+        assert second["error"] == (
+            "integration action is not claimed; the main controller must call "
+            "get_runnable_actions and claim_runnable_action first"
+        )
+    finally:
+        mcp_control.set_current_run_id(None)
+
+
+def test_wrong_run_or_epoch_cannot_finish_someone_elses_claim(state: RouteState, tmp_path: Path):
+    ctx = _setup_integration_candidate(state, tmp_path)
+    state.consume_controller_action("r1", "ep-1", ctx["action_id"])
+
+    assert state.finish_controller_action("wrong-run", "ep-1", ctx["action_id"], "completed") is None
+    assert state.finish_controller_action("r1", "wrong-epoch", ctx["action_id"], "completed") is None
+
+    claim = _claim_row(state, ctx["action_id"])
+    assert claim["status"] == "consumed"
+
+
+def test_finish_controller_action_is_idempotent_against_double_completion(
+    state: RouteState, tmp_path: Path,
+):
+    ctx = _setup_integration_candidate(state, tmp_path)
+    state.consume_controller_action("r1", "ep-1", ctx["action_id"])
+
+    first = state.finish_controller_action("r1", "ep-1", ctx["action_id"], "completed")
+    assert first is not None
+    assert first["status"] == "completed"
+
+    second = state.finish_controller_action("r1", "ep-1", ctx["action_id"], "failed")
+    assert second is None
+
+    claim = _claim_row(state, ctx["action_id"])
+    assert claim["status"] == "completed"

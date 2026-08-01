@@ -2129,6 +2129,46 @@ class RouteState:
         finally:
             conn.close()
 
+    def finish_controller_action(
+        self,
+        run_id: str,
+        epoch_id: str,
+        action_id: str,
+        status: str,
+    ) -> dict | None:
+        """Terminalize a consumed controller-integration action.
+
+        Controller integration is a two-step operation: the controller first
+        consumes the claim immediately before acting, then the integration or
+        resolution operation records its outcome.  Keeping the claim in
+        ``consumed`` after that outcome would make it look active forever and
+        would prevent the same candidate from being claimed again after a
+        failed integration or an explicit retry decision.
+        """
+        if status not in {"completed", "failed", "cancelled", "orphaned"}:
+            raise ValueError(f"invalid controller action status: {status}")
+        conn = self._new_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            now = _utcnow()
+            updated = conn.execute(
+                "UPDATE runnable_action_claims SET status=?, consumed_at=COALESCE(consumed_at, ?) "
+                "WHERE action_id=? AND run_id=? AND epoch_id=? AND role='controller' "
+                "AND action_kind='controller_integration' AND status='consumed'",
+                (status, now, action_id, run_id, epoch_id),
+            )
+            if updated.rowcount != 1:
+                conn.rollback()
+                return None
+            conn.commit()
+            result = conn.execute(
+                "SELECT * FROM runnable_action_claims WHERE action_id=?",
+                (action_id,),
+            ).fetchone()
+            return dict(result) if result is not None else None
+        finally:
+            conn.close()
+
     def start_sidecar_execution(
         self,
         *,

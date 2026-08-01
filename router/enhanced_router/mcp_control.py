@@ -1096,6 +1096,7 @@ async def integrate_shadow_changeset(
         return {"integrated": False, "error": "red integration candidate requires recovery"}
     if disposition == "yellow" and not controller_approval:
         return {"integrated": False, "error": "yellow candidate requires controller approval"}
+    integration_action_id: str | None = None
     if disposition == "yellow" and controller_approval:
         controller_error = _require_main_controller_binding(
             state, run_id, epoch_id, capability="integrate_changeset",
@@ -1107,66 +1108,77 @@ async def integrate_shadow_changeset(
         )
         if action_error:
             return {"integrated": False, "error": action_error}
+        integration_action_id = f"integration:{candidate['candidate_id']}"
 
-    changeset_record = state.get_changeset(changeset_id)
-    if changeset_record is None:
-        return {"integrated": False, "error": "changeset not found"}
-    if changeset_record.get("status") not in {"validated", "proposed"}:
-        return {
-            "integrated": False,
-            "error": f"changeset is already {changeset_record.get('status')}",
-        }
-    patch_blob = changeset_record.get("patch_blob")
-    if not isinstance(patch_blob, (bytes, bytearray)):
-        return {"integrated": False, "error": "changeset has no persisted patch"}
-    workspace_id = str(changeset_record.get("workspace_id"))
-    workspace = state.get_workspace(workspace_id)
-    run = state.get_run(run_id)
-    if workspace is None or run is None or not run.get("cwd"):
-        return {"integrated": False, "error": "canonical workspace state is unavailable"}
-
-    from enhanced_router.shadow_worktree import Changeset, ShadowWorktreeManager
-
+    integration_outcome = "failed"
     try:
-        validation = json.loads(str(changeset_record.get("result_json") or "{}"))
-        validation = validation.get("validation", validation)
-        changed_files = tuple(json.loads(str(changeset_record.get("changed_files_json") or "[]")))
-        changeset = Changeset(
-            changeset_id=changeset_id,
-            execution_id=str(changeset_record.get("execution_id")),
-            workspace_id=workspace_id,
-            base_sha=str(changeset_record.get("base_sha")),
-            patch_digest=str(changeset_record.get("patch_digest")),
-            patch=bytes(patch_blob),
-            changed_files=changed_files,
-            validation=validation,
-            parent_canonical_generation=(
-                int(changeset_record["parent_canonical_generation"])
-                if changeset_record.get("parent_canonical_generation") is not None
-                else None
-            ),
-        )
-        manager = ShadowWorktreeManager(str(run["cwd"]))
-        main_rows = state.get_workspaces(
-            run_id=run_id, epoch_id=epoch_id, kind="main", status="active",
-        )
-        if not main_rows:
-            return {"integrated": False, "error": "canonical workspace is not active"}
-        result = manager.integrate_green(
-            state=state, run_id=run_id, epoch_id=epoch_id, changeset=changeset,
-            expected_dirty_patch_hash=str(
-                main_rows[0].get("current_dirty_hash")
-                or main_rows[0].get("dirty_patch_hash")
-                or ""
-            ),
-        )
-        state.update_workspace_status(workspace_id, "merged")
-        return {"integrated": True, **result}
-    except Exception as exc:
-        state.mark_integration_candidate(
-            changeset_id, disposition="red", validation={"preflight_error": str(exc)},
-        )
-        return {"integrated": False, "error": str(exc), "conflict": True}
+        changeset_record = state.get_changeset(changeset_id)
+        if changeset_record is None:
+            return {"integrated": False, "error": "changeset not found"}
+        if changeset_record.get("status") not in {"validated", "proposed"}:
+            return {
+                "integrated": False,
+                "error": f"changeset is already {changeset_record.get('status')}",
+            }
+        patch_blob = changeset_record.get("patch_blob")
+        if not isinstance(patch_blob, (bytes, bytearray)):
+            return {"integrated": False, "error": "changeset has no persisted patch"}
+        workspace_id = str(changeset_record.get("workspace_id"))
+        workspace = state.get_workspace(workspace_id)
+        run = state.get_run(run_id)
+        if workspace is None or run is None or not run.get("cwd"):
+            return {"integrated": False, "error": "canonical workspace state is unavailable"}
+
+        from enhanced_router.shadow_worktree import Changeset, ShadowWorktreeManager
+
+        try:
+            validation = json.loads(str(changeset_record.get("result_json") or "{}"))
+            validation = validation.get("validation", validation)
+            changed_files = tuple(
+                json.loads(str(changeset_record.get("changed_files_json") or "[]"))
+            )
+            changeset = Changeset(
+                changeset_id=changeset_id,
+                execution_id=str(changeset_record.get("execution_id")),
+                workspace_id=workspace_id,
+                base_sha=str(changeset_record.get("base_sha")),
+                patch_digest=str(changeset_record.get("patch_digest")),
+                patch=bytes(patch_blob),
+                changed_files=changed_files,
+                validation=validation,
+                parent_canonical_generation=(
+                    int(changeset_record["parent_canonical_generation"])
+                    if changeset_record.get("parent_canonical_generation") is not None
+                    else None
+                ),
+            )
+            manager = ShadowWorktreeManager(str(run["cwd"]))
+            main_rows = state.get_workspaces(
+                run_id=run_id, epoch_id=epoch_id, kind="main", status="active",
+            )
+            if not main_rows:
+                return {"integrated": False, "error": "canonical workspace is not active"}
+            result = manager.integrate_green(
+                state=state, run_id=run_id, epoch_id=epoch_id, changeset=changeset,
+                expected_dirty_patch_hash=str(
+                    main_rows[0].get("current_dirty_hash")
+                    or main_rows[0].get("dirty_patch_hash")
+                    or ""
+                ),
+            )
+            state.update_workspace_status(workspace_id, "merged")
+            integration_outcome = "completed"
+            return {"integrated": True, **result}
+        except Exception as exc:
+            state.mark_integration_candidate(
+                changeset_id, disposition="red", validation={"preflight_error": str(exc)},
+            )
+            return {"integrated": False, "error": str(exc), "conflict": True}
+    finally:
+        if integration_action_id:
+            state.finish_controller_action(
+                run_id, epoch_id, integration_action_id, integration_outcome,
+            )
 
 
 @control_mcp.tool()
@@ -1208,22 +1220,34 @@ async def resolve_shadow_candidate(
     )
     if action_error:
         return {"resolved": False, "error": action_error}
-    if decision == "retry":
+    integration_action_id = f"integration:{candidate['candidate_id']}"
+    resolution_outcome = "failed"
+    try:
+        if decision == "retry":
+            state.mark_integration_candidate(
+                changeset_id, disposition="pending",
+                validation={"controller_decision": "retry", "reason": reason},
+            )
+            resolution_outcome = "completed"
+            return {
+                "resolved": True, "status": "pending",
+                "next_action": "request a new worker execution",
+            }
         state.mark_integration_candidate(
-            changeset_id, disposition="pending",
-            validation={"controller_decision": "retry", "reason": reason},
+            changeset_id, disposition="resolved",
+            validation={"controller_decision": "discard", "reason": reason},
         )
-        return {"resolved": True, "status": "pending", "next_action": "request a new worker execution"}
-    state.mark_integration_candidate(
-        changeset_id, disposition="resolved",
-        validation={"controller_decision": "discard", "reason": reason},
-    )
-    changeset = state.get_changeset(changeset_id)
-    if changeset:
-        state.mark_changeset_rejected(changeset_id)
-        workspace_id = str(changeset.get("workspace_id"))
-        state.update_workspace_status(workspace_id, "discarded")
-    return {"resolved": True, "status": "resolved", "decision": "discard"}
+        changeset = state.get_changeset(changeset_id)
+        if changeset:
+            state.mark_changeset_rejected(changeset_id)
+            workspace_id = str(changeset.get("workspace_id"))
+            state.update_workspace_status(workspace_id, "discarded")
+        resolution_outcome = "completed"
+        return {"resolved": True, "status": "resolved", "decision": "discard"}
+    finally:
+        state.finish_controller_action(
+            run_id, epoch_id, integration_action_id, resolution_outcome,
+        )
 
 
 @control_mcp.tool()
