@@ -8,44 +8,29 @@ replace mandatory controller/adversary decisions.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-class FastpathRouteCandidate(BaseModel):
-    """One router-computed, pre-vetted routing option offered to DiffusionGemma.
+# Some diffusion-serving stacks can emit an empty thought-channel envelope
+# even when thinking is disabled (see FastpathConfigSpec.disable_thinking).
+# Stripped defensively before json.loads rather than trusted to be absent.
+_THOUGHT_ENVELOPE_PATTERN = re.compile(r"^\s*<think>.*?</think>\s*", re.DOTALL)
 
-    Built from ModelRegistry.recommend() plus live model-health state --
-    never invented by the fastpath model. DiffusionGemma selects a
-    candidate_id; it never emits a bare model string, so an unbound-role
-    proposal can only ever reference a model the router already confirmed
-    is enabled, role-compatible, and (for a mutating role) write-tool
-    certified at packet-build time.
-    """
 
-    model_config = ConfigDict(extra="forbid")
-
-    candidate_id: str
-    role: Literal["recon", "implementer", "adversary", "repairer"]
-    model_id: str
-    endpoint: Literal["auto"] = "auto"
-    cost_class: str = "standard"
-    max_context_tokens: int | None = None
-    write_certified: bool = False
-    score: int = 0
+def _strip_thought_envelope(content: str) -> str:
+    """Strip a leading <think>...</think>-style envelope, if present."""
+    return _THOUGHT_ENVELOPE_PATTERN.sub("", content, count=1)
 
 
 class FastpathRoleProposal(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    # candidate_id selects one of the packet's offered FastpathRouteCandidate
-    # entries; model/endpoint are resolved from that candidate server-side
-    # by FastpathPolicyValidator, never trusted verbatim from the model's
-    # own output. model/preferred_logical_model/slot remain accepted so an
-    # older or misbehaving fastpath prompt degrades to "no route for this
-    # role" (skipped below) instead of a hard parse failure.
-    candidate_id: str | None = None
+    # ``model``/``endpoint`` are the public route-proposal shape.  ``slot``
+    # and ``preferred_logical_model`` remain accepted for older local
+    # fastpath prompts, but the sidecar never chooses a physical endpoint.
     model: str | None = None
     endpoint: Literal["auto"] = "auto"
     slot: Literal["fast", "work", "deep"] = "work"
@@ -93,34 +78,6 @@ class FastpathVerification(BaseModel):
         return value
 
 
-def build_route_candidates(
-    *, registry: Any, roles: list[str], profile_id: str | None = None, per_role: int = 3,
-) -> list[FastpathRouteCandidate]:
-    """Build the router-authoritative candidate set fastpath may choose from.
-
-    Uses ModelRegistry.recommend() (role-match, tool support, context,
-    health) rather than letting the fastpath model invent a model ID from
-    nothing -- see FastpathRouteCandidate's docstring. Deterministic:
-    recommend() already sorts by score desc then model_id asc, so the same
-    registry state always produces the same candidate_id set.
-    """
-    candidates: list[FastpathRouteCandidate] = []
-    for role in roles:
-        ranked = registry.recommend(role, profile_id=profile_id, healthy_only=False)
-        for ranked_model in ranked[:per_role]:
-            spec = registry.get_model(ranked_model.model_id)
-            candidates.append(FastpathRouteCandidate(
-                candidate_id=f"cand-{role}-{ranked_model.model_id}",
-                role=role,
-                model_id=ranked_model.model_id,
-                cost_class=spec.capabilities.cost_class,
-                max_context_tokens=spec.capabilities.max_context_tokens,
-                write_certified=bool(spec.capabilities.write_tool_certified),
-                score=ranked_model.score,
-            ))
-    return candidates
-
-
 @dataclass(frozen=True)
 class FastpathLimits:
     timeout_seconds: float = 5.0
@@ -136,29 +93,15 @@ class FastpathPacketBuilder:
     def __init__(self, limits: FastpathLimits | None = None) -> None:
         self.limits = limits or FastpathLimits()
 
-    def route_packet(
-        self, *, task: str, repository: dict[str, Any], deterministic_minimum_tier: str,
-        risk_signals: list[str], required_capabilities: list[str],
-        candidates: list["FastpathRouteCandidate"], unbound_roles: list[str],
-        current_routes: dict[str, str],
-    ) -> dict[str, Any]:
-        """Build the route packet actually sent to the fastpath model.
-
-        candidates/unbound_roles/current_routes are the router-authoritative
-        facts DiffusionGemma was previously never given (P0-1): it can only
-        select a candidate_id from *candidates*, never invent a model
-        string, and it can see which roles are already bound so it doesn't
-        propose replacing one.
-        """
+    def route_packet(self, *, task: str, repository: dict[str, Any], deterministic_minimum_tier: str,
+                     risk_signals: list[str], required_capabilities: list[str], available_routes: list[str]) -> dict[str, Any]:
         packet = {
             "task": task[:8_000],
             "repository": repository,
             "deterministic_minimum_tier": deterministic_minimum_tier,
             "risk_signals": risk_signals[:32],
             "required_capabilities": required_capabilities[:32],
-            "candidates": [c.model_dump() for c in candidates[:64]],
-            "unbound_roles": unbound_roles,
-            "current_routes": current_routes,
+            "available_routes": available_routes[:64],
         }
         return self._bounded(packet)
 
@@ -212,7 +155,6 @@ class FastpathPolicyValidator:
         state: Any,
         configuration_hash: str,
         confidence_threshold: float = 0.88,
-        candidates: list[FastpathRouteCandidate] | None = None,
     ) -> FastpathRouteProposal:
         if self._tier_order[proposal.workflow_tier] < self._tier_order.get(minimum_tier, 1):
             raise ValueError("fastpath attempted to lower the deterministic workflow tier")
@@ -224,37 +166,14 @@ class FastpathPolicyValidator:
         if not required_roles.issubset(proposal.routes):
             raise ValueError("fastpath proposal omits a mandatory role")
 
-        by_id = {c.candidate_id: c for c in candidates} if candidates is not None else None
-
         for role, target in proposal.routes.items():
             if role not in {"recon", "implementer", "adversary", "repairer"}:
                 raise ValueError(f"fastpath proposed unknown role '{role}'")
+            model_id = target.logical_model
             if target.endpoint != "auto":
                 raise ValueError("fastpath cannot select a physical endpoint")
-
-            if by_id is not None:
-                # Candidate-bounded mode (Phase 2): the model may only select
-                # candidate_id values the router itself offered for this
-                # role -- it never gets to supply a bare model string.
-                if target.candidate_id is None:
-                    continue
-                candidate = by_id.get(target.candidate_id)
-                if candidate is None or candidate.role != role:
-                    raise ValueError(
-                        f"fastpath selected candidate_id '{target.candidate_id}' which "
-                        f"was not offered for role '{role}'"
-                    )
-                target.model = candidate.model_id
-                target.endpoint = candidate.endpoint
-                model_id = candidate.model_id
-            else:
-                # Legacy mode (no candidate set supplied): the model's own
-                # model/preferred_logical_model string, checked against the
-                # registry same as before Phase 2.
-                model_id = target.logical_model
-                if model_id is None:
-                    continue
-
+            if model_id is None:
+                continue
             spec = registry.get_model(model_id)
             if not spec.enabled or role not in spec.allowed_roles:
                 raise ValueError(f"fastpath route is unavailable for role '{role}'")
@@ -289,11 +208,19 @@ class FastpathPolicyValidator:
 class FastpathClient:
     """Bounded, credential-owning client for internal route/verify calls."""
 
+    # Which schema each mode's strict response_format is generated from.
+    _SCHEMA_MODELS: dict[str, type[BaseModel]] = {
+        "route": FastpathRouteProposal,
+        "verify": FastpathVerification,
+    }
+
     def __init__(self, *, api_base: str, model: str, api_key_env: str,
                  provider_id: str, endpoint_id: str | None = None,
                  limits: FastpathLimits | None = None,
                  system_prompts: dict[str, str] | None = None,
-                 max_output_tokens: int = 1024) -> None:
+                 max_output_tokens: int = 256,
+                 strict_schema: bool = False,
+                 disable_thinking: bool = False) -> None:
         self.api_base = api_base.rstrip("/")
         self.model = model
         self.api_key_env = api_key_env
@@ -302,6 +229,8 @@ class FastpathClient:
         self.limits = limits or FastpathLimits()
         self.system_prompts = dict(system_prompts or {})
         self.max_output_tokens = max_output_tokens
+        self.strict_schema = strict_schema
+        self.disable_thinking = disable_thinking
 
     async def request(self, mode: Literal["route", "verify"], packet: dict[str, Any]) -> dict[str, Any]:
         prompt = json.dumps(packet, separators=(",", ":"), ensure_ascii=False)
@@ -312,33 +241,47 @@ class FastpathClient:
         messages.append({"role": "user", "content": prompt})
         from enhanced_router.backends import post_openai_compatible_json
 
+        if self.strict_schema:
+            schema_model = self._SCHEMA_MODELS[mode]
+            response_format: dict[str, Any] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": f"brigade_fastpath_{mode}",
+                    "strict": True,
+                    "schema": schema_model.model_json_schema(),
+                },
+            }
+        else:
+            response_format = {"type": "json_object"}
+
+        request_payload: dict[str, Any] = {
+            "messages": messages,
+            "max_tokens": self.max_output_tokens,
+            "response_format": response_format,
+            "stream": False,
+        }
+        if self.disable_thinking:
+            request_payload["reasoning_effort"] = "none"
+
         payload = await post_openai_compatible_json(
             api_base=self.api_base,
             model=self.model,
             api_key_env=self.api_key_env,
             provider_id=self.provider_id,
             endpoint_id=self.endpoint_id,
-            payload={
-                "messages": messages,
-                "max_tokens": self.max_output_tokens,
-                "response_format": {"type": "json_object"},
-                "stream": False,
-            },
+            payload=request_payload,
             request_id=f"fastpath:{mode}",
             extra_headers={"X-Brigade-Fastpath": mode},
             timeout_seconds=self.limits.timeout_seconds,
-            # Route requests block a fresh task's initial materialization
-            # (see hooks/user_prompt_submit.py's bounded wait), so they get
-            # priority within the provider's existing concurrency cap --
-            # queue ordering only, never extra capacity. Verify requests
-            # aren't latency-critical the same way and stay FIFO.
-            priority=(mode == "route"),
         )
         choices = payload.get("choices")
         content = choices[0].get("message", {}).get("content") if isinstance(choices, list) and choices else None
         if not isinstance(content, str):
             raise ValueError("fastpath response did not contain JSON message content")
-        parsed = json.loads(content)
+        try:
+            parsed = json.loads(_strip_thought_envelope(content))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"fastpath response was not valid JSON: {exc}") from exc
         if not isinstance(parsed, dict):
             raise ValueError("fastpath response must be a JSON object")
         return parsed

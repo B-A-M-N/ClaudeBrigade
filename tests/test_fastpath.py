@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 
 from enhanced_router.fastpath import (
+    FastpathClient,
     FastpathPacketBuilder,
     FastpathPolicyValidator,
-    FastpathRouteCandidate,
     FastpathRouteProposal,
-    build_route_candidates,
+    FastpathVerification,
+    _strip_thought_envelope,
 )
 
 
@@ -19,14 +18,6 @@ class FakeRegistry:
 
     def get_model(self, model_id):
         return self.models[model_id]
-
-
-def _fake_model(*, enabled=True, allowed_roles=frozenset({"implementer"}), write_tool_certified=True):
-    return SimpleNamespace(
-        enabled=enabled,
-        allowed_roles=allowed_roles,
-        capabilities=SimpleNamespace(write_tool_certified=write_tool_certified),
-    )
 
 
 class FakeState:
@@ -106,103 +97,127 @@ def test_route_schema_accepts_logical_model_shape_but_only_auto_endpoint():
         })
 
 
-def test_validate_route_resolves_model_from_offered_candidate_id():
-    """P0-1/P0-2: DiffusionGemma selects a candidate_id, never a bare model
-    string -- validate_route resolves model/endpoint from the offered
-    candidate set itself, not from anything the model claims."""
-    proposal = FastpathRouteProposal.model_validate({
-        "workflow_tier": "normal",
-        "recommended_roles": ["implementer"],
-        "routes": {"implementer": {"candidate_id": "cand-implementer-worker"}},
-        "confidence": 0.99,
-        "escalate_to_controller": False,
-    })
-    candidates = [
-        FastpathRouteCandidate(candidate_id="cand-implementer-worker", role="implementer", model_id="worker"),
-    ]
-    validated = FastpathPolicyValidator().validate_route(
-        proposal, minimum_tier="normal",
-        registry=FakeRegistry({"worker": _fake_model()}),
-        state=FakeState(), configuration_hash="cfg",
-        candidates=candidates,
+def test_strip_thought_envelope_removes_leading_think_block():
+    content = "<think>reasoning about the task</think>\n{\"ok\": true}"
+    assert _strip_thought_envelope(content) == '{"ok": true}'
+
+
+def test_strip_thought_envelope_is_a_noop_without_a_think_block():
+    content = '{"ok": true}'
+    assert _strip_thought_envelope(content) == content
+
+
+def _fake_client(**overrides) -> FastpathClient:
+    kwargs = dict(
+        api_base="https://fastpath.example.invalid",
+        model="diffusiongemma",
+        api_key_env="FREEINFERENCE_API_KEY",
+        provider_id="freeinference",
     )
-    target = validated.routes["implementer"]
-    assert target.model == "worker"
-    assert target.endpoint == "auto"
+    kwargs.update(overrides)
+    return FastpathClient(**kwargs)
 
 
-def test_validate_route_rejects_a_candidate_id_that_was_not_offered():
-    proposal = FastpathRouteProposal.model_validate({
-        "workflow_tier": "normal",
-        "recommended_roles": ["implementer"],
-        "routes": {"implementer": {"candidate_id": "cand-invented"}},
-        "confidence": 0.99,
-        "escalate_to_controller": False,
-    })
-    with pytest.raises(ValueError, match="not offered"):
-        FastpathPolicyValidator().validate_route(
-            proposal, minimum_tier="normal",
-            registry=FakeRegistry({"worker": _fake_model()}),
-            state=FakeState(), configuration_hash="cfg",
-            candidates=[
-                FastpathRouteCandidate(candidate_id="cand-implementer-worker", role="implementer", model_id="worker"),
-            ],
+def _fake_response(content: str) -> dict:
+    return {"choices": [{"message": {"content": content}}]}
+
+
+@pytest.mark.asyncio
+async def test_request_defaults_to_json_object_and_no_reasoning_effort(monkeypatch):
+    captured: dict = {}
+
+    async def fake_post(**kwargs):
+        captured.update(kwargs)
+        return _fake_response('{"decision": "escalate", "checks": {}, '
+                               '"violations": [], "requires_full_adversary": true, '
+                               '"confidence": 0.1}')
+
+    monkeypatch.setattr("enhanced_router.backends.post_openai_compatible_json", fake_post)
+    client = _fake_client()
+    result = await client.request("verify", {"contract": {}})
+
+    assert result["decision"] == "escalate"
+    payload = captured["payload"]
+    assert payload["response_format"] == {"type": "json_object"}
+    assert "reasoning_effort" not in payload
+    assert payload["max_tokens"] == 256
+
+
+@pytest.mark.asyncio
+async def test_request_strict_schema_sends_json_schema_response_format(monkeypatch):
+    captured: dict = {}
+
+    async def fake_post(**kwargs):
+        captured.update(kwargs)
+        return _fake_response('{"workflow_tier": "normal", "recommended_roles": [], '
+                               '"routes": {}, "confidence": 0.1, '
+                               '"escalate_to_controller": true}')
+
+    monkeypatch.setattr("enhanced_router.backends.post_openai_compatible_json", fake_post)
+    client = _fake_client(strict_schema=True)
+    await client.request("route", {"task": "x"})
+
+    response_format = captured["payload"]["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["strict"] is True
+    assert response_format["json_schema"]["schema"] == FastpathRouteProposal.model_json_schema()
+
+
+@pytest.mark.asyncio
+async def test_request_strict_schema_uses_the_right_schema_per_mode(monkeypatch):
+    captured: dict = {}
+
+    async def fake_post(**kwargs):
+        captured.update(kwargs)
+        return _fake_response('{"decision": "escalate", "checks": {}, '
+                               '"violations": [], "requires_full_adversary": true, '
+                               '"confidence": 0.1}')
+
+    monkeypatch.setattr("enhanced_router.backends.post_openai_compatible_json", fake_post)
+    client = _fake_client(strict_schema=True)
+    await client.request("verify", {"contract": {}})
+
+    schema = captured["payload"]["response_format"]["json_schema"]["schema"]
+    assert schema == FastpathVerification.model_json_schema()
+
+
+@pytest.mark.asyncio
+async def test_request_disable_thinking_sends_reasoning_effort_none(monkeypatch):
+    captured: dict = {}
+
+    async def fake_post(**kwargs):
+        captured.update(kwargs)
+        return _fake_response('{"decision": "escalate", "checks": {}, '
+                               '"violations": [], "requires_full_adversary": true, '
+                               '"confidence": 0.1}')
+
+    monkeypatch.setattr("enhanced_router.backends.post_openai_compatible_json", fake_post)
+    client = _fake_client(disable_thinking=True)
+    await client.request("verify", {"contract": {}})
+
+    assert captured["payload"]["reasoning_effort"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_request_strips_thought_envelope_before_parsing(monkeypatch):
+    async def fake_post(**kwargs):
+        return _fake_response(
+            '<think>let me think</think>{"decision": "escalate", "checks": {}, '
+            '"violations": [], "requires_full_adversary": true, "confidence": 0.1}'
         )
 
-
-def test_validate_route_rejects_a_candidate_id_offered_for_a_different_role():
-    proposal = FastpathRouteProposal.model_validate({
-        "workflow_tier": "normal",
-        "recommended_roles": ["implementer"],
-        "routes": {"implementer": {"candidate_id": "cand-recon-worker"}},
-        "confidence": 0.99,
-        "escalate_to_controller": False,
-    })
-    with pytest.raises(ValueError, match="not offered"):
-        FastpathPolicyValidator().validate_route(
-            proposal, minimum_tier="normal",
-            registry=FakeRegistry({"worker": _fake_model()}),
-            state=FakeState(), configuration_hash="cfg",
-            candidates=[
-                FastpathRouteCandidate(candidate_id="cand-recon-worker", role="recon", model_id="worker"),
-            ],
-        )
+    monkeypatch.setattr("enhanced_router.backends.post_openai_compatible_json", fake_post)
+    client = _fake_client()
+    result = await client.request("verify", {"contract": {}})
+    assert result["decision"] == "escalate"
 
 
-def test_validate_route_without_candidates_falls_back_to_legacy_model_field():
-    """Backward compatibility: a caller that doesn't supply a candidate set
-    (candidates=None, the default) still validates the model's own
-    model/preferred_logical_model string exactly as before Phase 2."""
-    proposal = FastpathRouteProposal.model_validate({
-        "workflow_tier": "normal",
-        "recommended_roles": ["implementer"],
-        "routes": {"implementer": {"model": "worker", "endpoint": "auto"}},
-        "confidence": 0.99,
-        "escalate_to_controller": False,
-    })
-    validated = FastpathPolicyValidator().validate_route(
-        proposal, minimum_tier="normal",
-        registry=FakeRegistry({"worker": _fake_model()}),
-        state=FakeState(), configuration_hash="cfg",
-    )
-    assert validated.routes["implementer"].model == "worker"
+@pytest.mark.asyncio
+async def test_request_raises_clean_error_on_invalid_json(monkeypatch):
+    async def fake_post(**kwargs):
+        return _fake_response("not json at all")
 
-
-def test_build_route_candidates_uses_registry_recommend_not_invention():
-    """Candidates come from ModelRegistry.recommend() -- real, role-eligible,
-    scored models -- never anything the fastpath model could have invented."""
-    from pathlib import Path
-
-    from enhanced_router.registry import ModelRegistry
-
-    registry = ModelRegistry(Path(__file__).resolve().parents[1] / "config")
-    registry.load_models()
-    candidates = build_route_candidates(registry=registry, roles=["implementer"], per_role=2)
-    assert candidates
-    assert all(c.role == "implementer" for c in candidates)
-    assert len(candidates) <= 2
-    for candidate in candidates:
-        spec = registry.get_model(candidate.model_id)
-        assert spec.enabled
-        assert "implementer" in spec.allowed_roles
-        assert candidate.candidate_id == f"cand-implementer-{candidate.model_id}"
+    monkeypatch.setattr("enhanced_router.backends.post_openai_compatible_json", fake_post)
+    client = _fake_client()
+    with pytest.raises(ValueError, match="not valid JSON"):
+        await client.request("verify", {"contract": {}})

@@ -217,13 +217,10 @@ async def internal_fastpath_route(request: Request) -> JSONResponse:
     encoded = json.dumps(packet, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     if len(encoded) > 64_000:
         raise HTTPException(status_code=413, detail="fastpath packet exceeds byte limit")
-    execution_id = f"fp_{uuid.uuid4().hex}"
-    _reserve_route_proposal_if_identified(packet, execution_id=execution_id)
     execution = await _queue_fastpath_job(
         packet=packet,
         mode="route",
         runner=lambda: _run_fastpath_route(packet),
-        execution_id=execution_id,
     )
     if request.headers.get("x-brigade-fastpath-async") == "1":
         return JSONResponse({
@@ -233,31 +230,6 @@ async def internal_fastpath_route(request: Request) -> JSONResponse:
             "intake_id": packet.get("intake_id"),
         }, status_code=202)
     return JSONResponse(await _wait_fastpath_job(str(execution["execution_id"])))
-
-
-def _reserve_route_proposal_if_identified(packet: dict[str, Any], *, execution_id: str) -> None:
-    """Reserve the route_proposals row before the sidecar job is even queued.
-
-    Must happen before invoke_detached schedules the background task that
-    will eventually call mark_route_proposal_running/complete_route_proposal
-    on this same proposal_id, and before the "queued" HTTP response below
-    hands proposal_id back to the caller -- otherwise get_route_proposal can
-    return "not found" for however long inference takes.
-    """
-    proposal_id = packet.get("proposal_id")
-    intake_id = packet.get("intake_id")
-    run_id = packet.get("run_id")
-    epoch_id = packet.get("epoch_id")
-    if not all(isinstance(v, str) and v for v in (proposal_id, intake_id, run_id, epoch_id)):
-        return
-    try:
-        get_state().reserve_route_proposal(
-            proposal_id=str(proposal_id), intake_id=str(intake_id),
-            run_id=str(run_id), epoch_id=str(epoch_id), execution_id=execution_id,
-            source="fastpath",
-        )
-    except Exception:
-        LOGGER.exception("failed to reserve fastpath proposal=%s", proposal_id)
 
 
 def _resolve_run_fastpath(registry: Any, run_id: Any) -> Any:
@@ -282,7 +254,6 @@ async def _queue_fastpath_job(
     packet: dict[str, Any],
     mode: str,
     runner: Any,
-    execution_id: str | None = None,
 ) -> dict[str, Any]:
     """Create one persisted advisory sidecar job and start its task."""
     from enhanced_router.registry import get_registry
@@ -299,7 +270,7 @@ async def _queue_fastpath_job(
     model = registry.get_model(config.model_id)
     if not model.provider_id:
         raise HTTPException(status_code=503, detail="fastpath model has no provider")
-    execution_id = execution_id or f"fp_{uuid.uuid4().hex}"
+    execution_id = f"fp_{uuid.uuid4().hex}"
     return await get_sidecar_executor().invoke_detached(
         run_id=run_id,
         epoch_id=epoch_id,
@@ -334,48 +305,6 @@ async def _wait_fastpath_job(execution_id: str) -> dict[str, Any]:
     return result
 
 
-def _enrich_route_packet(packet: dict[str, Any], *, registry: Any, state: Any) -> tuple[dict[str, Any], list[Any]]:
-    """Add router-authoritative facts to a bare route packet before it's
-    sent to the fastpath model (P0-1): eligible candidates per role, which
-    roles are already bound (so fastpath doesn't propose replacing one),
-    and the profile's current routes. Previously the packet only carried
-    task-level facts and DiffusionGemma had to invent a model ID from
-    nothing.
-
-    Returns (enriched_packet, candidates) -- the caller needs the raw
-    candidate objects too, to pass into FastpathPolicyValidator.validate_route.
-    """
-    from enhanced_router.fastpath import build_route_candidates
-
-    run_id = str(packet.get("run_id") or "")
-    epoch_id = str(packet.get("epoch_id") or "")
-    all_roles = ["recon", "implementer", "adversary", "repairer"]
-    bound_roles = (
-        {str(b["role"]) for b in state.get_active_bindings(run_id, epoch_id)}
-        if run_id and epoch_id else set()
-    )
-    unbound_roles = [role for role in all_roles if role not in bound_roles]
-    profile_id = None
-    if run_id:
-        run_row = state.get_run(run_id)
-        if run_row:
-            profile_id = run_row.get("inference_profile_id")
-    candidates = build_route_candidates(registry=registry, roles=unbound_roles, profile_id=profile_id)
-    current_routes: dict[str, str] = {}
-    if run_id and epoch_id:
-        for role, route in state.get_epoch_routes(run_id, epoch_id).items():
-            model_id = route.get("model_id")
-            if isinstance(model_id, str):
-                current_routes[role] = model_id
-    enriched = {
-        **packet,
-        "candidates": [c.model_dump() for c in candidates],
-        "unbound_roles": unbound_roles,
-        "current_routes": current_routes,
-    }
-    return enriched, candidates
-
-
 async def _run_fastpath_route(packet: dict[str, Any]) -> dict[str, Any]:
     """Execute one advisory route call after its request has been detached."""
     from enhanced_router.fastpath import FastpathClient, FastpathLimits, FastpathPolicyValidator, FastpathRouteProposal
@@ -385,9 +314,6 @@ async def _run_fastpath_route(packet: dict[str, Any]) -> dict[str, Any]:
     config = _resolve_run_fastpath(registry, packet.get("run_id"))
     if config is None or not config.enabled or "route" not in config.modes:
         raise HTTPException(status_code=404, detail="fastpath route mode is disabled")
-
-    packet, candidates = _enrich_route_packet(packet, registry=registry, state=get_state())
-
     encoded = json.dumps(packet, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     if len(encoded) > config.max_packet_bytes:
         raise HTTPException(status_code=413, detail="fastpath packet exceeds byte limit")
@@ -422,10 +348,9 @@ async def _run_fastpath_route(packet: dict[str, Any]) -> dict[str, Any]:
         endpoint_id=selected.endpoint_id,
         system_prompts=config.system_prompts,
         max_output_tokens=config.max_output_tokens,
+        strict_schema=config.strict_schema,
+        disable_thinking=config.disable_thinking,
     )
-    proposal_id = packet.get("proposal_id")
-    if isinstance(proposal_id, str) and proposal_id:
-        get_state().mark_route_proposal_running(proposal_id)
     try:
         result = await client.request("route", packet)
         proposal = FastpathRouteProposal.model_validate(result)
@@ -434,7 +359,6 @@ async def _run_fastpath_route(packet: dict[str, Any]) -> dict[str, Any]:
             proposal, minimum_tier=minimum, registry=registry, state=get_state(),
             configuration_hash=registry.registry_hash(),
             confidence_threshold=config.route_confidence_threshold,
-            candidates=candidates,
         )
         result_payload = {
             **proposal.model_dump(),
@@ -444,8 +368,6 @@ async def _run_fastpath_route(packet: dict[str, Any]) -> dict[str, Any]:
         }
     except Exception as exc:
         if config.failure_policy == "fail":
-            if isinstance(proposal_id, str) and proposal_id:
-                get_state().fail_route_proposal(proposal_id, str(exc))
             raise HTTPException(status_code=502, detail=f"fastpath validation failed: {exc}") from exc
         result_payload = {
             "validation_status": "bypassed",
@@ -453,12 +375,15 @@ async def _run_fastpath_route(packet: dict[str, Any]) -> dict[str, Any]:
             "fastpath_model_id": config.model_id,
             "confidence": 0.0,
         }
+    proposal_id = packet.get("proposal_id")
     intake_id = packet.get("intake_id")
     run_id = packet.get("run_id")
     if all(isinstance(value, str) and value for value in (proposal_id, intake_id, run_id)):
         try:
-            get_state().complete_route_proposal(
-                str(proposal_id),
+            get_state().create_route_proposal(
+                proposal_id=str(proposal_id),
+                intake_id=str(intake_id),
+                source="fastpath",
                 parsed_proposal=result_payload,
                 validation_status=str(result_payload.get("validation_status", "bypassed")),
                 validation_reason=str(result_payload.get("validation_reason", "")),
@@ -547,6 +472,8 @@ async def _run_fastpath_verify(body: dict[str, Any]) -> dict[str, Any]:
         endpoint_id=selected.endpoint_id,
         system_prompts=config.system_prompts,
         max_output_tokens=config.max_output_tokens,
+        strict_schema=config.strict_schema,
+        disable_thinking=config.disable_thinking,
     )
     try:
         result = await client.request("verify", packet)

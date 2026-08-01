@@ -168,10 +168,22 @@ class FastpathConfigSpec(StrictConfigModel):
     timeout_seconds: float = Field(default=5.0, gt=0, le=30)
     max_packet_tokens: int = Field(default=12_000, ge=256)
     max_packet_bytes: int = Field(default=64_000, ge=1024)
-    max_output_tokens: int = Field(default=1_024, ge=64)
+    # DiffusionGemma generates one 256-token canvas in parallel; a longer
+    # response requires a second sequential canvas, giving up most of its
+    # latency advantage over an ordinary autoregressive call for what should
+    # be a small classification result.
+    max_output_tokens: int = Field(default=256, ge=64, le=256)
     route_confidence_threshold: float = Field(default=0.88, ge=0, le=1)
     failure_policy: Literal["bypass", "fail"] = "bypass"
     system_prompts: dict[str, str] = Field(default_factory=dict)
+    # Off by default: forces response_format to the exact Pydantic schema
+    # instead of a bare json_object. Constrained decoding support varies by
+    # deployment -- verify against the actual endpoint before enabling.
+    strict_schema: bool = False
+    # Off by default: sends reasoning_effort="none". Only meaningful for a
+    # model whose deployment actually recognizes that field -- verify before
+    # enabling, since an unrecognized field's handling is provider-specific.
+    disable_thinking: bool = False
 
     @model_validator(mode="after")
     def _advisory_only(self) -> "FastpathConfigSpec":
