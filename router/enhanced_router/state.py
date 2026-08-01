@@ -1700,10 +1700,22 @@ class RouteState:
     def _active_action_claims(
         self, run_id: str, epoch_id: str,
     ) -> dict[str, dict]:
-        """Return non-terminal action claims, expiring stale claims first."""
+        """Return non-terminal action claims, expiring stale claims first.
+
+        Expiring the claim row alone is not enough: a TTL-expired claim may
+        still hold a 'reserved' provider_reservations row.  Without releasing
+        it here, that capacity slot leaks for the life of the process --
+        reconcile_lifecycle only runs at startup, so it would not otherwise
+        be freed until the next restart.
+        """
         conn = self._new_conn()
         try:
             now = _utcnow()
+            expiring = conn.execute(
+                "SELECT action_id, reservation_id, provider_id FROM runnable_action_claims "
+                "WHERE run_id=? AND epoch_id=? AND status='claimed' AND expires_at < ?",
+                (run_id, epoch_id, now),
+            ).fetchall()
             conn.execute(
                 "UPDATE runnable_action_claims SET status='expired' "
                 "WHERE run_id=? AND epoch_id=? AND status='claimed' AND expires_at < ?",
@@ -1715,9 +1727,26 @@ class RouteState:
                 "WHERE run_id=? AND epoch_id=? AND status IN ('claimed','consumed')",
                 (run_id, epoch_id),
             ).fetchall()
-            return {str(row["action_id"]): dict(row) for row in rows}
+            result = {str(row["action_id"]): dict(row) for row in rows}
         finally:
             conn.close()
+        released_provider_ids: set[str] = set()
+        for row in expiring:
+            reservation_id = row["reservation_id"]
+            if not reservation_id:
+                continue
+            released = self.release_provider_reservation(str(reservation_id), "expired")
+            if released and released.get("provider_id"):
+                released_provider_ids.add(str(released["provider_id"]))
+        if released_provider_ids:
+            from enhanced_router.registry import get_registry
+
+            registry = get_registry()
+            for provider_id in released_provider_ids:
+                provider = registry.providers.get(provider_id)
+                if provider:
+                    self.admit_provider_agents(provider_id, provider.limits.max_active_agents)
+        return result
 
     def get_runnable_actions(
         self, run_id: str, epoch_id: str, *, include_claimed: bool = False,

@@ -627,6 +627,76 @@ def test_provider_agent_admission_does_not_create_dead_queue_entry(state: RouteS
     assert state.get_provider_reservations("freeinference") == [first]
 
 
+def test_ttl_expired_claim_releases_its_provider_reservation(
+    state: RouteState, monkeypatch: pytest.MonkeyPatch,
+):
+    """A claim that expires via TTL must free its reservation immediately.
+
+    reconcile_lifecycle only runs at process startup, so if the inline
+    expiry path in _active_action_claims doesn't also release the
+    reservation, the provider capacity slot leaks for the life of the
+    process instead of being freed for the next queued agent.
+    """
+    from enhanced_router.state import _utcnow_age
+
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+
+    first = state.reserve_provider_agent(
+        reservation_id="res-1", run_id="r1", epoch_id="ep-1", provider_id="freeinference",
+        execution_id="pending:action-1", max_active=1, enqueue=False,
+    )
+    assert first["state"] == "reserved"
+    second = state.reserve_provider_agent(
+        reservation_id="res-2", run_id="r1", epoch_id="ep-1", provider_id="freeinference",
+        execution_id="pending:action-2", max_active=1, enqueue=True,
+    )
+    assert second["state"] == "queued"
+
+    conn = state._new_conn()
+    try:
+        conn.execute(
+            "INSERT INTO runnable_action_claims "
+            "(action_id, run_id, epoch_id, phase_id, role, native_agent_name, model_id, "
+            "action_kind, provider_id, claim_token, reservation_id, status, created_at, "
+            "claimed_at, expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("action-1", "r1", "ep-1", "phase-1", "implementer", "brigade-implementer",
+             "model-a", "native_agent", "freeinference", "tok-1", "res-1", "claimed",
+             _utcnow(), _utcnow(), _utcnow_age(1)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    class FakeProvider:
+        limits = SimpleNamespace(max_active_agents=1)
+
+    class FakeRegistry:
+        providers = {"freeinference": FakeProvider()}
+
+        @staticmethod
+        def get_model(model_id: str) -> SimpleNamespace:
+            return SimpleNamespace(provider_id=None)
+
+    import enhanced_router.registry as registry_module
+    monkeypatch.setattr(registry_module, "get_registry", lambda: FakeRegistry())
+
+    state.get_runnable_actions("r1", "ep-1")
+
+    reservations = {r["reservation_id"]: r for r in state.get_provider_reservations("freeinference")}
+    assert reservations["res-1"]["state"] == "expired"
+    assert reservations["res-2"]["state"] == "reserved"
+
+    conn = state._new_conn()
+    try:
+        claim = conn.execute(
+            "SELECT status FROM runnable_action_claims WHERE action_id='action-1'"
+        ).fetchone()
+        assert claim["status"] == "expired"
+    finally:
+        conn.close()
+
+
 def test_v29_to_current_adds_binding_and_group_columns(tmp_path: Path):
     db = tmp_path / "v29.db"
     state = RouteState(db)
