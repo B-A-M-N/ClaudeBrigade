@@ -141,6 +141,7 @@ os.chmod(path, 0o600)
 # Provider API keys — one KEY=VALUE per line.
 # Only recognized variable names are loaded.
 # FREEINFERENCE_API_KEY=
+# FREEINFERENCE_API_BASE=
 # FREEINFERENCE_MAX_CONCURRENCY=4
 LONGCAT_API_KEY=replace_me
 # OPENROUTER_API_KEY=
@@ -218,6 +219,7 @@ PY
 # Provider API keys — one KEY=VALUE per line.
 # Only recognized variable names are loaded.
 # FREEINFERENCE_API_KEY=
+# FREEINFERENCE_API_BASE=
 # FREEINFERENCE_MAX_CONCURRENCY=4
 LONGCAT_API_KEY=replace_me
 # OPENROUTER_API_KEY=

@@ -31,6 +31,7 @@ from enhanced_router.env_parser import EnvParseError, parse_env_file
 # Provider keys that are allowed in providers.env
 ALLOWED_PROVIDER_KEYS = frozenset({
     "FREEINFERENCE_API_KEY",
+    "FREEINFERENCE_API_BASE",
     "FREEINFERENCE_MAX_CONCURRENCY",
     "LONGCAT_API_KEY",
     "LONGCAT_API_BASE",
@@ -61,6 +62,7 @@ ALLOWED_PROVIDER_KEYS = frozenset({
 # Provider keys that should be passed to the router process (not Claude Code)
 PROVIDER_KEYS_FOR_ROUTER = frozenset({
     "FREEINFERENCE_API_KEY",
+    "FREEINFERENCE_API_BASE",
     "FREEINFERENCE_MAX_CONCURRENCY",
     "LONGCAT_API_KEY",
     "LONGCAT_API_BASE",
