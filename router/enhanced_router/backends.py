@@ -134,6 +134,7 @@ def _resolve_pinned_auth(
 LOGGER = logging.getLogger("claude-enhanced-router")
 _provider_admission = ProviderAdmissionManager()
 _litellm_supervisor: Any | None = None
+_ANTHROPIC_PASSTHROUGH_PROVIDER = "anthropic"
 
 
 def configure_litellm_supervisor(supervisor: Any | None) -> None:
@@ -144,7 +145,16 @@ def configure_litellm_supervisor(supervisor: Any | None) -> None:
 
 def configure_provider_admission(limits: dict[str, ProviderLimits]) -> None:
     """Apply registry-owned provider limits to the shared transport manager."""
-    for provider_id, provider_limits in limits.items():
+    # Claude subscription passthrough does not have a registry model/provider
+    # row, but it still needs the same bounded request and stream lifecycle as
+    # every other outbound backend.  Operators may override this synthetic
+    # lane by declaring an explicit ``anthropic`` provider.
+    configured = dict(limits)
+    configured.setdefault(
+        _ANTHROPIC_PASSTHROUGH_PROVIDER,
+        ProviderLimits(max_concurrency=8, max_queued_agents=0, queue_timeout_seconds=20.0),
+    )
+    for provider_id, provider_limits in configured.items():
         _provider_admission.configure(provider_id, provider_limits)
 
 
@@ -877,6 +887,17 @@ def _provider_ids_for_route(resolved: "ResolvedRoute") -> tuple[str, ...]:
     return ()
 
 
+def _passthrough_admission_route(resolved: "ResolvedRoute") -> "ResolvedRoute":
+    """Attach the synthetic Anthropic provider identity to passthrough routes."""
+    if resolved.provider_id or resolved.provider_ids:
+        return resolved
+    return replace(
+        resolved,
+        provider_id=_ANTHROPIC_PASSTHROUGH_PROVIDER,
+        endpoint_id=resolved.endpoint_id or "messages",
+    )
+
+
 async def _release_provider_request(
     resolved: "ResolvedRoute | None", request_id: str | None,
 ) -> None:
@@ -944,21 +965,28 @@ async def proxy_anthropic_passthrough(
         kind=BackendType.ANTHROPIC_PASSTHROUGH,
         model_id=str(payload.get("model") or "anthropic"),
     )
+    admission_route = _passthrough_admission_route(resolved)
     started_at = time.perf_counter()
-    request_id = request.headers.get("x-request-id") or f"passthrough:{uuid.uuid4().hex}"
+    admission_id: str | None = None
 
     client = get_upstream_client()
     try:
+        admission_id = await _acquire_provider_request(
+            admission_route, request, streaming=is_streaming,
+        )
+        if admission_id is None:
+            raise RuntimeError("Anthropic passthrough admission did not return a request ID")
         upstream_response = await _send_with_provider_retry(
             client,
             lambda: client.build_request(
                 request.method, url, headers=headers, content=body
             ),
-            resolved,
+            admission_route,
             started_at,
-            request_id,
+            admission_id,
         )
     except Exception as exc:
+        await _release_provider_request(admission_route, admission_id)
         return JSONResponse(
             status_code=502,
             content={
@@ -973,24 +1001,25 @@ async def proxy_anthropic_passthrough(
     if is_streaming:
         return StreamingResponse(
             _stream_upstream_with_admission(
-                upstream_response, request_id, resolved, started_at
+                upstream_response, admission_id, admission_route, started_at
             ),
             status_code=upstream_response.status_code,
             headers=response_headers,
         )
 
     try:
-        content = await _read_with_deadline(upstream_response, resolved, started_at)
+        content = await _read_with_deadline(upstream_response, admission_route, started_at)
     finally:
         await upstream_response.aclose()
+        await _release_provider_request(admission_route, admission_id)
     try:
         response_payload = json.loads(content)
     except (TypeError, ValueError):
         response_payload = None
     if isinstance(response_payload, dict):
         _record_endpoint_usage(
-            resolved,
-            request_id,
+            admission_route,
+            admission_id,
             response_payload,
             started_at,
             succeeded=200 <= upstream_response.status_code < 300,
@@ -1044,7 +1073,8 @@ async def proxy_anthropic_passthrough_worker(
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     is_streaming = bool(payload.get("stream"))
     started_at = time.perf_counter()
-    request_id = request.headers.get("x-request-id") or f"passthrough:{uuid.uuid4().hex}"
+    admission_route = _passthrough_admission_route(resolved)
+    admission_id: str | None = None
 
     LOGGER.info(
         "anthropic_passthrough_worker role=%s model=%s session=%s agent=%s binding=%s",
@@ -1057,16 +1087,22 @@ async def proxy_anthropic_passthrough_worker(
 
     client = get_upstream_client()
     try:
+        admission_id = await _acquire_provider_request(
+            admission_route, request, streaming=is_streaming,
+        )
+        if admission_id is None:
+            raise RuntimeError("Anthropic passthrough admission did not return a request ID")
         upstream_response = await _send_with_provider_retry(
             client,
             lambda: client.build_request(
                 request.method, url, headers=headers, content=body
             ),
-            resolved,
+            admission_route,
             started_at,
-            request_id,
+            admission_id,
         )
     except Exception as exc:
+        await _release_provider_request(admission_route, admission_id)
         LOGGER.warning(
             "anthropic_passthrough_worker error role=%s error=%s",
             resolved.role, exc,
@@ -1085,25 +1121,25 @@ async def proxy_anthropic_passthrough_worker(
     if is_streaming:
         return StreamingResponse(
             _stream_upstream_with_admission(
-                upstream_response, request_id, resolved, started_at
+                upstream_response, admission_id, admission_route, started_at
             ),
             status_code=upstream_response.status_code,
             headers=response_headers,
         )
 
     try:
-        content = await _read_with_deadline(upstream_response, resolved, started_at)
+        content = await _read_with_deadline(upstream_response, admission_route, started_at)
     finally:
         await upstream_response.aclose()
+        await _release_provider_request(admission_route, admission_id)
     try:
         response_payload = json.loads(content)
     except (TypeError, ValueError):
         response_payload = None
     if isinstance(response_payload, dict):
-        usage_route = _route_with_reported_deployment(resolved, upstream_response.headers)
         _record_endpoint_usage(
-            usage_route,
-            request_id,
+            _route_with_reported_deployment(admission_route, upstream_response.headers),
+            admission_id,
             response_payload,
             started_at,
             succeeded=200 <= upstream_response.status_code < 300,

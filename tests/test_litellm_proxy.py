@@ -206,6 +206,30 @@ class TestSanitizeUpstreamHeaders:
 
 
 class TestResolvedRoute:
+    @pytest.mark.asyncio
+    async def test_anthropic_passthrough_uses_shared_admission_lane(self):
+        from types import SimpleNamespace
+
+        import enhanced_router.backends as backends
+
+        backends.configure_provider_admission({})
+        route = backends._passthrough_admission_route(
+            ResolvedRoute(
+                kind=BackendType.ANTHROPIC_PASSTHROUGH,
+                model_id="claude-sonnet",
+            )
+        )
+        assert route.provider_id == "anthropic"
+        assert route.endpoint_id == "messages"
+
+        request_id = await backends._acquire_provider_request(
+            route, SimpleNamespace(headers={}), streaming=True,
+        )
+        assert request_id is not None
+        assert backends.provider_admission_snapshots()["anthropic"]["active_requests"] == 1
+        await backends._release_provider_request(route, request_id)
+        assert backends.provider_admission_snapshots()["anthropic"]["active_requests"] == 0
+
     def test_minimal_route(self):
         """Route with just kind and model_id."""
         route = ResolvedRoute(

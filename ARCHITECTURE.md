@@ -146,6 +146,12 @@ Provider settings are configurable in `config/providers.yaml` and may be
 overridden through the provider-specific environment variable. FreeInference
 credentials remain process-local.
 
+The standard Claude subscription passthrough has no registry provider row, so
+the router assigns it a synthetic `anthropic` admission lane. It uses the
+same request permit, retry/circuit, deadline, stream accounting, and release
+path as configured external providers. An explicit `anthropic` provider entry
+may override its default concurrency policy.
+
 Provider discovery is catalog-driven. The bundled provider definitions include
 OpenRouter plus the configured Kilo/Crush, OpenCode Zen/Go, Cline, NVIDIA NIM,
 FreeInference, FreeTheAI, Requesty, and FreeModel routes. The interactive CLI
@@ -319,6 +325,8 @@ Implemented in the current working tree:
 - one shared external HTTP client and response-header copier;
 - bounded streaming deadlines, incremental SSE usage parsing, and provider
   admission/circuit state, including atomic managed-group reservations;
+- Claude subscription passthrough requests admitted and accounted through the
+  shared synthetic `anthropic` provider lane;
 - model-qualified visible agents, execution lifecycle hooks, mutation leases,
   task intake, phase snapshots, and controller MCP controls;
 - Git-backed shadow workspaces, dirty-baseline preservation, persisted worker
