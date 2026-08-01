@@ -915,6 +915,44 @@ def test_fallback_accounting_is_scoped_per_role_in_multi_role_phase(
     assert repairer_action["model_id"] == "model-b"
 
 
+def test_reconcile_lifecycle_terminalizes_orphaned_detached_fastpath_jobs(
+    state: RouteState,
+):
+    """Detached fastpath jobs (start_detached_sidecar_execution) have no
+    backing runnable_action_claims row, so the claim-based orphan detection
+    never sees them. A crashed job must still get picked up and
+    terminalized -- otherwise it stays 'started' forever and can never even
+    be retried (SidecarExecutor.retry requires a terminal failed/timeout
+    status before it will recover a detached job).
+    """
+    from enhanced_router.state import _utcnow_age
+
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    state.start_detached_sidecar_execution(
+        run_id="r1", epoch_id="ep-1", execution_id="scx-1",
+        phase_id="fastpath:route", role="fastpath", model_id="model-a",
+        provider_id=None, packet={"hello": "world"},
+    )
+    conn = state._new_conn()
+    try:
+        conn.execute(
+            "UPDATE agent_executions SET started_at=? WHERE execution_id='scx-1'",
+            (_utcnow_age(2000),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = state.reconcile_lifecycle(max_age_seconds=900)
+    assert result["detached_executions_orphaned"] == 1
+
+    execution = state.get_agent_execution("scx-1")
+    assert execution is not None
+    assert execution["status"] == "timeout"
+    assert "orphaned" in execution["error"]
+
+
 def test_v29_to_current_adds_binding_and_group_columns(tmp_path: Path):
     db = tmp_path / "v29.db"
     state = RouteState(db)

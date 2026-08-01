@@ -3025,10 +3025,25 @@ class RouteState:
         reservation_ids: list[str] = []
         provider_ids: set[str] = set()
         orphaned_execution_ids: list[str] = []
+        detached_execution_ids: list[str] = []
         try:
             conn.execute("BEGIN IMMEDIATE")
             run_clause = "" if run_id is None else " AND run_id=?"
             run_params: tuple[object, ...] = () if run_id is None else (run_id,)
+            # Detached sidecar executions (fastpath jobs: start_detached_sidecar_execution)
+            # have no backing runnable_action_claims row, so the claim-based
+            # orphan detection below never sees them. A router restart mid-job
+            # would otherwise leave them 'started'/'running' forever -- and
+            # even an explicit retry() call requires a terminal failed/timeout
+            # status first, so nothing could ever recover them.
+            detached = conn.execute(
+                "SELECT execution_id FROM agent_executions "
+                "WHERE execution_kind='sidecar_call' AND status IN ('started','running') "
+                "AND started_at < ?" + run_clause + " AND execution_id NOT IN "
+                "(SELECT execution_id FROM runnable_action_claims WHERE execution_id IS NOT NULL)",
+                (cutoff, *run_params),
+            ).fetchall()
+            detached_execution_ids = [str(row[0]) for row in detached]
             expired = conn.execute(
                 "SELECT reservation_id, provider_id FROM provider_reservations "
                 "WHERE state IN ('queued','reserved') AND deadline_at IS NOT NULL "
@@ -3103,7 +3118,19 @@ class RouteState:
                 # Already terminal (it finished right before reconciliation
                 # ran) -- nothing to reconcile, not a failure.
                 pass
+        detached_orphaned = 0
+        for execution_id in detached_execution_ids:
+            try:
+                self.update_agent_execution(
+                    execution_id=execution_id, status="timeout",
+                    error="orphaned: detached sidecar job had no terminal report before "
+                          "crash-recovery cutoff",
+                )
+                detached_orphaned += 1
+            except WorkflowStateError:
+                pass
         result["executions_orphaned"] = executions_orphaned
+        result["detached_executions_orphaned"] = detached_orphaned
         return result
 
     def admit_provider_agents(self, provider_id: str, max_active: int) -> list[dict]:
