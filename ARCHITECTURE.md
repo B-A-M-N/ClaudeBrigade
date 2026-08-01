@@ -345,6 +345,25 @@ Implemented in the current working tree:
   claim outcomes, provider-reservation handoff, and lifecycle reconciliation;
 - fail-closed mutating workspace ownership, canonical-generation advancement,
   and crash-recoverable integration journaling;
+- mutation-lease acquisition that lazily reclaims a lease from a crashed
+  holder (stale heartbeat) instead of permanently locking the workspace for
+  writes, the same lazy-expiry-on-read shape used for runnable action claims;
+- red shadow-integration candidates (invalid patch, unauthorized files, or a
+  failed integration preflight) automatically escalate to an accepted
+  finding so `evaluate_condition`'s `accepted_findings` gate sees them
+  instead of only living in the integration-candidates table; resolved when
+  the controller discards or retries the candidate;
+- `RouteState` is decomposed into ~20 single-purpose repository mixin
+  modules (`router/enhanced_router/*_state.py`), each covering one bounded
+  concern (workflow phases, agent executions, shadow workspaces, mutation
+  leases, provider reservations, run orchestration, and so on) and mixed
+  into `RouteState` via ordinary multiple inheritance; `state.py` itself
+  retains only schema/migrations and the handful of methods that
+  deliberately span more than one repository's tables;
+- opt-in cost-aware model recommendation (`RecommendationConstraints.prefer_low_cost`)
+  and a profile-load diagnostic flagging profiles that assign the same model
+  to every implemented role, which would make adversarial review a same-model
+  self-review;
 - persisted completion tokens bound to the current workspace fingerprint and
   route snapshot, fail-closed completion validation, state-backed statusline
   visibility, and profile readiness reporting;
@@ -381,10 +400,12 @@ Remaining work before a production-quality proving ground:
    do not run live inference probes automatically.
 6. Reconcile all documentation, release manifests, installer assets, and
    generated hashes after source/config work is final.
-7. Split the large `RouteState` implementation into domain repositories only
-   after the current invariants have remained stable through the proving-ground
-   tests. This is intentionally deferred; this pass keeps transactional
-   changes localized and does not attempt a broad state rewrite.
+7. Real per-run/epoch token or dollar spend cap enforcement. `cost_class` now
+   feeds the opt-in low-cost recommendation preference, but nothing yet
+   compares actual token spend against a configured budget and denies
+   further admission once it's exceeded -- the closest existing field,
+   `turn_budget` on a workflow phase, is stored but similarly unenforced
+   anywhere today.
 
 This status is intentionally not a release claim. The repository should be
 considered an active proving-ground implementation until the remaining list

@@ -114,7 +114,8 @@ CLAUDE_CONFIG_DIR=~/.claude-brigade claude auth status --text
 |------|----------------|
 | `app.py` | FastAPI app, lifespan, `/v1/messages`, `/v1/models`, `/healthz`, MCP mount |
 | `routing.py` | `resolve_request()` — role alias → epoch → route → binding → `ResolvedRoute` |
-| `state.py` | `RouteState` — SQLite-backed runs, epochs, routes, bindings, LiteLLM generations |
+| `state.py` | `RouteState` — schema/migrations, `_new_conn`, and the handful of methods that span more than one repository's tables; mixes in ~20 `*_state.py` repository modules (see below) for everything else |
+| `*_state.py` | One `XRepository` mixin per bounded concern (e.g. `workflow_phase_state.py`, `agent_execution_state.py`, `mutation_lease_state.py`, `shadow_workspace_state.py`, `provider_reservation_state.py`, `run_orchestration_state.py`) — each only touches its own tables through `self._new_conn()`; `RouteState` inherits from all of them so cross-repository `self.method()` calls resolve via normal MRO regardless of which mixin defines the method |
 | `registry.py` | `ModelRegistry` — loads YAML, validates cross-refs, deterministic `recommend()` |
 | `config_models.py` | Pydantic models: `ModelSpec`, `ProfileSpec`, `ModelCapabilities`, etc. |
 | `backends.py` | Proxy implementations: `proxy_anthropic_passthrough`, `proxy_direct_anthropic`, `proxy_litellm_messages` |
