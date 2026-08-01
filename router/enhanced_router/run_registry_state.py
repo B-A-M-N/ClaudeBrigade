@@ -31,7 +31,7 @@ class RunRegistryRepository:
     _RUN_COLUMNS = (
         "run_id", "claude_session_id", "cwd", "controller_capability_hash",
         "inference_profile_id", "sidecar_profile_id", "launch_preset_id",
-        "created_at", "closed_at",
+        "token_budget", "created_at", "closed_at",
     )
 
     def create_run(
@@ -43,15 +43,23 @@ class RunRegistryRepository:
         inference_profile_id: str | None = None,
         sidecar_profile_id: str | None = None,
         launch_preset_id: str | None = None,
+        token_budget: int | None = None,
     ) -> dict:
-        """Insert run if not exists (idempotent). Returns run dict."""
+        """Insert run if not exists (idempotent). Returns run dict.
+
+        ``token_budget`` is an optional cap on total tokens spent across
+        every agent_execution in this run, enforced by
+        RunnableActionRepository.claim_runnable_action. NULL/unset means
+        unbounded, matching every run created before this field existed.
+        """
         conn = self._new_conn()
         try:
             conn.execute(
                 "INSERT OR IGNORE INTO runs "
                 "(run_id, claude_session_id, cwd, controller_capability_hash, "
-                "inference_profile_id, sidecar_profile_id, launch_preset_id, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "inference_profile_id, sidecar_profile_id, launch_preset_id, "
+                "token_budget, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     session_id,
@@ -61,6 +69,7 @@ class RunRegistryRepository:
                     inference_profile_id,
                     sidecar_profile_id,
                     launch_preset_id,
+                    token_budget,
                     _utcnow(),
                 ),
             )

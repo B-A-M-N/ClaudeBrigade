@@ -388,6 +388,23 @@ class RunnableActionRepository:
         if action.get("status") in {"claimed", "consumed"}:
             return action
 
+        run = self.get_run(run_id)
+        token_budget = run.get("token_budget") if run else None
+        if token_budget is not None:
+            conn = self._new_conn()
+            try:
+                spent = conn.execute(
+                    "SELECT COALESCE(SUM(total_tokens), 0) FROM agent_executions WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()[0]
+            finally:
+                conn.close()
+            if int(spent) >= int(token_budget):
+                raise WorkflowStateError(
+                    f"run {run_id!r} has exhausted its token budget "
+                    f"({spent} spent, budget {token_budget})"
+                )
+
         claim_token = secrets.token_urlsafe(24)
         now = datetime.now(timezone.utc)
         expires_at = (now + timedelta(seconds=ttl_seconds)).isoformat()
@@ -412,6 +429,7 @@ class RunnableActionRepository:
                 deadline_at=expires_at,
                 reason=f"action-claim:{action_id}",
                 enqueue=False,
+                model_id=action.get("model_id"),
             )
             if reservation.get("state") != "reserved":
                 raise WorkflowStateError(

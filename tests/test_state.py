@@ -690,6 +690,47 @@ def test_provider_agent_admission_does_not_create_dead_queue_entry(state: RouteS
     assert state.get_provider_reservations("freeinference") == [first]
 
 
+def test_reserve_provider_agent_refuses_an_unhealthy_model_immediately(state: RouteState):
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    state.set_model_health(
+        "bad-model", "cfg", "1.0", "unhealthy",
+        reachable=False, authenticated=True, compatible=True,
+    )
+    result = state.reserve_provider_agent(
+        reservation_id="a1", run_id="r1", epoch_id="ep-1", provider_id="freeinference",
+        execution_id="e1", max_active=1, enqueue=False, model_id="bad-model",
+    )
+    assert result["state"] == "unavailable"
+    assert "health check" in result["reason"]
+    assert state.get_provider_reservations("freeinference") == []
+
+
+def test_reserve_provider_agent_admits_a_healthy_model(state: RouteState):
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    state.set_model_health(
+        "good-model", "cfg", "1.0", "healthy",
+        reachable=True, authenticated=True, compatible=True,
+    )
+    result = state.reserve_provider_agent(
+        reservation_id="a1", run_id="r1", epoch_id="ep-1", provider_id="freeinference",
+        execution_id="e1", max_active=1, enqueue=False, model_id="good-model",
+    )
+    assert result["state"] == "reserved"
+
+
+def test_reserve_provider_agent_does_not_block_an_untested_model(state: RouteState):
+    """No health record yet (untested) must not be treated as unhealthy."""
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    result = state.reserve_provider_agent(
+        reservation_id="a1", run_id="r1", epoch_id="ep-1", provider_id="freeinference",
+        execution_id="e1", max_active=1, enqueue=False, model_id="never-checked-model",
+    )
+    assert result["state"] == "reserved"
+
+
 def test_ttl_expired_claim_releases_its_provider_reservation(
     state: RouteState, monkeypatch: pytest.MonkeyPatch,
 ):
@@ -777,6 +818,62 @@ def _make_changeset(state: RouteState, changeset_id: str, workspace_id: str) -> 
         changed_files=["a.py"], result={"validation": {"valid": True}}, status="validated",
         patch=b"--- a\n+++ b\n",
     )
+
+
+def test_get_workspaces_reaps_a_shadow_workspace_from_a_crashed_subagent(
+    state: RouteState,
+):
+    """A shadow workspace whose owning subagent died without a clean status
+    transition (SubagentStop/StopFailure never fired, so update_workspace_status
+    never ran) must eventually be reclaimed by get_workspaces itself, not
+    only at session_end.py."""
+    state.create_run("r1", session_id="s1", cwd="/tmp")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    state.create_workspace(
+        workspace_id="ws-shadow-1", run_id="r1", epoch_id="ep-1", kind="shadow",
+        path="/tmp/shadow-1", base_sha="sha-0", dirty_patch_hash="dirty-0",
+    )
+
+    conn = state._new_conn()
+    conn.execute(
+        "UPDATE workspaces SET heartbeat_at = '2000-01-01T00:00:00+00:00' "
+        "WHERE workspace_id='ws-shadow-1'",
+    )
+    conn.commit()
+    conn.close()
+
+    workspaces = state.get_workspaces(run_id="r1", epoch_id="ep-1", kind="shadow")
+    assert workspaces[0]["status"] == "discarded"
+    assert workspaces[0]["released_at"] is not None
+
+
+def test_get_workspaces_does_not_reap_a_fresh_shadow_workspace(state: RouteState):
+    state.create_run("r1", session_id="s1", cwd="/tmp")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    state.create_workspace(
+        workspace_id="ws-shadow-1", run_id="r1", epoch_id="ep-1", kind="shadow",
+        path="/tmp/shadow-1", base_sha="sha-0", dirty_patch_hash="dirty-0",
+    )
+    workspaces = state.get_workspaces(run_id="r1", epoch_id="ep-1", kind="shadow")
+    assert workspaces[0]["status"] == "active"
+
+
+def test_get_workspaces_does_not_reap_a_stale_main_workspace(state: RouteState):
+    """Only shadow workspaces are reaped -- a stale main/integration
+    workspace has a different lifecycle and must stay active regardless of
+    age."""
+    workspace_id = _register_canonical_workspace(state)
+    conn = state._new_conn()
+    conn.execute(
+        "UPDATE workspaces SET heartbeat_at = '2000-01-01T00:00:00+00:00' "
+        "WHERE workspace_id=?",
+        (workspace_id,),
+    )
+    conn.commit()
+    conn.close()
+
+    workspaces = state.get_workspaces(run_id="r1", epoch_id="ep-1", kind="main")
+    assert workspaces[0]["status"] == "active"
 
 
 def test_begin_integration_journal_rejects_concurrent_workspace_integration(
@@ -1035,7 +1132,7 @@ def test_v29_to_current_adds_binding_and_group_columns(tmp_path: Path):
         assert "configuration_hash" in columns
         assert "routing_mode" in columns
         assert "deployment_group" in columns
-        assert version == 39
+        assert version == 41
     finally:
         conn.close()
 
@@ -1086,6 +1183,67 @@ def test_runnable_native_action_requires_claim_and_is_consumed_once(
     finished = state.finish_spawn_assignment("r1", "ep-1", "agent-1", "completed")
     assert finished is not None
     assert finished["status"] == "consumed"
+
+
+def test_claim_runnable_action_denied_once_run_token_budget_is_exhausted(
+    state: RouteState, monkeypatch: pytest.MonkeyPatch,
+):
+    """A run created with token_budget stops admitting new claims once
+    cumulative agent_executions.total_tokens for the run reaches it."""
+    state.create_run("r1", token_budget=100)
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    state.set_role_route("r1", "ep-1", "recon", "model-a", "manual")
+    state.initialize_workflow_phases(
+        "r1", "ep-1", [{"id": "recon", "roles": ["recon"], "max_fanout": 1}],
+    )
+    state.start_phase("r1", "ep-1", "recon")
+    state.create_agent_execution(
+        "exec-1", "r1", "ep-1", "agent-0", "recon", "model-a",
+    )
+    state.update_agent_execution("exec-1", total_tokens=150)
+
+    class FakeRegistry:
+        providers: dict = {}
+
+        @staticmethod
+        def get_model(model_id: str) -> SimpleNamespace:
+            return SimpleNamespace(provider_id=None)
+
+    import enhanced_router.registry as registry_module
+    monkeypatch.setattr(registry_module, "get_registry", lambda: FakeRegistry())
+
+    actions = state.get_runnable_actions("r1", "ep-1")
+    native = next(item for item in actions if item["action_kind"] == "native_agent")
+    with pytest.raises(WorkflowStateError, match="exhausted its token budget"):
+        state.claim_runnable_action("r1", "ep-1", native["action_id"])
+
+
+def test_claim_runnable_action_ignores_budget_when_run_has_none(
+    state: RouteState, monkeypatch: pytest.MonkeyPatch,
+):
+    """token_budget defaults to unbounded (NULL) for a run that never set one."""
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    state.set_role_route("r1", "ep-1", "recon", "model-a", "manual")
+    state.initialize_workflow_phases(
+        "r1", "ep-1", [{"id": "recon", "roles": ["recon"], "max_fanout": 1}],
+    )
+    state.start_phase("r1", "ep-1", "recon")
+
+    class FakeRegistry:
+        providers: dict = {}
+
+        @staticmethod
+        def get_model(model_id: str) -> SimpleNamespace:
+            return SimpleNamespace(provider_id=None)
+
+    import enhanced_router.registry as registry_module
+    monkeypatch.setattr(registry_module, "get_registry", lambda: FakeRegistry())
+
+    actions = state.get_runnable_actions("r1", "ep-1")
+    native = next(item for item in actions if item["action_kind"] == "native_agent")
+    claim = state.claim_runnable_action("r1", "ep-1", native["action_id"])
+    assert claim["status"] == "claimed"
 
 
 def test_controller_phase_generates_controlled_native_mutator_action(
@@ -1472,7 +1630,7 @@ def test_migration_v39_adds_fallback_routes_column(tmp_path: Path):
         columns = {row[1] for row in conn.execute("PRAGMA table_info(role_routes)")}
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         assert "fallback_routes_json" in columns
-        assert version == 39
+        assert version == 41
     finally:
         conn.close()
 

@@ -303,6 +303,12 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     if current < 39:
         _migrate_v39(conn)
         conn.execute("PRAGMA user_version = 39")
+    if current < 40:
+        _migrate_v40(conn)
+        conn.execute("PRAGMA user_version = 40")
+    if current < 41:
+        _migrate_v41(conn)
+        conn.execute("PRAGMA user_version = 41")
 
 
 def _needs_v37_hardening(conn: sqlite3.Connection) -> bool:
@@ -1286,6 +1292,25 @@ def _migrate_v39(conn: sqlite3.Connection) -> None:
     _add_column_if_missing(conn, "role_routes", "fallback_routes_json", "TEXT")
 
 
+def _migrate_v40(conn: sqlite3.Connection) -> None:
+    """Add runs.token_budget: an optional per-run cap enforced at
+    claim_runnable_action time (SUM(agent_executions.total_tokens) for the
+    run). NULL means unbounded, matching every run created before this
+    migration.
+    """
+    _add_column_if_missing(conn, "runs", "token_budget", "INTEGER")
+
+
+def _migrate_v41(conn: sqlite3.Connection) -> None:
+    """Add workspaces.heartbeat_at, so a shadow workspace whose owning
+    subagent dies without a clean status transition can be reclaimed
+    mid-session instead of only at session_end.py. Backfilled from
+    created_at for existing rows.
+    """
+    _add_column_if_missing(conn, "workspaces", "heartbeat_at", "TEXT")
+    conn.execute("UPDATE workspaces SET heartbeat_at = created_at WHERE heartbeat_at IS NULL")
+
+
 def _migrate_v37(conn: sqlite3.Connection) -> None:
     """Harden actor credentials, native spawn correlation, and workspace generations."""
     _add_column_if_missing(conn, "runs", "controller_capability_hash", "TEXT")
@@ -1707,7 +1732,7 @@ class RouteState(
 
     # ---- Shadow workspace / changeset lifecycle ------------------------
 
-    # create_workspace, register_main_workspace, validate_execution_workspace,
+    # create_workspace, register_main_workspace,
     # advance_canonical_workspace, begin_integration_journal,
     # finish_integration_journal, get_pending_integration_journals,
     # get_workspace, get_workspaces, update_workspace_status, create_changeset,

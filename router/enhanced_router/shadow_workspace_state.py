@@ -13,13 +13,26 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from enhanced_router.state_errors import WorkflowStateError
 
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _utcnow_age(max_age_seconds: int) -> str:
+    """Return an ISO-8601 timestamp that is *max_age_seconds* in the past."""
+    return (datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)).isoformat()
+
+
+# Mirrors mutation_lease_state._STALE_LEASE_MAX_AGE_SECONDS: applied lazily
+# inside get_workspaces (see _expire_stale_workspaces) rather than via a
+# scheduled sweep, since nothing else periodically reaps a shadow workspace
+# whose owning subagent died without a clean status transition -- only
+# session_end.py's full-session-close cleanup ever caught it before this.
+_STALE_SHADOW_WORKSPACE_MAX_AGE_SECONDS = 1_200
 
 
 class ShadowWorkspaceRepository:
@@ -56,18 +69,20 @@ class ShadowWorkspaceRepository:
         conn = self._new_conn()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            now = _utcnow()
             conn.execute(
                 """INSERT INTO workspaces
                    (workspace_id, run_id, epoch_id, kind, path, base_sha,
                     dirty_patch_hash, current_base_sha, current_dirty_hash,
                     parent_canonical_generation, parent_dirty_patch_hash,
-                    status, owner_execution_id, baseline_untracked_json, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    status, owner_execution_id, baseline_untracked_json, created_at,
+                    heartbeat_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (workspace_id, run_id, epoch_id, kind, path, base_sha,
                  dirty_patch_hash, base_sha, dirty_patch_hash,
                  parent_canonical_generation, parent_dirty_patch_hash,
                  status, owner_execution_id,
-                 json.dumps(sorted(baseline_untracked_files or [])), _utcnow()),
+                 json.dumps(sorted(baseline_untracked_files or [])), now, now),
             )
             conn.commit()
             row = conn.execute(
@@ -119,15 +134,17 @@ class ShadowWorkspaceRepository:
                     existing["epoch_id"] = epoch_id
                 conn.commit()
                 return existing
+            now = _utcnow()
             conn.execute(
                 """INSERT INTO workspaces
                    (workspace_id, run_id, epoch_id, kind, path, base_sha,
                     dirty_patch_hash, current_base_sha, current_dirty_hash,
-                    canonical_generation, status, baseline_untracked_json, created_at)
-                   VALUES (?, ?, ?, 'main', ?, ?, ?, ?, ?, 0, 'active', ?, ?)""",
+                    canonical_generation, status, baseline_untracked_json, created_at,
+                    heartbeat_at)
+                   VALUES (?, ?, ?, 'main', ?, ?, ?, ?, ?, 0, 'active', ?, ?, ?)""",
                 (workspace_id, run_id, epoch_id, path, base_sha, dirty_patch_hash,
                  base_sha, dirty_patch_hash,
-                 json.dumps(sorted(baseline_untracked_files or [])), _utcnow()),
+                 json.dumps(sorted(baseline_untracked_files or [])), now, now),
             )
             conn.commit()
             created = conn.execute(
@@ -140,25 +157,6 @@ class ShadowWorkspaceRepository:
             raise
         finally:
             conn.close()
-
-    def validate_execution_workspace(
-        self, workspace_id: str | None, execution_id: str, role: str,
-    ) -> dict:
-        """Require mutating executions to own an active shadow workspace."""
-        if role not in {"implementer", "repairer", "controller"}:
-            return {"valid": True, "workspace": None}
-        if not workspace_id:
-            return {"valid": False, "reason": "mutating execution has no workspace"}
-        workspace = self.get_workspace(workspace_id)
-        if workspace is None:
-            return {"valid": False, "reason": "workspace is not registered"}
-        if workspace.get("kind") != "shadow":
-            return {"valid": False, "reason": "mutating execution workspace is not a shadow"}
-        if workspace.get("status") != "active":
-            return {"valid": False, "reason": "mutating execution workspace is not active"}
-        if workspace.get("owner_execution_id") != execution_id:
-            return {"valid": False, "reason": "workspace belongs to another execution"}
-        return {"valid": True, "workspace": workspace}
 
     def advance_canonical_workspace(
         self,
@@ -327,6 +325,25 @@ class ShadowWorkspaceRepository:
         finally:
             conn.close()
 
+    def _expire_stale_workspaces(self) -> None:
+        """Reclaim shadow workspaces whose owning subagent died without a
+        clean status transition (SubagentStop/StopFailure), the same
+        lazy-expiry-on-read shape as acquire_mutation_lease and
+        _active_action_claims. Scoped to kind='shadow' only -- a stale
+        'main'/'integration' workspace is a different lifecycle and must
+        not be auto-discarded just because it's been active a while.
+        """
+        conn = self._new_conn()
+        try:
+            conn.execute(
+                "UPDATE workspaces SET status='discarded', released_at=? "
+                "WHERE kind='shadow' AND status='active' AND heartbeat_at < ?",
+                (_utcnow(), _utcnow_age(_STALE_SHADOW_WORKSPACE_MAX_AGE_SECONDS)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     def get_workspaces(
         self,
         *,
@@ -335,6 +352,7 @@ class ShadowWorkspaceRepository:
         kind: str | None = None,
         status: str | None = None,
     ) -> list[dict]:
+        self._expire_stale_workspaces()
         conn = self._new_conn()
         try:
             clauses: list[str] = []
@@ -357,11 +375,12 @@ class ShadowWorkspaceRepository:
             raise ValueError(f"invalid workspace status: {status}")
         conn = self._new_conn()
         try:
-            released = _utcnow() if status in {"merged", "discarded", "failed"} else None
+            now = _utcnow()
+            released = now if status in {"merged", "discarded", "failed"} else None
             conn.execute(
-                "UPDATE workspaces SET status=?, released_at=COALESCE(?, released_at) "
-                "WHERE workspace_id=?",
-                (status, released, workspace_id),
+                "UPDATE workspaces SET status=?, released_at=COALESCE(?, released_at), "
+                "heartbeat_at=? WHERE workspace_id=?",
+                (status, released, now, workspace_id),
             )
             conn.commit()
             row = conn.execute(

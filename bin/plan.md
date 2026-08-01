@@ -22,12 +22,18 @@ Replace the LongCat-specific controller with a generic Brigade architecture back
 | controller | deepseek-v4-pro (fallback: deepseek-v4-flash) |
 | recon | qwen3.6-35b-a3b |
 | implementer | qwen3.6-35b-a3b |
-| test_engineer | qwen3.6-35b-a3b |
-| secondary_reviewer | qwen3.6-35b-a3b |
+| adversary | deepseek-v4-pro |
 | repairer | qwen3.6-35b-a3b |
-| final_reviewer | deepseek-v4-pro |
-| adjudicator | deepseek-v4-pro |
-| verifier | deepseek-v4-pro |
+
+Only these four worker roles (recon, implementer, adversary, repairer) are
+implemented -- `ProfileSpec`/`role_names` in config_models.py, the
+`profiles.yaml` schema, and every workflow phase's role checks are all built
+around exactly this set. An earlier version of this table additionally
+listed test_engineer, secondary_reviewer, final_reviewer, adjudicator, and
+verifier, but none of those were ever implemented in code, config, or an
+agent definition; adding them would mean redesigning the workflow-phase DAG
+(who runs after whom, who gates completion) rather than a mechanical schema
+extension. Removed rather than left overstating what's built.
 
 ## Milestones
 

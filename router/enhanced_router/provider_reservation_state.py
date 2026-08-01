@@ -42,14 +42,42 @@ class ProviderReservationRepository:
         deadline_at: str | None = None,
         reason: str = "",
         enqueue: bool = True,
+        model_id: str | None = None,
     ) -> dict:
         """Reserve a provider-wide native-agent slot durably.
 
         This complements the in-process request admission manager.  A queued
         native agent is not spawned until this record becomes ``reserved``.
+
+        When *model_id* is given and *enqueue* is False, an unhealthy model
+        (its latest health record showing reachable/authenticated/compatible
+        not all true) refuses the immediate reservation the same way an
+        exhausted capacity slot does -- model_health_state was previously
+        only consulted for /v1/models listing and recommend()'s scoring, not
+        at actual admission time. A model with no health record yet
+        (untested) is not blocked here; only a confirmed-unhealthy one is.
+        Reservations aren't per-model rows, so a caller that enqueues
+        (enqueue=True) is not re-checked against health when later admitted
+        by admit_provider_agents -- this only gates the immediate-or-refuse
+        decision, not the queue.
         """
         if max_active < 1:
             raise ValueError("max_active must be positive")
+        if model_id is not None and not enqueue:
+            health = self.get_model_health(model_id)
+            if health is not None and not (
+                health.get("reachable") and health.get("authenticated") and health.get("compatible")
+            ):
+                return {
+                    "reservation_id": reservation_id,
+                    "run_id": run_id,
+                    "epoch_id": epoch_id,
+                    "provider_id": provider_id,
+                    "execution_id": execution_id,
+                    "lane": lane,
+                    "state": "unavailable",
+                    "reason": f"model {model_id!r} failed its latest health check",
+                }
         conn = self._new_conn()
         try:
             conn.execute("BEGIN IMMEDIATE")
