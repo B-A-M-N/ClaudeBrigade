@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROFILE_DIR="${CLAUDE_BRIGADE_PROFILE_DIR:-${CLAUDE_ENHANCED_CONFIG_DIR:-$HOME/.claude-brigade}}"
+SETTINGS="$PROFILE_DIR/settings.json"
+BACKUP=""
+mkdir -p "$PROFILE_DIR"
+if [[ -f "$SETTINGS" ]]; then
+  BACKUP="$SETTINGS.login-backup.$$"
+  mv "$SETTINGS" "$BACKUP"
+fi
+restore() {
+  if [[ -n "$BACKUP" && -f "$BACKUP" ]]; then
+    mv "$BACKUP" "$SETTINGS"
+  fi
+}
+trap restore EXIT
+
+env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY \
+    -u CLAUDE_CODE_OAUTH_TOKEN -u CLAUDE_CODE_USE_BEDROCK \
+    -u CLAUDE_CODE_USE_VERTEX -u CLAUDE_CODE_USE_FOUNDRY \
+    -u ANTHROPIC_MODEL \
+  CLAUDE_CONFIG_DIR="$PROFILE_DIR" claude auth login

@@ -1,0 +1,19 @@
+fastpath:
+  enabled: true
+  model_id: diffusiongemma
+  endpoint: auto
+  modes: [route, verify]
+  read_only: true
+  authoritative: false
+  timeout_seconds: 5
+  max_packet_tokens: 12000
+  route_confidence_threshold: 0.88
+  failure_policy: bypass
+  system_prompts:
+    route: >-
+      Classify the task conservatively. Return only the requested JSON schema.
+      You are advisory: never lower the deterministic tier, remove required
+      review, select a provider endpoint, or claim authority over state.
+    verify: >-
+      Review only the bounded evidence packet. Return only the requested JSON
+      schema. PASS is advisory and cannot override failed or unknown checks.

@@ -41,3 +41,51 @@ BRIGADE_CONFIG_DIR = _env_path(
 DEFAULT_DB_PATH: Path = BRIGADE_STATE_DIR / "state.db"
 
 REGISTRY_HASH_KEY = "registry_config_sha256"
+
+# ---------------------------------------------------------------------------
+# Authoritative agent-type allowlists.
+#
+# These three frozensets are the single source of truth for every hook that
+# needs to know which subagent types, mutators, and implementation agents
+# exist.  The hooks import them directly -- no lazy import, no fallback.
+# ---------------------------------------------------------------------------
+
+#: Agent types allowed to be spawned as subagents.
+ALLOWED_SUBAGENTS: frozenset[str] = frozenset({
+    "brigade-recon",
+    "brigade-implementer",
+    "brigade-adversary",
+    "brigade-repairer",
+    "controller-direct",
+    "brigade-fi-qwen-scout",
+    "brigade-fi-minimax-architect",
+    "brigade-fi-kimi-implementer",
+    "brigade-fi-glm-adversary",
+    "brigade-fi-glm-fast-repairer",
+})
+
+#: Agent types allowed to mutate the workspace
+#: (Write / Edit / NotebookEdit / Bash-with-mutation).
+MUTATORS: frozenset[str] = frozenset({
+    "brigade-implementer",
+    "brigade-repairer",
+    "controller-direct",
+    "brigade-fi-kimi-implementer",
+    "brigade-fi-glm-fast-repairer",
+})
+
+#: Agent types considered "implementation" for completion-sequence validation.
+IMPLEMENTATION_AGENTS: frozenset[str] = frozenset({
+    "brigade-implementer",
+    "brigade-repairer",
+    "controller-direct",
+    "brigade-fi-kimi-implementer",
+    "brigade-fi-glm-fast-repairer",
+})
+
+#: HTTP headers that MUST NOT be forwarded to upstream backends (RFC 9113 ?8.2.2).
+HOP_BY_HOP: frozenset[str] = frozenset({
+    "connection", "keep-alive", "proxy-authenticate",
+    "proxy-authorization", "te", "trailers",
+    "transfer-encoding", "upgrade",
+})

@@ -13,7 +13,7 @@ def test_bundle_agents_render_for_native_agents_flag():
     directory = Path(__file__).resolve().parents[1] / "agents"
     agents = render_agents(directory)
     assert agents["brigade-implementer"]["model"] == "anthropic-brigade-implementer"
-    assert agents["brigade-adversary"]["background"] is False
+    assert agents["brigade-adversary"]["background"] is True
     assert "prompt" in agents["brigade-repairer"]
     # Verify tools field is properly parsed as a list
     assert isinstance(agents["brigade-recon"]["tools"], list)
@@ -34,11 +34,11 @@ def test_controller_append_has_brigade_references():
     assert "enhanced-controller" not in text
 
 
-def test_sonnet_direct_updated_body():
+def test_controller_direct_uses_active_binding():
     directory = Path(__file__).resolve().parents[1] / "agents"
     agents = render_agents(directory)
-    body = agents["sonnet-direct"]["prompt"]
-    assert "configured worker model" in body
+    body = agents["controller-direct"]["prompt"]
+    assert "active-controller mutation path" in body
     assert "LongCat" not in body
 
 
@@ -49,7 +49,7 @@ def test_required_roles_validation():
     assert "brigade-implementer" in agents
     assert "brigade-adversary" in agents
     assert "brigade-repairer" in agents
-    assert "sonnet-direct" in agents
+    assert "controller-direct" in agents
 
 
 def test_expected_models_validation():
@@ -82,7 +82,7 @@ def test_wrong_model_raises_value_error(tmp_path):
         ("brigade-recon", "anthropic-brigade-recon"),
         ("brigade-adversary", "anthropic-brigade-adversary"),
         ("brigade-repairer", "anthropic-brigade-repairer"),
-        ("sonnet-direct", "sonnet[1m]"),
+        ("controller-direct", None),
         ("brigade-implementer", "wrong-model"),
     ]:
         (tmp_path / f"{name}.md").write_text(

@@ -1,6 +1,6 @@
 # ClaudeBrigade Development Controller
 
-You are the persistent DeepSeek main-thread controller for this repository.
+You are the controller for this repository: the model active in Claude Code's main thread. The controller may be any registry-approved, compatibility-certified model.
 
 ## Ownership
 
@@ -80,10 +80,12 @@ Confirm that:
 ## Context
 
 You operate inside the ClaudeBrigade repository. The launch profile routes:
-- your main thread through DeepSeek V4 Flash
-- every native Agent subagent through Qwen3.6-35B
+- the active Claude Code model as the controller
+- each visible native Agent through its immutable registry binding
 
-No Claude model is involved. No AegisKeys, Free-Code, or normal Claude configuration should be modified. Work only inside this repository.
+FreeInference-only sessions are supported when the selected model is
+certified. Provider keys remain in the router process and are never exposed to
+Claude Code.
 
 ## First task
 

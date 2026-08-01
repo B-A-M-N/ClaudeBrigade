@@ -1,5 +1,98 @@
 workflows:
-  normal: {default_profile: hybrid}
-  cross-cutting: {default_profile: hybrid}
-  high-risk: {default_profile: hybrid}
-  trivial: {default_profile: longcat}
+  trivial:
+    default_profile: freeinference
+    phases:
+      - id: implementation
+        actor: controller
+        required: true
+        mutation: true
+        min_fanout: 1
+        max_fanout: 1
+        quality_quorum: 1
+  normal:
+    default_profile: hybrid
+    phases:
+      - id: implementation
+        roles: [implementer]
+        required: true
+        mutation: true
+        min_fanout: 1
+        max_fanout: 1
+        quality_quorum: 1
+  cross-cutting:
+    default_profile: hybrid
+    phases:
+      - id: recon
+        roles: [recon]
+        required: true
+        mutation: false
+        parallel_group: recon
+        min_fanout: 2
+        max_fanout: 2
+        quality_quorum: 1
+      - id: implementation
+        roles: [implementer]
+        depends_on: [recon]
+        mutation: true
+        min_fanout: 1
+        max_fanout: 1
+      - id: adversarial-review
+        roles: [adversary]
+        depends_on: [implementation]
+        mutation: false
+        min_fanout: 1
+        max_fanout: 1
+        quality_quorum: 1
+      - id: repair
+        roles: [repairer]
+        required: false
+        depends_on: [adversarial-review]
+        conditional: accepted_findings
+        mutation: true
+      - id: verification
+        actor: controller
+        depends_on: [repair]
+        mutation: false
+  high-risk:
+    default_profile: hybrid
+    phases:
+      - id: recon
+        roles: [recon]
+        required: true
+        mutation: false
+        parallel_group: recon
+        min_fanout: 2
+        max_fanout: 2
+        quality_quorum: 2
+      - id: design-review
+        roles: [adversary]
+        depends_on: [recon]
+        required: true
+        mutation: false
+        distinct_agent_from: [adversarial-review]
+        min_fanout: 2
+        max_fanout: 2
+        quality_quorum: 2
+      - id: implementation
+        roles: [implementer]
+        depends_on: [design-review]
+        mutation: true
+        min_fanout: 1
+        max_fanout: 1
+      - id: adversarial-review
+        roles: [adversary]
+        depends_on: [implementation]
+        mutation: false
+        distinct_agent_from: [design-review]
+        min_fanout: 1
+        max_fanout: 2
+      - id: repair
+        roles: [repairer]
+        required: false
+        depends_on: [adversarial-review]
+        conditional: accepted_findings
+        mutation: true
+      - id: verification
+        actor: controller
+        depends_on: [repair]
+        mutation: false

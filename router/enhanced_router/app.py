@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 import os
@@ -18,9 +19,16 @@ from enhanced_router.backends import (
     BackendType,
     ResolvedRoute,
     ROLE_MODEL_ALIASES,
-    sanitize_upstream_headers,
+    ROLE_MODEL_BINDINGS,
+    parse_request_identity,
+    proxy_direct_anthropic as _proxy_direct_anthropic_backend,
     proxy_litellm_messages as _proxy_litellm_messages_backend,
+    proxy_anthropic_passthrough_worker as _proxy_anthropic_passthrough_worker_backend,
+    close_upstream_client,
+    copy_response_headers,
+    get_upstream_client,
 )
+from enhanced_router.base import HOP_BY_HOP
 from enhanced_router.mcp_control import control_mcp
 from enhanced_router.mcp_transport import authenticated_mcp_app
 from enhanced_router.routing import resolve_request
@@ -32,53 +40,113 @@ logging.basicConfig(level=os.getenv("ENHANCED_ROUTER_LOG_LEVEL", "INFO"))
 ANTHROPIC_UPSTREAM = os.getenv("ANTHROPIC_UPSTREAM", "https://api.anthropic.com").rstrip("/")
 LONGCAT_UPSTREAM = os.getenv("LONGCAT_UPSTREAM", "https://api.longcat.chat/anthropic").rstrip("/")
 LONGCAT_API_KEY = os.getenv("LONGCAT_API_KEY", "")
-ROUTER_TOKEN = os.getenv("ENHANCED_ROUTER_TOKEN", "")
+ROUTER_TOKEN_ENV = "ENHANCED_ROUTER_TOKEN"
 LONGCAT_PUBLIC_ID = os.getenv("LONGCAT_PUBLIC_ID", "anthropic-longcat-2-0")
 LONGCAT_UPSTREAM_ID = os.getenv("LONGCAT_UPSTREAM_ID", "LongCat-2.0")
 
-# Sonnet/Haiku IDs that are forwarded directly to Anthropic (not LongCat).
-# Claude Code's model-discovery (CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1)
-# validates that the selected model appears in GET /v1/models, so we must
-# include these here even though they are really served by Anthropic upstream.
-_PASSTHROUGH_MODELS: list[dict[str, str]] = [
-    {"id": "claude-sonnet-5",        "display_name": "Claude Sonnet 5"},
-    {"id": "claude-sonnet-4-5",      "display_name": "Claude Sonnet 4.5"},
-    {"id": "claude-haiku-4-5",       "display_name": "Claude Haiku 4.5"},
-    {"id": "claude-opus-4-5",        "display_name": "Claude Opus 4.5"},
-    {"id": "claude-opus-4-7",        "display_name": "Claude Opus 4.7"},
-]
+async def _init_litellm_supervisor(app: FastAPI) -> None:
+    """Initialise the LiteLLM supervisor if BRIGADE_LITELLM_KEY is set.
 
-HOP_BY_HOP = {
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailers",
-    "transfer-encoding",
-    "upgrade",
-    "content-length",
-    "content-encoding",
-    "host",
-}
+    The supervisor manages LiteLLM child process lifecycle (generations).
+    Once initialized, it is registered with the MCP control layer for
+    ``reload_catalog`` tool support.
+    """
+    litellm_key = os.environ.get("BRIGADE_LITELLM_KEY", "")
+    if not litellm_key:
+        LOGGER.info("BRIGADE_LITELLM_KEY not set; LiteLLM supervisor disabled")
+        return
+
+    from enhanced_router.litellm_supervisor import LiteLLMSupervisor
+    from enhanced_router.mcp_control import set_litellm_supervisor
+    from enhanced_router.base import BRIGADE_CACHE_DIR
+
+    from enhanced_router.registry import get_registry
+    from enhanced_router.litellm_config import generate_litellm_config
+    state = get_state()
+    supervisor = LiteLLMSupervisor(state, BRIGADE_CACHE_DIR, litellm_key)
+    set_litellm_supervisor(supervisor)
+    app.state.litellm_supervisor = supervisor
+
+    # Create initial generation from current registry
+    try:
+        registry = get_registry()
+        reg_hash = registry.registry_hash()
+        config_text = generate_litellm_config(registry.models)
+
+        if registry.models and any(
+            s.has_litellm_endpoint() and s.enabled
+            for s in registry.models.values()
+        ):
+            await supervisor.start_generation(
+                registry_hash=reg_hash,
+                models=registry.models,
+                config_text=config_text,
+                reason="app-startup",
+            )
+        else:
+            LOGGER.info("No enabled litellm models; supervisor ready but idle")
+    except Exception as exc:
+        LOGGER.warning("LiteLLM initial generation failed: %s", exc)
 
 
-def _build_client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=30.0, read=3600.0, write=120.0, pool=30.0),
-        follow_redirects=False,
-    )
+async def _shutdown_litellm(app: FastAPI) -> None:
+    """Shut down the LiteLLM supervisor and all child processes."""
+    supervisor = getattr(app.state, "litellm_supervisor", None)
+    if supervisor is not None:
+        LOGGER.info("Shutting down LiteLLM supervisor")
+        try:
+            await supervisor.shutdown()
+        except Exception as exc:
+            LOGGER.warning("LiteLLM shutdown error: %s", exc)
+
+
+def _configure_provider_admission() -> None:
+    """Load provider limits before any request can enter a backend."""
+    from enhanced_router.backends import configure_provider_admission
+    from enhanced_router.provider_admission import ProviderLimits, apply_concurrency_env_override
+    from enhanced_router.registry import get_registry
+
+    registry = get_registry()
+    configured: dict[str, ProviderLimits] = {}
+    for provider_id, provider in registry.providers.items():
+        limits = ProviderLimits(**provider.limits.model_dump())
+        limits = apply_concurrency_env_override(limits, provider.max_concurrency_env)
+        if provider.max_concurrency_env and os.getenv(provider.max_concurrency_env):
+            LOGGER.info(
+                "provider=%s concurrency overridden to %s",
+                provider_id,
+                limits.max_concurrency,
+            )
+        configured[provider_id] = limits
+    configure_provider_admission(configured)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.client = _build_client()
-    # Run the MCP session manager inside the FastAPI lifespan
-    async with control_mcp.session_manager.run():
-        try:
-            yield
-        finally:
-            await app.state.client.aclose()
+    _configure_provider_admission()
+    try:
+        state = get_state()
+        lifecycle = state.reconcile_lifecycle()
+        LOGGER.info("lifecycle reconciliation: %s", lifecycle)
+        from enhanced_router.shadow_worktree import ShadowWorktreeManager
+        integration = ShadowWorktreeManager.reconcile_pending_integrations(state)
+        LOGGER.info("integration reconciliation: %s", integration)
+    except Exception as exc:
+        # Startup remains available for inspection, but readiness/health can
+        # report the reconciliation failure rather than silently losing it.
+        LOGGER.error("state reconciliation failed: %s", exc)
+        app.state.reconciliation_error = str(exc)
+    # Initialize LiteLLM supervisor if key is configured
+    await _init_litellm_supervisor(app)
+    # The mounted Streamable HTTP MCP application owns its request/session
+    # lifecycle.  Do not enter its session manager here: doing so blocks
+    # ordinary FastAPI TestClient/startup and couples provider routing to the
+    # optional control surface.
+    try:
+        yield
+    finally:
+        await _shutdown_litellm(app)
+        await close_upstream_client()
 
 
 app = FastAPI(title="Claude Enhanced Router", docs_url=None, redoc_url=None, lifespan=lifespan)
@@ -88,7 +156,7 @@ app = FastAPI(title="Claude Enhanced Router", docs_url=None, redoc_url=None, lif
 # MCP mount
 # ---------------------------------------------------------------------------
 
-_mcp_asgi = authenticated_mcp_app(control_mcp.streamable_http_app(), get_state())
+_mcp_asgi = authenticated_mcp_app(control_mcp.streamable_http_app(), None)
 app.mount("/mcp", _mcp_asgi)
 
 
@@ -105,8 +173,258 @@ def _require_local(request: Request) -> None:
     peer = request.client.host if request.client else None
     if not _is_loopback(peer):
         raise HTTPException(status_code=403, detail="loopback access only")
-    if ROUTER_TOKEN and request.headers.get("x-enhanced-token") != ROUTER_TOKEN:
+    token = os.getenv(ROUTER_TOKEN_ENV, "")
+    if token and request.headers.get("x-enhanced-token") != token:
         raise HTTPException(status_code=401, detail="invalid router token")
+
+
+@app.post("/internal/fastpath/route")
+async def internal_fastpath_route(request: Request) -> JSONResponse:
+    """Run the optional advisory fastpath on bounded loopback input."""
+    _require_local(request)
+    from enhanced_router.fastpath import FastpathClient, FastpathLimits, FastpathPolicyValidator, FastpathRouteProposal
+    from enhanced_router.registry import get_registry
+    from enhanced_router.backends import _provider_admission
+
+    registry = get_registry()
+    config = registry.fastpath
+    if config is None or not config.enabled or "route" not in config.modes:
+        raise HTTPException(status_code=404, detail="fastpath route mode is disabled")
+    try:
+        packet = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="fastpath packet must be JSON") from exc
+    if not isinstance(packet, dict):
+        raise HTTPException(status_code=400, detail="fastpath packet must be an object")
+    encoded = json.dumps(packet, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if len(encoded) > config.max_packet_bytes:
+        raise HTTPException(status_code=413, detail="fastpath packet exceeds byte limit")
+
+    model = registry.get_model(config.model_id)
+    provider_id = model.provider_id
+    if not provider_id:
+        raise HTTPException(status_code=503, detail="fastpath model has no provider")
+    try:
+        from enhanced_router.endpoint_selection import select_endpoint
+        selected = select_endpoint(
+            config.model_id, model, get_state(), explicit_endpoint=config.endpoint,
+            require_certified=True, provider_id=provider_id,
+            configuration_hash=registry.registry_hash(),
+            # FastpathClient uses a bounded non-streaming JSON completion;
+            # requiring streaming here made a valid structured endpoint look
+            # uncertified and silently disabled the advisory lane.
+            required_capabilities=("messages",),
+        )
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=f"fastpath endpoint is not certified: {exc}") from exc
+
+    client = FastpathClient(
+        api_base=(selected.spec.api_base or model.api_base or "").rstrip("/"),
+        model=(selected.spec.litellm_model or model.litellm_model or config.model_id).removeprefix("openai/"),
+        api_key_env=selected.spec.api_key_env or model.api_key_env or "FREEINFERENCE_API_KEY",
+        limits=FastpathLimits(
+            timeout_seconds=config.timeout_seconds,
+            max_packet_bytes=config.max_packet_bytes,
+        ),
+        system_prompts=config.system_prompts,
+        max_output_tokens=config.max_output_tokens,
+    )
+    request_id = f"fastpath:{packet.get('intake_id', 'unknown')}"
+    try:
+        await _provider_admission.acquire_request(
+            provider_id, request_id, deadline=asyncio.get_running_loop().time() + config.timeout_seconds
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="fastpath provider capacity unavailable") from exc
+    try:
+        result = await client.request("route", packet)
+        proposal = FastpathRouteProposal.model_validate(result)
+        minimum = str(packet.get("deterministic_minimum_tier", "normal"))
+        FastpathPolicyValidator().validate_route(
+            proposal, minimum_tier=minimum, registry=registry, state=get_state(),
+            configuration_hash=registry.registry_hash(),
+            confidence_threshold=config.route_confidence_threshold,
+        )
+        return JSONResponse({
+            **proposal.model_dump(),
+            "validation_status": "accepted_for_controller_review",
+            "fastpath_model_id": config.model_id,
+            "fastpath_endpoint_id": selected.endpoint_id,
+        })
+    except Exception as exc:
+        if config.failure_policy == "fail":
+            raise HTTPException(status_code=502, detail=f"fastpath validation failed: {exc}") from exc
+        return JSONResponse({
+            "validation_status": "bypassed",
+            "validation_reason": str(exc)[:500],
+            "fastpath_model_id": config.model_id,
+            "confidence": 0.0,
+        })
+    finally:
+        await _provider_admission.release_request(request_id)
+
+
+@app.post("/internal/fastpath/verify")
+async def internal_fastpath_verify(request: Request) -> JSONResponse:
+    """Run advisory fastpath verification over an authoritative evidence packet.
+
+    The endpoint deliberately returns a recommendation only.  It never marks
+    a workflow phase, finding, or completion state as satisfied.  Callers may
+    provide ``run_id``/``epoch_id`` to persist the recommendation for audit.
+    """
+    _require_local(request)
+    from enhanced_router.fastpath import (
+        FastpathClient,
+        FastpathLimits,
+        FastpathPolicyValidator,
+        FastpathVerification,
+    )
+    from enhanced_router.registry import get_registry
+    from enhanced_router.backends import _provider_admission
+
+    registry = get_registry()
+    config = registry.fastpath
+    if config is None or not config.enabled or "verify" not in config.modes:
+        raise HTTPException(status_code=404, detail="fastpath verify mode is disabled")
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="fastpath packet must be JSON") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="fastpath packet must be an object")
+    packet = body.get("packet", body)
+    if not isinstance(packet, dict):
+        raise HTTPException(status_code=400, detail="fastpath packet must be an object")
+    encoded = json.dumps(packet, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if len(encoded) > config.max_packet_bytes:
+        raise HTTPException(status_code=413, detail="fastpath packet exceeds byte limit")
+
+    model = registry.get_model(config.model_id)
+    provider_id = model.provider_id
+    if not provider_id:
+        raise HTTPException(status_code=503, detail="fastpath model has no provider")
+    try:
+        from enhanced_router.endpoint_selection import select_endpoint
+
+        selected = select_endpoint(
+            config.model_id,
+            model,
+            get_state(),
+            explicit_endpoint=config.endpoint,
+            require_certified=True,
+            provider_id=provider_id,
+            configuration_hash=registry.registry_hash(),
+            required_capabilities=("messages",),
+        )
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=f"fastpath endpoint is not certified: {exc}") from exc
+
+    client = FastpathClient(
+        api_base=(selected.spec.api_base or model.api_base or "").rstrip("/"),
+        model=(selected.spec.litellm_model or model.litellm_model or config.model_id).removeprefix("openai/"),
+        api_key_env=selected.spec.api_key_env or model.api_key_env or "FREEINFERENCE_API_KEY",
+        limits=FastpathLimits(timeout_seconds=config.timeout_seconds, max_packet_bytes=config.max_packet_bytes),
+        system_prompts=config.system_prompts,
+        max_output_tokens=config.max_output_tokens,
+    )
+    request_id = f"fastpath-verify:{body.get('verification_id', body.get('epoch_id', 'unknown'))}"
+    try:
+        await _provider_admission.acquire_request(
+            provider_id,
+            request_id,
+            deadline=asyncio.get_running_loop().time() + config.timeout_seconds,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="fastpath provider capacity unavailable") from exc
+    try:
+        result = await client.request("verify", packet)
+        verification = FastpathVerification.model_validate(result)
+        FastpathPolicyValidator().validate_verification(
+            verification,
+            packet=packet,
+            deterministic_failed=bool(body.get("deterministic_failed", False)),
+        )
+        response = {
+            **verification.model_dump(),
+            "validation_status": "advisory",
+            "fastpath_model_id": config.model_id,
+            "fastpath_endpoint_id": selected.endpoint_id,
+        }
+        run_id = body.get("run_id")
+        epoch_id = body.get("epoch_id")
+        if isinstance(run_id, str) and isinstance(epoch_id, str):
+            state = get_state()
+            verification_id = str(body.get("verification_id") or f"verify:{request_id}")
+            state.create_fastpath_verification(
+                verification_id=verification_id,
+                run_id=run_id,
+                epoch_id=epoch_id,
+                contract_digest=hashlib.sha256(
+                    json.dumps(packet.get("contract", {}), sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest(),
+                evidence_digest=hashlib.sha256(encoded).hexdigest(),
+                decision=verification.decision,
+                checks_json=json.dumps(verification.checks, sort_keys=True, separators=(",", ":")),
+                violations_json=json.dumps(verification.violations, separators=(",", ":")),
+                confidence=verification.confidence,
+                policy_disposition="advisory",
+            )
+            response["verification_id"] = verification_id
+        return JSONResponse(response)
+    except Exception as exc:
+        if config.failure_policy == "fail":
+            raise HTTPException(status_code=502, detail=f"fastpath verification failed: {exc}") from exc
+        return JSONResponse({
+            "decision": "escalate",
+            "validation_status": "bypassed",
+            "validation_reason": str(exc)[:500],
+            "fastpath_model_id": config.model_id,
+            "confidence": 0.0,
+        })
+    finally:
+        await _provider_admission.release_request(request_id)
+
+
+@app.post("/internal/catalog/sync")
+async def internal_catalog_sync(request: Request) -> JSONResponse:
+    """Synchronize an authenticated provider catalog on explicit request.
+
+    Health and readiness checks never call the provider catalog. Existing
+    bindings remain pinned; only new bindings see the published generation.
+    """
+    _require_local(request)
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid JSON: {exc}") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="catalog sync requires a JSON object")
+    provider_id = body.get("provider_id", "freeinference")
+    endpoint_id = body.get("endpoint_id", "openai")
+    if not isinstance(provider_id, str) or not isinstance(endpoint_id, str):
+        raise HTTPException(status_code=400, detail="provider_id and endpoint_id must be strings")
+    from enhanced_router.registry import get_registry
+
+    registry = get_registry()
+    try:
+        digest, model_count = registry.discover_provider_catalog(
+            provider_id,
+            endpoint_id=endpoint_id,
+            state=get_state(),
+            request_id=request.headers.get("x-request-id"),
+        )
+    except (ValueError, OSError, httpx.HTTPError) as exc:
+        raise HTTPException(status_code=502, detail=f"catalog discovery failed: {exc}") from exc
+    return JSONResponse(
+        status_code=200,
+        content={
+            "provider_id": provider_id,
+            "endpoint_id": endpoint_id,
+            "model_count": model_count,
+            "response_digest": digest,
+            "registry_hash": registry.registry_hash(),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -235,10 +553,6 @@ def _copy_request_headers(request: Request, *, longcat: bool) -> dict[str, str]:
     return headers
 
 
-def _copy_response_headers(headers: httpx.Headers) -> dict[str, str]:
-    return {key: value for key, value in headers.items() if key.lower() not in HOP_BY_HOP}
-
-
 async def _stream_upstream(response: httpx.Response) -> AsyncIterator[bytes]:
     try:
         async for chunk in response.aiter_bytes():
@@ -290,7 +604,7 @@ async def _proxy(request: Request, payload: dict[str, Any], path: str) -> Respon
     agent_id = request.headers.get("x-claude-code-agent-id", "main")
     route = "longcat" if longcat else "anthropic"
 
-    client: httpx.AsyncClient = request.app.state.client
+    client: httpx.AsyncClient = get_upstream_client()
 
     for attempt in range(_MAX_RETRIES):
         started = time.monotonic()
@@ -303,7 +617,7 @@ async def _proxy(request: Request, payload: dict[str, Any], path: str) -> Respon
                 route, session_id, agent_id, attempt, type(exc).__name__,
             )
             if attempt < _MAX_RETRIES - 1:
-                await asyncio.sleep(_RETRY_BASE_DELAY * (2 ** attempt))
+                await asyncio.sleep(max(0.1, _RETRY_BASE_DELAY * (2 ** attempt)))
                 continue
             return JSONResponse(
                 status_code=502,
@@ -316,7 +630,7 @@ async def _proxy(request: Request, payload: dict[str, Any], path: str) -> Respon
         if status in _RETRYABLE_STATUSES and attempt < _MAX_RETRIES - 1:
             retry_after = _parse_retry_after(upstream_response.headers)
             delay = retry_after if retry_after is not None else (_RETRY_BASE_DELAY * (2 ** attempt))
-            delay = min(delay, 30.0)
+            delay = max(0.1, min(delay, 30.0))
             await upstream_response.aclose()
             LOGGER.info(
                 "route=%s session=%s agent=%s status=%s attempt=%s retrying_in=%.1fs",
@@ -330,7 +644,7 @@ async def _proxy(request: Request, payload: dict[str, Any], path: str) -> Respon
             route, payload.get("model"), session_id, agent_id, status, elapsed_ms, attempt,
         )
 
-        response_headers = _copy_response_headers(upstream_response.headers)
+        response_headers = copy_response_headers(upstream_response.headers)
         if is_streaming:
             if status in _RETRYABLE_STATUSES:
                 LOGGER.warning(
@@ -347,7 +661,10 @@ async def _proxy(request: Request, payload: dict[str, Any], path: str) -> Respon
         await upstream_response.aclose()
         return Response(content=content, status_code=status, headers=response_headers)
 
-    return JSONResponse(status_code=502, content={"error": {"type": "upstream_connection_error", "message": "max retries exceeded"}})
+    return JSONResponse(
+        status_code=502,
+        content={"error": {"type": "upstream_request_error", "message": "no upstream response received after all retries"}},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -361,27 +678,99 @@ async def root_probe(request: Request) -> Response:
     return Response(status_code=200)
 
 
+@app.get("/livez")
+async def livez(request: Request) -> Response:
+    _require_local(request)
+    return Response(status_code=200)
+
+
+@app.get("/readyz")
+async def readyz(request: Request) -> Response:
+    _require_local(request)
+    try:
+        from enhanced_router.registry import get_registry
+        registry = get_registry()
+        controller_models = registry.controller_models()
+        if not controller_models:
+            raise RuntimeError("no controller-eligible model is configured")
+        if not any(spec.has_litellm_endpoint() for _, spec in controller_models) and not os.environ.get("ANTHROPIC_API_KEY"):
+            raise RuntimeError("no controller transport is ready")
+        return JSONResponse({"status": "ready"})
+    except Exception as exc:
+        return JSONResponse(status_code=503, content={"status": "not_ready", "reason": str(exc)})
+
+
 @app.get("/healthz")
 async def healthz(request: Request) -> dict[str, Any]:
     _require_local(request)
     try:
-        from enhanced_router.registry import ModelRegistry
-        registry = ModelRegistry()
-        registry.load_models()
-        registry.load_profiles()
-        registry.load_workflows()
+        from enhanced_router.registry import get_registry
+        from enhanced_router.backends import provider_admission_snapshots
+        registry = get_registry()
+        registry_hash = registry.registry_hash()
+
         model_count = len(registry.models)
-        health = {"status": "ok", "gateway": "ok", "mcp": "ok", "litellm": "not_configured"}
-        health["registry_hash"] = registry.registry_hash()
-        health["configured_models"] = model_count
-        health["healthy_models"] = model_count
+        litellm_count = sum(1 for s in registry.models.values() if s.has_litellm_endpoint() and s.enabled)
+        healthy_count = sum(
+            1 for model_id, spec in registry.models.items()
+            if spec.enabled and (state_health := get_state().get_model_health(model_id))
+            and state_health.get("status") == "healthy"
+        )
+
+        # LiteLLM status from supervisor
+        litellm_status = "disabled"
+        litellm_generation = None
+        litellm_port = None
+        supervisor = getattr(app.state, "litellm_supervisor", None)
+        if supervisor is not None:
+            litellm_status = "ready"
+            litellm_generation = supervisor.active_generation
+            litellm_port = supervisor.active_port
+            if litellm_port is None:
+                litellm_status = "starting"
+
+        from enhanced_router.base import BRIGADE_CONFIG_DIR
+
+        health = {
+            "status": "ok",
+            "service": "claude-brigade",
+            "protocol_version": 2,
+            "gateway": "ok",
+            "mcp": "ok",
+            "registry": "ok",
+            "litellm": litellm_status,
+            "litellm_generation": litellm_generation,
+            "litellm_port": litellm_port,
+            "litellm_models_configured": litellm_count,
+            "healthy_models": healthy_count,
+            "configured_models": model_count,
+            "provider_admission": provider_admission_snapshots(),
+            "registry_hash": registry_hash,
+            "daemon_metadata": {
+                "build_hash": "",
+                "registry_hash": registry_hash,
+                "protocol_version": 2,
+                "config_dir": str(BRIGADE_CONFIG_DIR),
+                "pid": os.getpid(),
+            },
+        }
     except Exception as exc:
         health = {
             "status": "degraded",
+            "service": "claude-brigade",
+            "protocol_version": 2,
             "gateway": "ok",
             "mcp": "ok",
-            "litellm": "not_configured",
+            "registry": "error",
+            "litellm": "disabled",
             "registry_error": str(exc),
+            "daemon_metadata": {
+                "build_hash": "",
+                "registry_hash": "",
+                "protocol_version": 2,
+                "config_dir": "",
+                "pid": os.getpid(),
+            },
         }
     return health
 
@@ -389,12 +778,56 @@ async def healthz(request: Request) -> dict[str, Any]:
 @app.get("/v1/models")
 async def models(request: Request) -> dict[str, Any]:
     _require_local(request)
+    from enhanced_router.registry import get_registry
+
+    registry = get_registry()
     entries: list[dict[str, Any]] = [
-        {"id": alias, "display_name": f"Brigade {role.title()}", "type": "model"}
-        for alias, role in ROLE_MODEL_ALIASES.items()
+        {
+            "id": model_id,
+            "display_name": spec.display_name,
+            "type": "model",
+            "provider": spec.provider_id,
+            "controller_eligible": spec.capabilities.controller_eligible,
+            "status": "enabled" if spec.enabled else "disabled",
+            "endpoints": {
+                endpoint_id: {
+                    "provider": endpoint.provider_id or spec.provider_id,
+                    "backend": endpoint.backend,
+                    "protocol": endpoint.protocol,
+                    "certified": endpoint.certified,
+                }
+                for endpoint_id, endpoint in spec.endpoints.items()
+            },
+        }
+        for model_id, spec in sorted(registry.models.items())
+        if spec.enabled
     ]
-    for m in _PASSTHROUGH_MODELS:
-        entries.append({"id": m["id"], "display_name": m["display_name"], "type": "model"})
+    entries.extend(
+        {
+            "id": alias,
+            "display_name": f"Brigade {role.title()}",
+            "type": "model",
+            "controller_eligible": False,
+            "status": "healthy",
+        }
+        for alias, role in sorted(ROLE_MODEL_ALIASES.items())
+    )
+    entries.extend(
+        {
+            "id": alias,
+            "display_name": f"Brigade {alias.removeprefix('anthropic-brigade-').replace('-', ' ').title()}",
+            "type": "model",
+            "provider": (
+                registry.models[ROLE_MODEL_BINDINGS[alias]].provider_id
+                if ROLE_MODEL_BINDINGS[alias] in registry.models
+                else None
+            ),
+            "controller_eligible": False,
+            "status": "healthy",
+            "backing_model": ROLE_MODEL_BINDINGS[alias],
+        }
+        for alias in sorted(ROLE_MODEL_BINDINGS)
+    )
     return {"data": entries, "has_more": False}
 
 
@@ -410,30 +843,21 @@ async def messages(request: Request) -> Response:
 
     model = payload["model"]
 
-    # Never forward a role alias upstream unchanged
-    if model in ROLE_MODEL_ALIASES:
-        resolved: ResolvedRoute = resolve_request(
-            public_model=model,
-            run_id=request.headers.get("x-brigade-run-id"),
-            claude_agent_id=request.headers.get("x-claude-code-agent-id"),
-        )
+    # Identity-first resolution: extract identity, then call resolve_request
+    # which will look up existing bindings BEFORE examining the model string (P0-1).
+    identity = parse_request_identity(request)
 
-        # Build headers once, strip internal Brigade fields
-        raw_headers = {k: v for k, v in request.headers.items()}
-        clean_headers = sanitize_upstream_headers(raw_headers)
+    # Controller model policy enforcement for non-alias models
+    resolved: ResolvedRoute = resolve_request(
+        identity=identity,
+        public_model=model,
+    )
 
-        match resolved.kind:
+    match resolved.kind:
             case BackendType.ANTHROPIC_PASSTHROUGH:
-                # A role alias resolving to passthrough is an internal error
-                # unless the route explicitly targets an Anthropic API model.
-                raise HTTPException(
-                    status_code=500,
-                    detail=(
-                        f"Role alias '{model}' resolved to unexpected passthrough "
-                        f"for model '{resolved.model_id}'. Ensure the model is "
-                        "properly configured in models.yaml."
-                    ),
-                )
+                if resolved.upstream_model:
+                    payload["model"] = resolved.upstream_model
+                return await _proxy_anthropic_passthrough_worker_backend(request, payload, resolved)
 
             case BackendType.DIRECT_ANTHROPIC:
                 if not resolved.upstream_model:
@@ -442,9 +866,7 @@ async def messages(request: Request) -> Response:
                         detail=f"DIRECT_ANTHROPIC route for {model} has no upstream_model.",
                     )
                 payload["model"] = resolved.upstream_model
-                if _is_longcat(resolved.upstream_model):
-                    payload = normalize_longcat_payload(payload)
-                return await _proxy(request, payload, "/v1/messages")
+                return await _proxy_direct_anthropic_backend(request, payload, resolved)
 
             case BackendType.LITELLM:
                 if not resolved.upstream_model:
@@ -453,37 +875,13 @@ async def messages(request: Request) -> Response:
                         detail=f"LITELLM route for {model} has no upstream_model.",
                     )
                 payload["model"] = resolved.upstream_model
-                # LiteLLM backend — uses sanitized headers, not _copy_request_headers
-                return await _proxy_litellm(request, payload, resolved, clean_headers)
+                return await _proxy_litellm_messages_backend(request, payload, resolved)
 
             case _:
                 raise HTTPException(
                     status_code=500,
                     detail=f"Unhandled backend kind: {resolved.kind}",
                 )
-
-    # Legacy LongCat direct model check
-    if _is_longcat(model):
-        return await _proxy(request, payload, "/v1/messages")
-
-    # Standard Anthropic passthrough
-    return await _proxy(request, payload, "/v1/messages")
-
-
-async def _proxy_litellm(
-    request: Request,
-    payload: dict[str, Any],
-    resolved: ResolvedRoute,
-    headers: dict[str, str],
-) -> Response:
-    """Proxy a request through the internal LiteLLM child process.
-
-    Delegates to backends.proxy_litellm_messages(). The role alias model ID
-    has already been replaced with the LiteLLM model-group name in the
-    resolve_request path.
-    """
-    return await _proxy_litellm_messages_backend(request, payload, resolved)
-
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(request: Request) -> Response:

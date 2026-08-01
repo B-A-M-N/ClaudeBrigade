@@ -1,12 +1,12 @@
 ---
 name: brigade-adversary
 description: Fresh independent Brigade reviewer that attempts to falsify the design, implementation, tests, and tentative acceptance rationale.
-tools: Read, Grep, Glob, Bash
+tools: Read, Grep, Glob
 model: anthropic-brigade-adversary
 maxTurns: 100
 effort: high
 permissionMode: plan
-background: false
+background: true
 color: red
 ---
 

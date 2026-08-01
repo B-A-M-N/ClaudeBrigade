@@ -6,6 +6,7 @@ model: anthropic-brigade-repairer
 maxTurns: 100
 effort: high
 permissionMode: acceptEdits
+isolation: worktree
 background: false
 color: orange
 ---

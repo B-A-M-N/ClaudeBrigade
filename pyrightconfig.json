@@ -1,0 +1,9 @@
+{
+  "include": ["router", "hooks"],
+  "extraPaths": ["router", "hooks"],
+  "venvPath": ".",
+  "venv": ".venv",
+  "typeCheckingMode": "basic",
+  "reportMissingImports": "error",
+  "reportMissingModuleSource": "warning"
+}

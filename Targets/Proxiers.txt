@@ -1,0 +1,369 @@
+ByteCatCode & CrowLLM — Infrastructure & Security Analysis
+=============================================================
+
+EXECUTIVE SUMMARY
+-----------------
+Both services are NewAPI (formerly OneAPI) deployments — the same open-source
+AI gateway software. They share identical frontend build fingerprints, near-
+identical configuration, and sequential deployment timing. They are almost
+certainly operated by the same actor.
+
+DO NOT USE AS UPSTREAM PROVIDERS for any production gateway. They are:
+- Key harvesters (collect all upstream provider credentials)
+- Traffic interceptors (log all prompts/responses)
+- Chinese-jurisdiction services (explicit "move to police" threats)
+- Operationally unstable (broken auth, 502 monitoring, nginx timeouts)
+
+=============================================================
+BYTECATCODE — INFRASTRUCTURE
+=============================================================
+
+Network Topology:
+-----------------
+Endpoint                    IP                    Provider          Role
+www.bytecatcode.org         104.16.161.224        Cloudflare        Main frontend
+                            104.19.23.168
+bytecat.lamclod.cn          103.41.5.181          JUNIUYUN-CN (HK)  PRIMARY API (nginx, NO Cloudflare)
+codecdn.bytecatcode.org     185.93.1.245          Bunny CDN         Global acceleration (Chicago)
+code.bytecatcode.org        104.21.78.247         Cloudflare        Backup API
+                            172.67.138.225
+status.bytecatcode.org      Cloudflare            Uptime Kuma       Monitoring (operational)
+
+SSL Certificates:
+-----------------
+- bytecatcode.org:        Google Trust Services, CN=bytecatcode.org
+- www.bytecatcode.org:    Google Trust Services, CN=www.bytecatcode.org
+- codecdn.bytecatcode.org: Let's Encrypt, CN=codecdn.bytecatcode.org
+- code.bytecatcode.org:   Google Trust Services, CN=bytecatcode.org + *.bytecatcode.org
+
+NewAPI Configuration (/api/status):
+-----------------------------------
+{
+  "system_name": "bytecat",
+  "server_address": "https://www.bytecatcode.org",
+  "quota_per_unit": 500000,
+  "usd_exchange_rate": 7.3,
+  "start_time": 1784767465 (2026-07-23 00:44:25 UTC),
+  "quota_display_type": "USD",
+  "custom_currency_symbol": "¤",
+  "custom_currency_exchange_rate": 1,
+  "data_export_default_time": "hour",
+  "default_collapse_sidebar": false,
+  "default_use_auto_group": false,
+  "demo_site_enabled": false,
+  "enable_batch_update": true,
+  "enable_data_export": true,
+  "enable_drawing": true,
+  "enable_task": true,
+  "email_verification": true,
+  "display_in_currency": true,
+  "oidc_enabled": true,
+  "oidc_authorization_endpoint": "https://auth.lamclod.cn/authorize" (BROKEN - DNS fails),
+  "linuxdo_enabled": true,
+  "github_enabled": true,
+  "checkin_enabled": false
+}
+
+Auth Infrastructure:
+--------------------
+- OIDC: auth.lamclod.cn/authorize — DOES NOT RESOLVE
+- GitHub OAuth: client_id Ov23liuTqWmGR1Ivzw7q
+- LinuxDO OAuth: client_id LfwsMzdsy4eFpmEuVlvddwKEgxWU0Cv6
+- Email/password with verification
+
+Monitoring (Uptime Kuma):
+-------------------------
+Public status page: https://status.bytecatcode.org/status/bytecat
+Monitors (15 total):
+  - Website (5): bytecat.lamclod.cn, www.bytecatcode.org, code.bytecatcode.org,
+                 status.bytecatcode.org, codecdn.bytecatcode.org
+  - Claude (7): hybrid, kiro, kiro-备用, max-high, aws-官key, aws-q, max
+  - Codex (2): codex, codex-pro
+  - Gemini (1): gemini
+
+NOTABLE: "aws-官key" = "AWS official key" — suggests reselling AWS Bedrock access
+
+Frontend Build Fingerprint:
+---------------------------
+CSS: 5355.10e003a7e2.css (SHARED with CrowLLM — identical file hash)
+JS:  vendor-ui-primitives.1379b0ed86.js
+     vendor-tanstack.1c1a4fe38c.js
+     lib-react.b4421cb5e9.js
+     5355.d57f74ea6b.js
+     index.a688a047f1.js
+
+Announcements / ToS:
+--------------------
+"本站接口不允许对接沉浸式翻译，酒馆等违法违规，极限高并发服务，如被检测到会进行临时封停处理，多次违规会被永久封禁。"
+(No immersive translate, tavern/roleplay apps; high concurrency triggers temp ban;
+repeat violations = permanent ban)
+
+Notice page: Content filtering enabled ("敏感词拦截"), escalation path:
+警告 → 限制功能 → 临时封禁 → 永久销号 → 移送公安
+(Warn → Restrict → Temp Ban → Permaban → Police Referral)
+
+Pricing: ~$0.003/request for "free" models (DeepSeek, GLM, etc.)
+         500k tokens = 1 unit @ CNY 7.3 (~$1)
+
+Registrant (lamclod.cn):
+------------------------
+- Name: 李伟豪
+- Email: 2070346656@qq.com
+- Registrar: 阿里云计算有限公司 (Alibaba Cloud / HiChina)
+- Registered: 2024-07-14
+- Expires: 2027-07-14
+
+=============================================================
+CROWLLM — INFRASTRUCTURE
+=============================================================
+
+Network Topology:
+-----------------
+Endpoint              IP                    Provider    Role
+crowllm.com           172.67.202.61         Cloudflare  All traffic (frontend + API)
+www.crowllm.com       104.21.90.152         Cloudflare  Same
+docs.crowllm.com      172.67.202.61         Cloudflare  Docusaurus docs
+status.crowllm.com    Cloudflare            Uptime Kuma DOWN (502)
+
+SSL Certificates:
+-----------------
+- crowllm.com:        Google Trust Services, SAN: crowllm.com, mail.crowllm.com, *.mail.crowllm.com
+- www.crowllm.com:    Let's Encrypt, SAN: *.crowllm.com, crowllm.com
+- docs.crowllm.com:   Let's Encrypt, SAN: *.crowllm.com, crowllm.com
+  (www and docs share identical serial: 06D9AEF14315AC46398C3CE28576A7D43EBC)
+
+NewAPI Configuration (/api/status):
+-----------------------------------
+{
+  "system_name": "CrowLLM",
+  "server_address": "https://crowllm.com",
+  "quota_per_unit": 500000,
+  "usd_exchange_rate": 7.3,
+  "start_time": 1784890639 (2026-07-24 10:57:19 UTC),
+  "quota_display_type": "USD",
+  "custom_currency_symbol": "¤",
+  "custom_currency_exchange_rate": 1,
+  "data_export_default_time": "hour",
+  "default_collapse_sidebar": false,
+  "default_use_auto_group": true,
+  "demo_site_enabled": false,
+  "enable_batch_update": true,
+  "enable_data_export": true,
+  "enable_drawing": true,
+  "enable_task": true,
+  "email_verification": true,
+  "display_in_currency": true,
+  "oidc_enabled": false,
+  "linuxdo_enabled": false,
+  "github_enabled": false,
+  "checkin_enabled": true,
+  "discord_client_id": "1499355043823091792",
+  "telegram_bot": "crowllm_auth_bot",
+  "uptime_kuma_enabled": true,
+  "price": 7.3,
+  "stripe_unit_price": 8
+}
+
+Auth Infrastructure:
+--------------------
+- Email/password only
+- Discord OAuth: client_id 1499355043823091792
+- NO GitHub, NO LinuxDO, NO OIDC
+- NO 2FA, NO passkeys (passkey_login: false)
+
+Monitoring:
+-----------
+Uptime Kuma configured but status page returns 502 (non-operational)
+
+Frontend Build Fingerprint:
+---------------------------
+CSS: 814.10e003a7e2.css (IDENTICAL to ByteCatCode — hash 10e003a7e2)
+JS:  vendor-ui-primitives.b17b3046c5.js
+     vendor-tanstack.74c48f25c5.js
+     lib-react.064bab1680.js
+     814.dbaed305a2.js
+     index.14a2b1790b.js
+
+Model Roster (65 models):
+--------------------------
+- 智谱/Zhipu: 22 models (GLM 4.x, 5.x)
+- DeepSeek: 5 models
+- Moonshot: 6 models
+- 阿里巴巴/Qwen: 3 models
+- MiniMax: 2 models
+- xAI/Grok: 4 models
+- OpenAI: 5 models
+- Meta/Ollama: 5 models
+- Mistral: 4 models
+- Google/Gemini: 1 model
+- Agnes: 3 models
+- Gemma: 1 model
+
+Pricing: Almost entirely per-request $0.003-$0.007
+         Only token-based: Gemini 3.1 Flash Lite ($0.035/$0.12 per 1M)
+
+Registrant:
+-----------
+- Domain: crowllm.com
+- Registered: 2026-03-25 via Namecheap
+- Privacy protected (no public WHOIS)
+
+=============================================================
+CORRELATION EVIDENCE — SAME OPERATOR
+=============================================================
+
+1. IDENTICAL FRONTEND BUILD
+   - CSS file hash: 10e003a7e2 (both 5355.10e003a7e2.css and 814.10e003a7e2.css)
+   - Same vendor dependencies (vendor-ui-primitives, vendor-tanstack, lib-react)
+   - Separate production builds (different JS hashes) but same source
+
+2. NEAR-IDENTICAL NEWAPI CONFIG
+   - quota_per_unit: 500000 (both)
+   - usd_exchange_rate: 7.3 (both)
+   - custom_currency_symbol: ¤ (both)
+   - data_export_default_time: "hour" (both)
+   - default_collapse_sidebar: false (both)
+   - All feature flags identical (enable_batch_update, enable_data_export, etc.)
+
+3. SEQUENTIAL DEPLOYMENT
+   - ByteCatCode start_time: 2026-07-23 00:44 UTC
+   - CrowLLM start_time: 2026-07-24 10:57 UTC
+   - Difference: ~34.2 hours
+
+4. SAME ERROR CODEBASE
+   - Both return NewAPI error format on /v1/models: "new_api_error"
+   - ByteCatCode: {"message":"...","success":false}
+   - CrowLLM: {"code":"AUTH_UNAUTHORIZED","message":"...","success":false}
+   - Same /api/setup response: {"data":{"status":true,"root_init":false,"database_type":""},"success":true}
+
+5. SAME PRICING MODEL
+   - Per-request ~$0.003 for "free" Chinese models
+   - CNY 7.3 exchange rate hardcoded in both
+
+6. SAME TARGET MARKET
+   - Both heavily weighted to Chinese providers (Zhipu, DeepSeek, Qwen, Moonshot)
+   - Both use CNY pricing
+
+=============================================================
+SECURITY ASSESSMENT
+=============================================================
+
+Threat Vectors:
+---------------
+| Vector                | ByteCatCode | CrowLLM | Severity |
+|-----------------------|-------------|---------|----------|
+| Key Harvesting        | YES         | YES     | CRITICAL |
+| Traffic Logging       | YES         | YES     | CRITICAL |
+| Content Surveillance  | EXPLICIT    | IMPLIED | HIGH     |
+| Chinese Jurisdiction  | YES         | HIDDEN  | HIGH     |
+| Upstream Key Theft    | INDICATED   | LIKELY  | HIGH     |
+| Broken Auth Infra     | OIDC dead   | Minimal | MEDIUM   |
+| Operational Stability | nginx OK    | 502 Kuma| LOW      |
+
+Key Harvesting Details:
+-----------------------
+NewAPI stores all upstream provider credentials in its database:
+- AWS Bedrock keys (ByteCatCode "aws-官key" channel)
+- Anthropic/Claude keys
+- OpenAI keys
+- Google/Gemini keys
+- Zhipu/GLM keys
+- All other provider API keys
+
+Operator has FULL ACCESS to:
+- All upstream API keys
+- All user prompts and responses
+- All usage logs and analytics
+- All user accounts and tokens
+
+Content Surveillance (ByteCatCode Explicit):
+---------------------------------------------
+- "敏感词拦截" (sensitive word interception)
+- Automatic blocking of "不当言论及有害信息" (inappropriate speech and harmful info)
+- Escalation: 警告 → 限制功能 → 临时封禁 → 永久销号 → 移送公安
+- Bans: "沉浸式翻译、酒馆等违法违规" (immersive translate, tavern/roleplay)
+
+Jurisdiction Risk:
+------------------
+ByteCatCode:
+- Domain: .cn (lamclod.cn) registered via Alibaba Cloud
+- Registrant: Chinese individual (李伟豪), QQ email
+- Primary API IP: 103.41.5.181 (JUNIUYUN-CN, Hong Kong)
+- Announcements in Chinese, QQ groups for support
+- Explicit "移送公安" (refer to police) threat
+
+CrowLLM:
+- Domain: .com via Namecheap (privacy protected)
+- All traffic via Cloudflare (US)
+- Discord-based community
+- English UI but Chinese provider focus
+- Likely same operator, different jurisdictional facade
+
+=============================================================
+OPERATIONAL INDICATORS OF FEEDER OPERATION
+=============================================================
+
+1. BELOW-COST PRICING
+   - $0.003/request for DeepSeek V3/V4, GLM 4.x/5.x
+   - Official API costs exceed this — implies:
+     a) Stolen/compromised upstream keys
+     b) Bulk enterprise agreements being resold
+     c) Loss-leader for user acquisition → data harvesting
+
+2. UPSTREAM CHANNEL NAMES (ByteCatCode Uptime Kuma)
+   - "aws-官key" = "AWS official key" — suggests leaked AWS Bedrock credentials
+   - "hybrid", "kiro", "max-high", "aws-q" — multiple AWS channels
+   - Multiple Codex channels ("codex", "codex-pro")
+   - Suggests systematic credential harvesting from multiple sources
+
+3. AGGRESSIVE ToS ENFORCEMENT
+   - Auto-ban on "高并发" (high concurrency)
+   - Permanent ban + police referral for repeat violations
+   - Designed to prevent scrutiny of upstream usage patterns
+
+4. BROKEN AUTH INFRASTRUCTURE
+   - ByteCatCode OIDC endpoint (auth.lamclod.cn) does not resolve
+   - Security neglect or intentional (no audit trail via OIDC)
+
+5. MINIMAL OPERATIONAL MATURITY
+   - CrowLLM Uptime Kuma: 502 (down)
+   - bytecat.lamclod.cn nginx: frequent timeouts
+   - No proper health endpoints (all return HTML SPA)
+
+=============================================================
+RECOMMENDATIONS FOR UNIFIED-LLM-GATEWAY
+=============================================================
+
+1. BLOCK AT NETWORK LEVEL
+   - 103.41.5.181 (JUNIUYUN-CN — ByteCatCode primary nginx)
+   - 185.93.1.245 (Bunny CDN — ByteCatCode codecdn)
+   - Cloudflare IPs are shared — block via hostname matching
+
+2. DO NOT ADD AS UPSTREAM PROVIDERS
+   - Not independent providers (same NewAPI software)
+   - Not trustworthy (key harvesting, surveillance, CN jurisdiction)
+   - Operationally unreliable (timeouts, broken auth, 502 monitoring)
+
+3. FINGERPRINT FOR DETECTION
+   - Error type: "new_api_error" in /v1/models response
+   - CSS hash: 10e003a7e2 in frontend assets
+   - /api/setup response: {"data":{"status":true,"root_init":false,"database_type":""},"success":true}
+   - /api/status fields: quota_per_unit=500000, usd_exchange_rate=7.3
+
+4. IF TESTING REQUIRED
+   - Use burner API keys only
+   - Assume all traffic logged and analyzed
+   - Assume upstream keys harvested
+   - Do not send sensitive/proprietary prompts
+
+5. ALTERNATIVE FOR CHINESE MODELS
+   - Official APIs: Z.ai (GLM), Alibaba Cloud (Qwen), DeepSeek Platform
+   - Siray.ai: More mature NewAPI deployment with Kong gateway, global PoPs,
+     enterprise support — but still NewAPI-based (same core risks)
+
+=============================================================
+TIMESTAMP
+=============================================================
+Analysis performed: 2026-07-30
+ByteCatCode start_time: 2026-07-23 00:44 UTC
+CrowLLM start_time: 2026-07-24 10:57 UTC

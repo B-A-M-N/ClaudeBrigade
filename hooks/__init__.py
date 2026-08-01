@@ -1,0 +1,1 @@
+"""ClaudeBrigade lifecycle hooks package."""

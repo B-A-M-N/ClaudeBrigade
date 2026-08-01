@@ -1,0 +1,681 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# ClaudeBrigade launcher
+#
+# Canonical paths (accept old CLAUDE_ENHANCED_* as fallback for migration):
+#   APP_DIR     ~/.local/share/claude-brigade         (application code / venv)
+#   PROFILE_DIR ~/.claude-brigade                     (settings, agents, hooks, prompts)
+#   CONFIG_DIR  ~/.config/claude-brigade              (models.yaml, profiles.yaml, tokens, providers.env)
+#   CACHE_DIR   ~/.cache/claude-brigade               (logs, PID files, MCP config)
+#   STATE_DIR   ~/.local/state/claude-brigade          (SQLite databases)
+# ---------------------------------------------------------------------------
+
+APP_DIR="${CLAUDE_BRIGADE_APP_DIR:-${CLAUDE_ENHANCED_APP_DIR:-$HOME/.local/share/claude-brigade}}"
+PROFILE_DIR="${CLAUDE_BRIGADE_PROFILE_DIR:-${CLAUDE_ENHANCED_CONFIG_DIR:-$HOME/.claude-brigade}}"
+CONFIG_DIR="${BRIGADE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-brigade}"
+CACHE_DIR="${BRIGADE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-brigade}"
+STATE_DIR="${BRIGADE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-brigade}"
+TOKEN_FILE="$CONFIG_DIR/router.token"
+PORT_FILE="$CACHE_DIR/router.port"
+_PREFERRED_PORT="${CLAUDE_ENHANCED_PORT:-8787}"
+
+# ---------------------------------------------------------------------------
+# Helper: find free TCP port
+# ---------------------------------------------------------------------------
+
+find_free_port() {
+  python3 - "$1" <<'PY'
+import socket, sys
+start = int(sys.argv[1])
+for port in range(start, start + 200):
+    try:
+        with socket.socket() as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(('127.0.0.1', port))
+        print(port)
+        sys.exit(0)
+    except OSError:
+        pass
+sys.exit('No free port found in range')
+PY
+}
+
+mkdir -p "$CACHE_DIR"
+PROVIDER_KEYS=()
+
+# ---------------------------------------------------------------------------
+# Process lock — prevents concurrent launcher invocations from racing
+# ---------------------------------------------------------------------------
+
+LOCK_FILE="$CACHE_DIR/claude-brigade.lock"
+
+acquire_lock() {
+  exec 200>"$LOCK_FILE"
+  flock -n 200 || {
+    echo "Another launcher instance is running. Exiting." >&2
+    exit 1
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Hardened sandbox profile (BrokeLLM-inspired)
+# ---------------------------------------------------------------------------
+
+# Restrictive umask: newly created files are owner-only (BrokeLLM convention)
+umask 077
+
+# ---------------------------------------------------------------------------
+# Port resolution
+# ---------------------------------------------------------------------------
+
+if [[ -n "${CLAUDE_ENHANCED_PORT:-}" ]]; then
+  PORT="$CLAUDE_ENHANCED_PORT"
+elif [[ -f "$PORT_FILE" ]]; then
+  PORT="$(cat "$PORT_FILE")"
+else
+  PORT="$_PREFERRED_PORT"
+fi
+
+# ---------------------------------------------------------------------------
+# Safe secret reader/writer (BrokeLLM-inspired O_NOFOLLOW protection)
+#
+# Refuses to read or write through symlinks. Uses Python os.O_NOFOLLOW
+# to protect against symlink-based token substitution attacks.
+# ---------------------------------------------------------------------------
+
+_safe_read_token() {
+  # $1 = file path
+  # Validates the file is not a symlink, then reads it.
+  python3 -c "
+import os, sys
+path = sys.argv[1]
+if os.path.islink(path):
+    print('ERROR: token file is a symlink, refusing to read', file=sys.stderr)
+    sys.exit(1)
+print(open(path, 'r').read().strip(), end='')
+" "$1"
+}
+
+_safe_write_secret() {
+  # $1 = file path, $2 = content
+  # Creates file atomically with O_NOFOLLOW | O_EXCL to prevent symlink attacks.
+  python3 -c "
+import os, sys
+path = sys.argv[1]
+content = sys.argv[2]
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_TRUNC
+if hasattr(os, 'O_NOFOLLOW'):
+    flags |= os.O_NOFOLLOW
+# Verify not a symlink
+if os.path.islink(path):
+    print('ERROR: target path is a symlink, refusing to write', file=sys.stderr)
+    sys.exit(1)
+try:
+    fd = os.open(path, flags, 0o600)
+except FileExistsError:
+    # Another process wrote it first — read and return
+    with open(path, 'r') as fh:
+        print(fh.read(), end='')
+    sys.exit(0)
+with os.fdopen(fd, 'w') as fh:
+    fh.write(content)
+os.chmod(path, 0o600)
+" "$1" "$2"
+}
+
+# ---------------------------------------------------------------------------
+# Router token
+# ---------------------------------------------------------------------------
+
+if [[ ! -r "$TOKEN_FILE" ]]; then
+  echo "Missing router token. Re-run the installer." >&2
+  exit 1
+fi
+ROUTER_TOKEN="$(_safe_read_token "$TOKEN_FILE")"
+
+# ---------------------------------------------------------------------------
+# Run ID
+# ---------------------------------------------------------------------------
+
+RUN_ID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+export CLAUDE_BRIGADE_RUN_ID="$RUN_ID"
+CONTROLLER_CAPABILITY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+
+# ---------------------------------------------------------------------------
+# Provider-secret loader (hardened via Python bootstrap_env module)
+#
+# Uses the hardened env_parser.py via bootstrap_env.py to parse providers.env
+# and emit JSON with validated provider environment variables.
+# ---------------------------------------------------------------------------
+
+_load_providers_env() {
+  local providers_file="$CONFIG_DIR/providers.env"
+  if [[ ! -r "$providers_file" ]]; then
+    return 0
+  fi
+
+  # Use a temporary file so NUL-delimited credentials are never passed through
+  # command substitution (which strips NUL bytes) or echoed into a shell.
+  local bootstrap_output
+  bootstrap_output="$(mktemp "$CACHE_DIR/providers.XXXXXX")"
+  if ! "$APP_DIR/venv/bin/python" -m enhanced_router.bootstrap_env \
+      --config-dir "$CONFIG_DIR" --emit-nul >"$bootstrap_output"; then
+    rm -f "$bootstrap_output"
+    echo "ERROR: Failed to parse providers.env" >&2
+    exit 1
+  fi
+
+  while IFS= read -r -d '' pair; do
+    if [[ "$pair" != *=* ]]; then
+      rm -f "$bootstrap_output"
+      echo "ERROR: Bootstrap emitted malformed provider assignment" >&2
+      exit 1
+    fi
+    key="${pair%%=*}"
+    value="${pair#*=}"
+    export "$key=$value"
+    PROVIDER_KEYS+=("$key")
+  done <"$bootstrap_output"
+  rm -f "$bootstrap_output"
+}
+
+# Load providers
+_load_providers_env
+
+# ---------------------------------------------------------------------------
+# LiteLLM internal key
+# ---------------------------------------------------------------------------
+
+LITELLM_TOKEN_FILE="$CONFIG_DIR/litellm.token"
+if [[ -r "$LITELLM_TOKEN_FILE" ]]; then
+  LITELLM_KEY="$(_safe_read_token "$LITELLM_TOKEN_FILE")"
+else
+  LITELLM_KEY="${BRIGADE_LITELLM_KEY:-}"
+  if [[ -z "$LITELLM_KEY" ]]; then
+    LITELLM_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+    mkdir -p "$CONFIG_DIR"
+    _safe_write_secret "$LITELLM_TOKEN_FILE" "$LITELLM_KEY"
+  fi
+fi
+export BRIGADE_LITELLM_KEY="$LITELLM_KEY"
+
+# ---------------------------------------------------------------------------
+# Log rotation (BrokeLLM-inspired)
+#
+# Rotate router.log when it exceeds 10MB, keep 5 backups.
+# ---------------------------------------------------------------------------
+
+ROUTER_LOG="$CACHE_DIR/router.log"
+
+_rotate_log() {
+  local log_file="$1" max_size=10485760 backup_count=5
+  if [[ -f "$log_file" ]]; then
+    local size
+    size=$(stat -c%s "$log_file" 2>/dev/null || echo 0)
+    if (( size > max_size )); then
+      local i
+      for (( i=backup_count-1; i>=1; i-- )); do
+        local prev=$((i-1))
+        if [[ -f "${log_file}.${prev}" ]]; then
+          mv "${log_file}.${prev}" "${log_file}.${i}"
+        fi
+      done
+      mv "$log_file" "${log_file}.0"
+      touch "$log_file"
+      chmod 600 "$log_file" "${log_file}.0" 2>/dev/null || true
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Launch audit trail (BrokeLLM-inspired)
+#
+# Records each launcher invocation to a structured audit log for
+# forensics, compliance, and troubleshooting.
+# ---------------------------------------------------------------------------
+
+AUDIT_LOG="$CACHE_DIR/audit.jsonl"
+
+_audit_launch() {
+  local run_id="$1" port="$2" cwd="$3"
+  # Build provider keys JSON array
+  local pk_json="[]"
+  if [[ ${#PROVIDER_KEYS[@]} -gt 0 ]]; then
+    pk_json="["
+    local first=true
+    for k in "${PROVIDER_KEYS[@]}"; do
+      if $first; then first=false; else pk_json+=","; fi
+      pk_json+="\"$k\""
+    done
+    pk_json+="]"
+  fi
+  python3 -c "
+import json, os, pathlib, time, hashlib, sys
+
+path = pathlib.Path(sys.argv[1])
+entry = {
+    'ts': int(time.time()),
+    'run_id': sys.argv[2],
+    'port': int(sys.argv[3]),
+    'cwd': sys.argv[4],
+    'pid': os.getpid(),
+    'provider_keys_loaded': json.loads(sys.argv[5]),
+    'router_token_hash': hashlib.sha256(sys.argv[6].encode()).hexdigest()[:16],
+}
+path.parent.mkdir(parents=True, exist_ok=True)
+with path.open('a') as fh:
+    fh.write(json.dumps(entry) + '\n')
+path.chmod(0o600)
+" "$AUDIT_LOG" "$RUN_ID" "$PORT" "$PWD" "$pk_json" "$ROUTER_TOKEN"
+}
+
+# ---------------------------------------------------------------------------
+# Export Brigade path variables early (needed for pre-registration and router)
+# ---------------------------------------------------------------------------
+
+export BRIGADE_CONFIG_DIR="$CONFIG_DIR"
+export BRIGADE_STATE_DIR="$STATE_DIR"
+export BRIGADE_CACHE_DIR="$CACHE_DIR"
+
+# ---------------------------------------------------------------------------
+# Pre-register the run before starting the router (avoids MCP startup race)
+# ---------------------------------------------------------------------------
+
+if "$APP_DIR/venv/bin/python" -c "from enhanced_router.state import get_state; from enhanced_router.base import DEFAULT_DB_PATH; print('registrant ok')" 2>/dev/null; then
+  "$APP_DIR/venv/bin/python" - "$RUN_ID" "$PWD" "$CONTROLLER_CAPABILITY" <<'PY' 2>/dev/null || true
+import os, sys
+from enhanced_router.state import get_state
+state = get_state()
+rid = sys.argv[1]
+cwd = sys.argv[2]
+capability = sys.argv[3]
+state.create_run(rid, session_id=None, cwd=cwd, controller_capability=capability)
+PY
+fi
+
+# ---------------------------------------------------------------------------
+# Router health check / start
+# ---------------------------------------------------------------------------
+
+BANNED_ENV_KEYS=(
+  ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL
+  ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
+  ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL
+  CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_SUBAGENT_MODEL
+  CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
+  # BrokeLLM-inspired: block all provider API keys to prevent cross-provider
+  # leakage. Provider-specific keys are loaded for the router only and unset
+  # before Claude Code starts.
+  OPENROUTER_API_KEY DEEPSEEK_API_KEY GROQ_API_KEY GLM_API_KEY
+  OPENAI_API_KEY MISTRAL_API_KEY CEREBRAS_API_KEY COHERE_API_KEY
+  REPLICATE_API_KEY PALM_API_KEY VERTEX_PROJECT
+)
+
+# Helper: compare daemon_metadata from a healthz response with our current
+# environment.  Returns 0 (match) when all four hashes align, meaning the
+# existing daemon is compatible and can be reused.
+_daemon_metadata_matches() {
+  local healthz_json="$1"
+  python3 - "$healthz_json" "$ROUTER_TOKEN" "$CONFIG_DIR" "$ROUTER_TOKEN" <<'PY'
+import json, hashlib, sys, os
+
+healthz_text = sys.argv[1]
+token = sys.argv[2]
+config_dir = sys.argv[3]
+router_token = sys.argv[4]
+
+try:
+    data = json.loads(healthz_text)
+except json.JSONDecodeError:
+    sys.exit(1)
+
+meta = data.get("daemon_metadata")
+if meta is None:
+    sys.exit(1)  # pre-v2 daemon — treat as mismatch
+
+# 1. Build hash (empty string from daemon means always match)
+daemon_build = meta.get("build_hash", "")
+
+# 2. Registry hash — compare with current config dir content
+config_dir_actual = meta.get("config_dir", "")
+if config_dir_actual:
+    combined = ""
+    import pathlib
+    cfg = pathlib.Path(config_dir_actual)
+    if cfg.is_dir():
+        for fpath in sorted(cfg.glob("*.yaml")):
+            combined += fpath.name + "=" + fpath.read_text(encoding="utf-8")
+    current_hash = hashlib.sha256(combined.encode("utf-8")).hexdigest()
+    if current_hash != meta.get("registry_hash", ""):
+        sys.exit(1)
+
+# 3. Protocol version must be >= 2
+proto = meta.get("protocol_version", 0)
+if proto < 2:
+    sys.exit(1)
+
+# 4. Provider environment digest — compare loaded provider keys
+prov_file = os.path.join(config_dir_actual, "providers.env") if config_dir_actual else ""
+prov_hash = ""
+if prov_file and os.path.isfile(prov_file):
+    # Hash only the key names (not values) to detect config changes
+    key_names = sorted([
+        line.split("=", 1)[0].strip()
+        for line in open(prov_file)
+        if "=" in line and not line.startswith("#") and line.strip()
+    ])
+    prov_hash = hashlib.sha256(",".join(key_names).encode()).hexdigest()
+
+if daemon_build or prov_hash:
+    pass  # non-empty hashes are informational; mismatch is detected by config_hash
+
+sys.exit(0)
+PY
+}
+
+acquire_lock
+
+health_url="http://127.0.0.1:${PORT}/healthz"
+HEALTHZ_RESPONSE="$(curl -fsS -H "X-Enhanced-Token: $ROUTER_TOKEN" "$health_url" 2>/dev/null || true)"
+
+if [[ -n "$HEALTHZ_RESPONSE" ]]; then
+  if _daemon_metadata_matches "$HEALTHZ_RESPONSE"; then
+    # Existing daemon is compatible — reuse it
+    echo "$PORT" > "$PORT_FILE"
+  else
+    # Metadata mismatch or stale daemon — kill and restart
+    if [[ -f "$CACHE_DIR/router.pid" ]]; then
+      OLD_PID="$(cat "$CACHE_DIR/router.pid")"
+      if kill -0 "$OLD_PID" 2>/dev/null; then
+        kill "$OLD_PID" 2>/dev/null || true
+        # Give it a moment to exit
+        sleep 0.5
+        kill -9 "$OLD_PID" 2>/dev/null || true
+      fi
+    fi
+    PORT="$(find_free_port "$_PREFERRED_PORT")"
+    echo "$PORT" > "$PORT_FILE"
+    health_url="http://127.0.0.1:${PORT}/healthz"
+
+    # Rotate router log before starting fresh
+    _rotate_log "$ROUTER_LOG"
+
+    # Provider keys are passed to the router process, NOT to Claude Code
+    # Build env array for nohup: banned keys are unset, Brigade paths set
+    nohup env \
+      ENHANCED_ROUTER_TOKEN="$ROUTER_TOKEN" \
+      BRIGADE_LITELLM_KEY="$LITELLM_KEY" \
+      BRIGADE_CONFIG_DIR="$CONFIG_DIR" \
+      BRIGADE_STATE_DIR="$STATE_DIR" \
+      BRIGADE_CACHE_DIR="$CACHE_DIR" \
+      OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}" \
+      DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-}" \
+      GLM_API_KEY="${GLM_API_KEY:-}" \
+      ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
+      FREEINFERENCE_API_KEY="${FREEINFERENCE_API_KEY:-}" \
+      PYTHONPATH="$APP_DIR/router" \
+      "$APP_DIR/venv/bin/python" -m uvicorn enhanced_router.app:app \
+        --host 127.0.0.1 --port "$PORT" --no-access-log \
+        >"$CACHE_DIR/router.log" 2>&1 &
+    echo $! >"$CACHE_DIR/router.pid"
+    for _ in {1..50}; do
+      if curl -fsS -H "X-Enhanced-Token: $ROUTER_TOKEN" "$health_url" > /dev/null 2>&1; then
+        break
+      fi
+      sleep 0.1
+    done
+  fi
+else
+  # No existing daemon — start fresh
+  PORT="$(find_free_port "$_PREFERRED_PORT")"
+  echo "$PORT" > "$PORT_FILE"
+  health_url="http://127.0.0.1:${PORT}/healthz"
+
+  # Rotate router log before starting fresh
+  _rotate_log "$ROUTER_LOG"
+
+  # Provider keys are passed to the router process, NOT to Claude Code
+  # Build env array for nohup: banned keys are unset, Brigade paths set
+  nohup env \
+    ENHANCED_ROUTER_TOKEN="$ROUTER_TOKEN" \
+    BRIGADE_LITELLM_KEY="$LITELLM_KEY" \
+    BRIGADE_CONFIG_DIR="$CONFIG_DIR" \
+    BRIGADE_STATE_DIR="$STATE_DIR" \
+    BRIGADE_CACHE_DIR="$CACHE_DIR" \
+    OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}" \
+    DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-}" \
+    GLM_API_KEY="${GLM_API_KEY:-}" \
+    ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
+    FREEINFERENCE_API_KEY="${FREEINFERENCE_API_KEY:-}" \
+    PYTHONPATH="$APP_DIR/router" \
+    "$APP_DIR/venv/bin/python" -m uvicorn enhanced_router.app:app \
+      --host 127.0.0.1 --port "$PORT" --no-access-log \
+      >"$CACHE_DIR/router.log" 2>&1 &
+  echo $! >"$CACHE_DIR/router.pid"
+  for _ in {1..50}; do
+    if curl -fsS -H "X-Enhanced-Token: $ROUTER_TOKEN" "$health_url" > /dev/null 2>&1; then
+      break
+    fi
+    sleep 0.1
+  done
+fi
+
+if ! curl -fsS -H "X-Enhanced-Token: $ROUTER_TOKEN" "$health_url" > /dev/null 2>&1; then
+  echo "Router failed to start. See $CACHE_DIR/router.log" >&2
+  exit 1
+fi
+
+# Release the launcher lock — router is running; concurrent launchers
+# can share the same daemon with different run IDs.
+flock -u 200 2>/dev/null || true
+exec 200>&-
+
+# ---------------------------------------------------------------------------
+# Sanitize Claude Code environment
+#
+# Provider keys must NOT reach Claude Code or its Bash subprocesses.
+# They exist only in the router process.
+# ---------------------------------------------------------------------------
+
+for _key in "${BANNED_ENV_KEYS[@]}"; do
+  unset "$_key" 2>/dev/null || true
+done
+
+# Also unset provider keys that were loaded for the router
+for _key in "${PROVIDER_KEYS[@]}"; do
+  unset "$_key" 2>/dev/null || true
+done
+
+# Ensure Claude Code cannot pick up provider keys from the parent shell
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL
+unset ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
+unset ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL
+unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_SUBAGENT_MODEL
+unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
+# BrokeLLM-inspired: unset all common provider keys
+unset OPENROUTER_API_KEY DEEPSEEK_API_KEY GROQ_API_KEY GLM_API_KEY
+unset OPENAI_API_KEY MISTRAL_API_KEY CEREBRAS_API_KEY COHERE_API_KEY
+unset REPLICATE_API_KEY PALM_API_KEY VERTEX_PROJECT
+export CLAUDE_CODE_FORK_SUBAGENT=0
+export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+
+# ---------------------------------------------------------------------------
+# Export Brigade path variables for hooks and downstream processes
+#
+# NOTE: BRIGADE_CONFIG_DIR, BRIGADE_STATE_DIR, BRIGADE_CACHE_DIR
+# are already exported above (before pre-registration).  Only the
+# python-path and profile dir are set here.
+# ---------------------------------------------------------------------------
+
+CLAUDE_BRIGADE_PYTHON="$APP_DIR/venv/bin/python"
+export CLAUDE_BRIGADE_PYTHON
+export CLAUDE_CONFIG_DIR="$PROFILE_DIR"
+
+ROUTER_BASE_URL="http://127.0.0.1:${PORT}"
+
+# ---------------------------------------------------------------------------
+# Session settings (passed to Claude Code process)
+#
+# NOTE: BRIGADE_LITELLM_KEY is deliberately NOT included here.
+# It is only available in the router and LiteLLM child processes.
+# ---------------------------------------------------------------------------
+
+SESSION_SETTINGS_JSON="$(
+  python3 - "$ROUTER_BASE_URL" "$CLAUDE_BRIGADE_PYTHON" "$RUN_ID" "$BRIGADE_CONFIG_DIR" "$BRIGADE_STATE_DIR" "$BRIGADE_CACHE_DIR" "$ROUTER_TOKEN" <<'PY'
+import json
+import sys
+
+router_url, python_path, run_id, config_dir, state_dir, cache_dir, router_token = sys.argv[1:8]
+
+print(json.dumps({
+    "env": {
+        "ANTHROPIC_BASE_URL": router_url,
+        "ANTHROPIC_AUTH_TOKEN": router_token,
+        "CLAUDE_BRIGADE_PYTHON": python_path,
+        "CLAUDE_BRIGADE_RUN_ID": run_id,
+        "BRIGADE_CONFIG_DIR": config_dir,
+        "BRIGADE_STATE_DIR": state_dir,
+        "BRIGADE_CACHE_DIR": cache_dir,
+    }
+}))
+PY
+)"
+
+export ANTHROPIC_BASE_URL="$ROUTER_BASE_URL"
+export ANTHROPIC_AUTH_TOKEN="$ROUTER_TOKEN"
+export ANTHROPIC_CUSTOM_HEADERS="$(
+  printf 'X-Enhanced-Token: %s\nX-Brigade-Run-Id: %s' \
+    "$ROUTER_TOKEN" \
+    "$RUN_ID"
+)"
+
+# ---------------------------------------------------------------------------
+# Controller selection and conflicting CLI flags
+# ---------------------------------------------------------------------------
+
+# --model is deliberately passed through: Claude Code's active main model is
+# the controller. --controller-model is a Brigade-friendly spelling that is
+# translated to the same Claude Code flag.
+CLAUDE_ARGS=()
+CONTROLLER_MODEL=""
+while [ "$#" -gt 0 ]; do
+  argument="$1"
+  case "$argument" in
+    --controller-model=*)
+      CONTROLLER_MODEL="${argument#*=}"
+      ;;
+    --controller-model)
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "--controller-model requires a model ID" >&2
+        exit 2
+      fi
+      CONTROLLER_MODEL="$1"
+      ;;
+    --model=*)
+      requested_model="${argument#*=}"
+      CLAUDE_ARGS+=("--model" "$requested_model")
+      ;;
+    --model)
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "--model requires a model ID" >&2
+        exit 2
+      fi
+      requested_model="$1"
+      CLAUDE_ARGS+=("--model" "$requested_model")
+      ;;
+    --agent|--agent=*|--agents|--agents=*|--fallback-model|--fallback-model=*|--system-prompt|--system-prompt=*|--system-prompt-file|--system-prompt-file=*|--append-system-prompt-file|--append-system-prompt-file=*|--settings|--settings=*|--setting-sources|--setting-sources=*|--permission-mode|--permission-mode=*|--dangerously-skip-permissions|--allow-dangerously-skip-permissions)
+      echo "claude-brigade owns $argument to preserve the agent and system contract." >&2
+      echo "Use --model or --controller-model to select the active controller." >&2
+      exit 2
+      ;;
+    *)
+      CLAUDE_ARGS+=("$argument")
+      ;;
+  esac
+  shift
+done
+
+if [ -n "$CONTROLLER_MODEL" ]; then
+  CLAUDE_ARGS+=(--model "$CONTROLLER_MODEL")
+  requested_model="$CONTROLLER_MODEL"
+fi
+
+if [ -n "${requested_model:-}" ]; then
+  if ! PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" - "$requested_model" <<'PY'
+import sys
+from enhanced_router.registry import get_registry
+
+model_id = sys.argv[1]
+registry = get_registry()
+try:
+    spec = registry.get_model(model_id)
+except KeyError as exc:
+    raise SystemExit(f"controller model '{model_id}' is not present in the active registry") from exc
+if not spec.enabled:
+    raise SystemExit(f"controller model '{model_id}' is disabled")
+if not (spec.capabilities.controller_eligible or spec.backend == "anthropic-passthrough"):
+    raise SystemExit(f"controller model '{model_id}' is not controller-compatible")
+PY
+  then
+    exit 2
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Agents JSON
+# ---------------------------------------------------------------------------
+
+AGENTS_JSON="$(
+  PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" -m enhanced_router.agents_json "$PROFILE_DIR/agents"
+)"
+
+# ---------------------------------------------------------------------------
+# MCP configuration (temp file, cleaned up after Claude exits)
+# ---------------------------------------------------------------------------
+
+MCP_CONFIG_JSON="$CACHE_DIR/mcp-${RUN_ID}.json"
+python3 - "$ROUTER_TOKEN" "$RUN_ID" "$PORT" "$MCP_CONFIG_JSON" "$CONTROLLER_CAPABILITY" <<'PY'
+import json, os, sys
+token, run_id, port, path, controller_capability = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+config = {
+    "mcpServers": {
+        "claude-brigade": {
+            "type": "http",
+            "url": f"http://127.0.0.1:{port}/mcp",
+            "headers": {
+                "X-Enhanced-Token": token,
+                "X-Brigade-Run-Id": run_id,
+                "X-Brigade-Principal-Kind": "controller",
+                "X-Brigade-Controller-Capability": controller_capability,
+            },
+        }
+    }
+}
+with open(path, 'w') as f:
+    json.dump(config, f, separators=(',', ':'))
+os.chmod(path, 0o600)
+PY
+
+# ---------------------------------------------------------------------------
+# Launch Claude Code as a foreground child (not exec, so trap runs)
+# ---------------------------------------------------------------------------
+
+# Record launch audit event
+_audit_launch "$RUN_ID" "$PORT" "$PWD"
+
+set +e
+claude \
+  --settings "$SESSION_SETTINGS_JSON" \
+  --agents "$AGENTS_JSON" \
+  --mcp-config "$MCP_CONFIG_JSON" \
+  --append-system-prompt-file "$PROFILE_DIR/controller-append.md" \
+  "${CLAUDE_ARGS[@]}"
+_EXIT_CODE=$?
+set -e
+
+rm -f "$MCP_CONFIG_JSON"
+exit "$_EXIT_CODE"

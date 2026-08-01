@@ -1,5 +1,7 @@
 __pycache__/
 .pytest_cache/
+.test-venv/
+*.egg-info/
 test_out.txt
 *.pyc
 .env*
@@ -8,3 +10,7 @@ longcat.env
 *.pid
 *.swp
 *.swo
+!.env.example
+providers.env
+.coverage
+SHA256SUMS.tmp

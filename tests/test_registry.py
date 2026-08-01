@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import pathlib
 
 import pytest
@@ -32,6 +31,7 @@ def valid_registry(config_dir: pathlib.Path) -> ModelRegistry:
                 "display_name": "Model A",
                 "backend": "direct-anthropic",
                 "upstream_model": "ModelA-v1",
+                    "api_base": "https://api.test.com/anthropic",
                 "capabilities": {"tools": True, "mutation": True, "context_tokens": 100000, "reasoning": "high", "local": False},
                 "allowed_roles": ["recon", "implementer", "adversary", "repairer"],
             },
@@ -39,6 +39,7 @@ def valid_registry(config_dir: pathlib.Path) -> ModelRegistry:
                 "display_name": "Model B",
                 "backend": "direct-anthropic",
                 "upstream_model": "ModelB-v1",
+                    "api_base": "https://api.test.com/anthropic",
                 "capabilities": {"tools": True, "mutation": False, "context_tokens": 50000, "reasoning": "medium", "local": True},
                 "allowed_roles": ["recon", "adversary"],
             },
@@ -46,6 +47,7 @@ def valid_registry(config_dir: pathlib.Path) -> ModelRegistry:
                 "display_name": "Model C",
                 "backend": "direct-anthropic",
                 "upstream_model": "ModelC-v1",
+                    "api_base": "https://api.test.com/anthropic",
                 "capabilities": {"tools": False, "mutation": False, "context_tokens": 10000, "reasoning": "low", "local": False},
                 "allowed_roles": ["recon"],
             },
@@ -81,6 +83,7 @@ class TestModelRegistryLoad:
                     "display_name": "M1",
                     "backend": "direct-anthropic",
                     "upstream_model": "M1Up",
+                    "api_base": "https://api.test.com/anthropic",
                     "capabilities": {"tools": True, "mutation": True, "context_tokens": 1000, "reasoning": "high", "local": False},
                     "allowed_roles": ["recon"],
                 },
@@ -99,7 +102,7 @@ class TestModelRegistryLoad:
     def test_load_workflows(self, config_dir, valid_registry):
         workflows = valid_registry.workflows
         assert "normal" in workflows
-        assert workflows["normal"]["default_profile"] == "default"
+        assert workflows["normal"].default_profile == "default"
 
     def test_missing_models_file(self, tmp_path):
         reg = ModelRegistry(tmp_path / "nonexistent")
@@ -151,6 +154,7 @@ class TestModelRegistryLookup:
                     "display_name": "Enabled",
                     "backend": "direct-anthropic",
                     "upstream_model": "E",
+                    "api_base": "https://api.test.com/anthropic",
                     "capabilities": {"tools": True, "mutation": True, "context_tokens": 1000, "reasoning": "high", "local": False},
                     "allowed_roles": ["recon"],
                     "enabled": True,
@@ -159,6 +163,7 @@ class TestModelRegistryLookup:
                     "display_name": "Disabled",
                     "backend": "direct-anthropic",
                     "upstream_model": "D",
+                    "api_base": "https://api.test.com/anthropic",
                     "capabilities": {"tools": True, "mutation": True, "context_tokens": 1000, "reasoning": "high", "local": False},
                     "allowed_roles": ["recon"],
                     "enabled": False,
@@ -202,6 +207,7 @@ class TestModelRegistryRecommend:
                     "display_name": "Remote",
                     "backend": "direct-anthropic",
                     "upstream_model": "R",
+                    "api_base": "https://api.test.com/anthropic",
                     "capabilities": {"tools": True, "mutation": True, "context_tokens": 1000, "reasoning": "high", "local": False},
                     "allowed_roles": ["recon"],
                 },
@@ -209,6 +215,7 @@ class TestModelRegistryRecommend:
                     "display_name": "Local",
                     "backend": "direct-anthropic",
                     "upstream_model": "L",
+                    "api_base": "https://api.test.com/anthropic",
                     "capabilities": {"tools": True, "mutation": True, "context_tokens": 1000, "reasoning": "high", "local": True},
                     "allowed_roles": ["recon"],
                 },
@@ -229,6 +236,7 @@ class TestProfileCrossReference:
                     "display_name": "Valid",
                     "backend": "direct-anthropic",
                     "upstream_model": "V",
+                    "api_base": "https://api.test.com/anthropic",
                     "capabilities": {"tools": True, "mutation": True, "context_tokens": 1000, "reasoning": "high", "local": False},
                     "allowed_roles": ["recon"],
                 },

@@ -13,8 +13,17 @@ dependencies = [
     "mcp>=1.27,<2",
     "PyYAML>=6.0,<7",
     "uvicorn>=0.34,<1",
+    "litellm[proxy]==1.93.0",
 ]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0,<9", "pytest-asyncio>=0.25,<1", "pytest-cov>=6.0,<7"]
 
 [tool.setuptools.packages.find]
 where = ["router"]
 include = ["enhanced_router*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = [".", "router", "hooks"]

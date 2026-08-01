@@ -1,0 +1,29 @@
+[project]
+name = "freeinference-litellm"
+version = "0.1.0"
+description = "Local BYOK LiteLLM integration kit for FreeInference"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.28,<1",
+    "litellm[proxy]==1.93.0",
+    "pyyaml>=6.0,<7",
+    "rich>=13,<15",
+    "typer>=0.16,<1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9", "pytest-asyncio>=0.25,<1"]
+
+[project.scripts]
+fi-litellm = "fi_litellm.cli:app"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

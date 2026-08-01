@@ -1,9 +1,6 @@
 import json
-import pathlib
-import io
-import pytest
 from completion_guard import main as completion_guard_main, validate_ledger_sequence
-from guard_tool import main as guard_tool_main, MUTATING_BASH
+from guard_tool import _is_read_only_shell, main as guard_tool_main, MUTATING_BASH
 
 
 def test_guard_tool_mutating_bash_regex():
@@ -19,6 +16,14 @@ def test_guard_tool_mutating_bash_regex():
     assert MUTATING_BASH.search("ls -la") is None
     assert MUTATING_BASH.search("grep -rn 'foo' .") is None
     assert MUTATING_BASH.search("pytest") is None
+
+
+def test_read_only_shell_boundary_rejects_hidden_writers():
+    assert _is_read_only_shell("git status") is True
+    assert _is_read_only_shell("rg -n TODO router") is True
+    assert _is_read_only_shell("./existing-script.sh") is False
+    assert _is_read_only_shell("python3 -c 'open(\\\"x\\\", \\\"w\\\")'") is False
+    assert _is_read_only_shell("find . -exec touch marker 'x'") is False
 
 
 def test_subagent_allowlist_denies_unauthorized_role(monkeypatch):
@@ -38,9 +43,37 @@ def test_subagent_allowlist_denies_unauthorized_role(monkeypatch):
     assert "not in the authorized enhanced subagent allowlist" in denied_reasons[0]
 
 
+def test_agent_spawn_requires_a_cooperative_action_claim(tmp_path, monkeypatch):
+    class FakeState:
+        def get_active_epoch(self, run_id):
+            return {"epoch_id": "ep-1"}
+
+        def consume_runnable_action_for_spawn(self, run_id, epoch_id, native_agent_name, *, action_id=None):
+            return None
+
+    monkeypatch.setenv("CLAUDE_BRIGADE_RUN_ID", "run-1")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / ".cache"))
+    monkeypatch.setattr("enhanced_router.state.get_state", lambda: FakeState())
+    monkeypatch.setattr("guard_tool.deny", lambda reason: denied_reasons.append(reason))
+    denied_reasons = []
+    monkeypatch.setattr(
+        "sys.stdin",
+        io_string_stream(json.dumps({
+            "tool_name": "Agent",
+            "tool_input": {"subagent_type": "brigade-recon"},
+            "session_id": "claimed-agent-test",
+        })),
+    )
+
+    guard_tool_main()
+
+    assert len(denied_reasons) == 1
+    assert "get_runnable_actions" in denied_reasons[0]
+
+
 def test_completion_guard_mutation_triggered_gate(tmp_path, monkeypatch):
     session_id = "test-session-mutation"
-    cache_dir = tmp_path / ".cache" / "claude-enhanced"
+    cache_dir = tmp_path / ".cache" / "claude-brigade"
     session_dir = cache_dir / "sessions" / session_id
     session_dir.mkdir(parents=True)
 
@@ -89,17 +122,17 @@ def test_cross_cutting_requires_impl_adversary(tmp_path):
             f.write(json.dumps(e) + "\n")
 
     records = [
-        {"event": "SubagentStart", "agent_id": "1", "agent_type": "brigade-recon"},
-        {"event": "SubagentStop", "agent_id": "1", "agent_type": "brigade-recon"},
-        {"event": "SubagentStart", "agent_id": "2", "agent_type": "brigade-implementer"},
-        {"event": "SubagentStop", "agent_id": "2", "agent_type": "brigade-implementer"},
+        {"event": "SubagentStart", "agent_id": "1", "agent_type": "brigade-recon", "epoch_id": active_epoch_id},
+        {"event": "SubagentStop", "agent_id": "1", "agent_type": "brigade-recon", "epoch_id": active_epoch_id},
+        {"event": "SubagentStart", "agent_id": "2", "agent_type": "brigade-implementer", "epoch_id": active_epoch_id},
+        {"event": "SubagentStop", "agent_id": "2", "agent_type": "brigade-implementer", "epoch_id": active_epoch_id},
     ]
     (session_dir / "agents.jsonl").write_text("\n".join(json.dumps(r) for r in records) + "\n")
 
     parsed = {
         "Workflow-Tier": "cross-cutting",
         "Implementation-Agent": "brigade-implementer",
-        "Sonnet-Diff-Review": "passed",
+        "Controller-Diff-Review": "passed",
         "Adversarial-Review": "passed",
         "Accepted-Findings": "none",
         "Verification": "passed",
@@ -111,13 +144,20 @@ def test_cross_cutting_requires_impl_adversary(tmp_path):
     assert "Cross-cutting work requires an implementation adversary review" in err
 
 
-def test_model_resolution_mismatch_is_rejected(tmp_path):
-    session_dir = tmp_path / "session_model_mismatch"
+def test_model_resolution_accepts_legitimate_models(tmp_path):
+    """After removing the broken model-resolution validation, legitimate
+    upstream model names (e.g. litellm or direct-anthropic model IDs) must
+    no longer cause false-positive rejections.
+
+    The agent type itself is the guarantee of correct routing — resolved_model
+    can be any upstream model name.
+    """
+    session_dir = tmp_path / "session_model_ok"
     session_dir.mkdir()
-    active_epoch_id = "ep_model"
+    active_epoch_id = "ep_model_ok"
 
     ledger_events = [
-        {"event": "AgentResult", "epoch_id": active_epoch_id, "subagent_type": "brigade-implementer", "status": "completed", "resolved_model": "gpt-4-oops"},
+        {"event": "AgentResult", "epoch_id": active_epoch_id, "subagent_type": "brigade-implementer", "status": "completed", "resolved_model": "LongCat-2.0"},
         {"event": "SubagentStart", "epoch_id": active_epoch_id, "agent_type": "brigade-implementer"},
         {"event": "SubagentStop", "epoch_id": active_epoch_id, "agent_type": "brigade-implementer"},
     ]
@@ -126,15 +166,15 @@ def test_model_resolution_mismatch_is_rejected(tmp_path):
             f.write(json.dumps(e) + "\n")
 
     records = [
-        {"event": "SubagentStart", "agent_id": "1", "agent_type": "brigade-implementer"},
-        {"event": "SubagentStop", "agent_id": "1", "agent_type": "brigade-implementer"},
+        {"event": "SubagentStart", "agent_id": "1", "agent_type": "brigade-implementer", "epoch_id": active_epoch_id},
+        {"event": "SubagentStop", "agent_id": "1", "agent_type": "brigade-implementer", "epoch_id": active_epoch_id},
     ]
     (session_dir / "agents.jsonl").write_text("\n".join(json.dumps(r) for r in records) + "\n")
 
     parsed = {
         "Workflow-Tier": "normal",
         "Implementation-Agent": "brigade-implementer",
-        "Sonnet-Diff-Review": "passed",
+        "Controller-Diff-Review": "passed",
         "Adversarial-Review": "not-required",
         "Accepted-Findings": "none",
         "Verification": "passed",
@@ -142,13 +182,12 @@ def test_model_resolution_mismatch_is_rejected(tmp_path):
     }
 
     err = validate_ledger_sequence(parsed, session_dir, active_epoch_id)
-    assert err is not None
-    assert "Model resolution mismatch" in err
+    assert err is None, f"Expected no error for legitimate upstream model, got: {err}"
 
 
 def test_bounded_stop_hook_retries(tmp_path, monkeypatch):
     session_id = "test-stop-retry"
-    cache_dir = tmp_path / ".cache" / "claude-enhanced"
+    cache_dir = tmp_path / ".cache" / "claude-brigade"
     session_dir = cache_dir / "sessions" / session_id
     session_dir.mkdir(parents=True)
 
@@ -177,13 +216,22 @@ def test_bounded_stop_hook_retries(tmp_path, monkeypatch):
     monkeypatch.setattr("sys.stdin", io_string_stream(stdin_str))
     completion_guard_main()
 
-    # Attempt 3 - Max retries reached, should allow exit (return 0) without blocking
+    # Attempt 3 - Max retries reached, assistant still claims success
+    stdin_str = json.dumps(payload)
+    monkeypatch.setattr("sys.stdin", io_string_stream(stdin_str))
+    res = completion_guard_main()
+
+    # Should still block (message says "Enhanced-Completion: yes", not "failed")
+    assert len(blocked_reasons) == 3
+
+    # Attempt 4 - Assistant acknowledges failure, should allow exit
+    payload["last_assistant_message"] = "Enhanced-Completion: failed"
     stdin_str = json.dumps(payload)
     monkeypatch.setattr("sys.stdin", io_string_stream(stdin_str))
     res = completion_guard_main()
 
     assert res == 0
-    assert len(blocked_reasons) == 2
+    assert len(blocked_reasons) == 3  # No additional block
 
 
 class io_string_stream:

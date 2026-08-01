@@ -6,6 +6,7 @@ model: anthropic-brigade-implementer
 maxTurns: 140
 effort: high
 permissionMode: acceptEdits
+isolation: worktree
 background: false
 color: green
 ---

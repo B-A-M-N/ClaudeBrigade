@@ -1,7 +1,5 @@
-import pathlib
 import subprocess
-import pytest
-from workspace_fingerprint import fingerprint, repository_root, git_has_head
+from workspace_fingerprint import fingerprint, git_has_head
 
 
 def test_fingerprint_with_head(tmp_path):

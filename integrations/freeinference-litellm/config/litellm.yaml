@@ -1,0 +1,18 @@
+model_list:
+  - model_name: glm-5.1
+    litellm_params:
+      model: openai/glm-5.1
+      api_base: https://freeinference.org/v1
+      api_key: os.environ/FREEINFERENCE_API_KEY
+
+litellm_settings:
+  drop_params: false
+  num_retries: 0
+  request_timeout: 600
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+model_group_settings:
+  forward_client_headers_to_llm_api:
+    - glm-5.1

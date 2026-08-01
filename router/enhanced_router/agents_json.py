@@ -77,7 +77,7 @@ def render_agents(directory: pathlib.Path) -> dict[str, dict[str, Any]]:
         if name in agents:
             raise ValueError(f"Duplicate agent name: {name}")
         agents[name] = definition
-    REQUIRED_ROLES = {"brigade-recon", "brigade-implementer", "brigade-adversary", "brigade-repairer", "sonnet-direct"}
+    REQUIRED_ROLES = {"brigade-recon", "brigade-implementer", "brigade-adversary", "brigade-repairer", "controller-direct"}
     EXPECTED_MODELS = {
         "brigade-recon": "anthropic-brigade-recon",
         "brigade-implementer": "anthropic-brigade-implementer",

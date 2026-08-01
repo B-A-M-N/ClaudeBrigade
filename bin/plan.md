@@ -87,14 +87,12 @@ Tracking: `meta/M09-release.md`
 
 ## Progress
 
-<!-- Update this section as milestones are completed -->
-
-- [ ] M01: Generic role agents and stable aliases
-- [ ] M02: Model and profile registry
-- [ ] M03: SQLite route state
-- [ ] M04: MCP control server
-- [ ] M05: Gateway role-alias routing
-- [ ] M06: LiteLLM child service
-- [ ] M07: Hook and evidence-ledger integration
-- [ ] M08: Workflow engine
-- [ ] M09: Branding, migration, documentation, E2E
+- [x] M01: Generic role agents and stable aliases — `meta/M01-role-migration.md`
+- [x] M02: Model and profile registry — `meta/M02-registry.md`
+- [x] M03: SQLite route state — `meta/M03-route-state.md`
+- [x] M04: MCP control server — `meta/M04-mcp-control.md`
+- [x] M05: Gateway role-alias routing — `meta/M05-gateway-routing.md`
+- [x] M06: LiteLLM child service — `meta/M06-litellm.md`
+- [x] M07: Hook and evidence-ledger integration — `meta/M07-hooks.md`
+- [x] M08: Workflow engine — `meta/M08-workflow-engine.md`
+- [x] M09: Branding, migration, documentation, E2E

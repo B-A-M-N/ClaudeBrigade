@@ -1,12 +1,12 @@
 ---
 name: brigade-recon
 description: Proactively maps repositories and gathers evidence before designs cross-cutting or high-risk changes.
-tools: Read, Grep, Glob, Bash
+tools: Read, Grep, Glob
 model: anthropic-brigade-recon
 maxTurns: 60
 effort: high
 permissionMode: plan
-background: false
+background: true
 color: blue
 ---
 

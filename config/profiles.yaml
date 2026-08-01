@@ -1,4 +1,28 @@
 profiles:
+  freeinference:
+    recon: qwen3.6-35b
+    implementer: kimi-k2.7-code
+    adversary: glm-5.1
+    repairer: glm-5-turbo
+    specialists:
+      fast-scout:
+        model: qwen3.6-35b
+        roles: [recon]
+        latency_class: fast
+      broad-architect:
+        model: minimax-m3
+        roles: [recon, adversary]
+        activation: long_context_or_multimodal
+      coding-implementer:
+        model: kimi-k2.7-code
+        roles: [implementer]
+      correctness-reviewer:
+        model: glm-5.1
+        roles: [adversary]
+      fast-repairer:
+        model: glm-5-turbo
+        roles: [repairer]
+
   longcat:
     recon: longcat-2
     implementer: longcat-2
@@ -8,11 +32,35 @@ profiles:
   local-first:
     recon: qwen-local
     implementer: qwen-local
-    adversary: glm-review
+    adversary: glm-5.1
     repairer: qwen-local
 
   hybrid:
     recon: qwen-local
-    implementer: longcat-2
-    adversary: glm-review
-    repairer: longcat-2
+    implementer: glm-5.1
+    adversary: glm-5.1
+    repairer: glm-5-turbo
+
+  nvidia-nim:
+    recon: nvidia-nemotron-3-ultra
+    implementer: nvidia-nemotron-3-ultra
+    adversary: nvidia-llama-3.1-405b
+    repairer: nvidia-llama-3.1-70b
+
+  opencode-zen:
+    recon: opencode-zen-sonnet
+    implementer: opencode-zen-sonnet
+    adversary: opencode-zen-opus
+    repairer: opencode-zen-haiku
+
+  opencode-go:
+    recon: opencode-go-sonnet
+    implementer: opencode-go-sonnet
+    adversary: opencode-go-opus
+    repairer: opencode-go-sonnet
+
+  kilocode-free:
+    recon: kilocode-deepseek-v3
+    implementer: ling-3.0-flash
+    adversary: kilocode-mistral-nemo
+    repairer: kilocode-llama-3.1-8b

@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+set -u
+
+PROFILE_DIR="${CLAUDE_BRIGADE_PROFILE_DIR:-${CLAUDE_ENHANCED_CONFIG_DIR:-$HOME/.claude-brigade}}"
+APP_DIR="${CLAUDE_BRIGADE_APP_DIR:-${CLAUDE_ENHANCED_APP_DIR:-$HOME/.local/share/claude-brigade}}"
+CONFIG_DIR="${BRIGADE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-brigade}"
+CACHE_DIR="${BRIGADE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-brigade}"
+PORT_FILE="$CACHE_DIR/router.port"
+if [[ -n "${CLAUDE_ENHANCED_PORT:-}" ]]; then
+  PORT="$CLAUDE_ENHANCED_PORT"
+elif [[ -f "$PORT_FILE" ]]; then
+  PORT="$(cat "$PORT_FILE")"
+else
+  PORT="${CLAUDE_ENHANCED_PORT:-8787}"
+fi
+failed=0
+
+ok() { printf 'OK   %s\n' "$*"; }
+warn() { printf 'WARN %s\n' "$*"; }
+fail() { printf 'FAIL %s\n' "$*"; failed=1; }
+
+if command -v claude >/dev/null 2>&1; then
+  version="$(claude --version 2>/dev/null | head -n1)"
+  ok "Claude Code found: $version"
+else
+  fail "Claude Code is not on PATH"
+fi
+
+if [[ -x "$APP_DIR/venv/bin/python" ]]; then
+  if "$APP_DIR/venv/bin/python" -c "import fastapi, uvicorn, httpx, yaml, mcp" 2>/dev/null; then
+    ok "Router dependencies importable"
+  else
+    fail "Router dependencies missing or incomplete; run install.sh"
+  fi
+else
+  fail "Router virtual environment missing; run install.sh"
+fi
+
+for file in "$PROFILE_DIR/settings.json" \
+            "$PROFILE_DIR/controller-append.md" \
+            "$CONFIG_DIR/router.token" \
+            "$CONFIG_DIR/providers.env" \
+            "$CONFIG_DIR/litellm.token"; do
+  if [[ -r "$file" ]]; then
+    ok "$file"
+  else
+    fail "Missing $file"
+  fi
+done
+
+for agent in brigade-recon brigade-implementer brigade-adversary brigade-repairer controller-direct; do
+  if [[ -r "$PROFILE_DIR/agents/$agent.md" ]]; then
+    ok "Agent file: $agent.md"
+  else
+    fail "Missing agent file: $agent.md"
+  fi
+done
+
+if [[ -r "$CONFIG_DIR/providers.env" ]]; then
+  if "$APP_DIR/venv/bin/python" -m enhanced_router.bootstrap_env --config-dir "$CONFIG_DIR" --emit-nul >/dev/null 2>&1; then
+    ok "Provider environment parses successfully"
+  else
+    fail "providers.env could not be parsed"
+  fi
+  for _key in FREEINFERENCE_API_KEY LONGCAT_API_KEY OPENROUTER_API_KEY DEEPSEEK_API_KEY GLM_API_KEY; do
+    if grep -q "^${_key}=" "$CONFIG_DIR/providers.env" && ! grep -q "^${_key}=replace_me" "$CONFIG_DIR/providers.env" && ! grep -q "^${_key}=$" "$CONFIG_DIR/providers.env"; then
+      ok "Provider key $_key is configured"
+    fi
+  done
+  mode="$(stat -c '%a' "$CONFIG_DIR/providers.env" 2>/dev/null || true)"
+  [[ "$mode" == "600" ]] && ok "providers.env mode is 0600" || warn "providers.env mode is $mode; run chmod 600"
+fi
+
+if [[ -r "$CONFIG_DIR/providers.yaml" ]]; then
+  ok "Provider limits configuration is present"
+else
+  fail "Missing $CONFIG_DIR/providers.yaml"
+fi
+
+if [[ -r "$STATE_DIR/state.db" && -x "$APP_DIR/venv/bin/python" ]]; then
+  if "$APP_DIR/venv/bin/python" - "$STATE_DIR/state.db" <<'PY' >/dev/null 2>&1
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+PY
+  then
+    ok "SQLite foreign-key integrity is clean"
+  else
+    fail "SQLite foreign-key integrity check failed"
+  fi
+fi
+
+if [[ -r "$CONFIG_DIR/litellm.token" ]]; then
+  mode="$(stat -c '%a' "$CONFIG_DIR/litellm.token" 2>/dev/null || true)"
+  [[ "$mode" == "600" ]] && ok "litellm.token mode is 0600" || warn "litellm.token mode is $mode; run chmod 600"
+fi
+
+if command -v claude >/dev/null 2>&1; then
+  if env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY \
+         -u CLAUDE_CODE_OAUTH_TOKEN -u CLAUDE_CODE_USE_BEDROCK \
+         -u CLAUDE_CODE_USE_VERTEX -u CLAUDE_CODE_USE_FOUNDRY \
+         -u ANTHROPIC_MODEL \
+      CLAUDE_CONFIG_DIR="$PROFILE_DIR" claude auth status --text >/dev/null 2>&1; then
+    ok "Separate Claude profile is authenticated"
+  else
+    warn "Separate Claude profile is not authenticated; run claude-brigade-login"
+  fi
+fi
+
+profile_base_url="$(
+  python3 - "$PROFILE_DIR/settings.json" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    print(data.get("env", {}).get("ANTHROPIC_BASE_URL", ""))
+except Exception:
+    print("")
+PY
+)"
+
+if [[ -n "$profile_base_url" ]]; then
+  fail "Profile hardcodes ANTHROPIC_BASE_URL=$profile_base_url; the launcher must own the dynamic router URL"
+fi
+
+if [[ -r "$CONFIG_DIR/router.token" ]] && curl -fsS \
+    -H "X-Enhanced-Token: $(cat "$CONFIG_DIR/router.token")" \
+    "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then
+  ok "Loopback router is healthy on 127.0.0.1:$PORT"
+
+  models_json="$(
+    curl -fsS \
+      -H "X-Enhanced-Token: $(cat "$CONFIG_DIR/router.token")" \
+      "http://127.0.0.1:${PORT}/v1/models"
+  )" || models_json=""
+
+  if grep -q '"anthropic-brigade-recon"' <<<"$models_json" &&
+     grep -q '"anthropic-brigade-implementer"' <<<"$models_json" &&
+     grep -q '"anthropic-brigade-adversary"' <<<"$models_json" &&
+     grep -q '"anthropic-brigade-repairer"' <<<"$models_json" &&
+     grep -q '"claude-sonnet-5"' <<<"$models_json"; then
+    ok "Expected Brigade models are advertised"
+  else
+    fail "Router is not serving the expected Brigade model inventory"
+  fi
+else
+  warn "Router is not running; claude-brigade starts it automatically"
+fi
+
+if [[ -f "$CACHE_DIR/router.log" ]]; then
+  ok "Router log: $CACHE_DIR/router.log"
+fi
+
+exit "$failed"

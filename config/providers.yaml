@@ -1,0 +1,43 @@
+providers:
+  freeinference:
+    display_name: FreeInference
+    api_key_env: FREEINFERENCE_API_KEY
+    max_concurrency_env: FREEINFERENCE_MAX_CONCURRENCY
+    endpoints:
+      anthropic: https://freeinference.org/anthropic
+      openai: https://freeinference.org/v1
+    limits:
+      # One operator-facing knob. Both agent and upstream request admission use it.
+      # The controller consumes one slot when it is a FreeInference model.
+      max_concurrency: 4
+      max_active_agents: 4
+      max_inflight_requests: 4
+      max_queued_agents: 8
+      queue_timeout_seconds: 20
+    deadlines:
+      time_to_first_token_seconds: 45
+      stream_idle_seconds: 90
+      request_wall_seconds: 600
+      agent_wall_seconds: 900
+    retry:
+      max_attempts: 2
+      retryable_statuses: [429, 502, 503, 529]
+      max_backoff_seconds: 15
+
+  openrouter:
+    display_name: OpenRouter
+    api_key_env: OPENROUTER_API_KEY
+    endpoints:
+      openai: https://openrouter.ai/api/v1
+    discovery:
+      type: openai-models
+      url: https://openrouter.ai/api/v1/models
+    limits:
+      max_concurrency: 2
+      max_queued_agents: 4
+      queue_timeout_seconds: 20
+    retry:
+      max_attempts: 1
+      retryable_statuses: [429, 500, 502, 503, 504]
+      max_backoff_seconds: 10
+    routing_owner: brigade
