@@ -73,50 +73,55 @@ models:
     capabilities: {tools: true, mutation: true, reasoning: high, local: false}
     allowed_roles: [recon, implementer, adversary, repairer]
 
-  # Opencode Zen (via Cline API)
+  # OpenCode Zen (OpenAI-compatible free and paid catalog)
   opencode-zen-sonnet:
     display_name: Sonnet 4 (Opencode Zen)
+    provider_id: opencode-zen
     backend: litellm
-    litellm_model: openai/claude-sonnet-4
-    api_base: https://api.cline.bot/api/v1
-    api_key_env: CLINE_API_KEY
+    litellm_model: openai/claude-sonnet-4-5
+    api_base: https://opencode.ai/zen/v1
+    api_key_env: OPENCODE_API_KEY
     capabilities: {tools: true, mutation: true, reasoning: high, local: false}
     allowed_roles: [recon, implementer, adversary, repairer]
 
   opencode-zen-opus:
     display_name: Opus 4 (Opencode Zen)
+    provider_id: opencode-zen
     backend: litellm
-    litellm_model: openai/claude-opus-4
-    api_base: https://api.cline.bot/api/v1
-    api_key_env: CLINE_API_KEY
+    litellm_model: openai/claude-opus-4-5
+    api_base: https://opencode.ai/zen/v1
+    api_key_env: OPENCODE_API_KEY
     capabilities: {tools: true, mutation: true, reasoning: high, local: false}
     allowed_roles: [recon, implementer, adversary, repairer]
 
   opencode-zen-haiku:
     display_name: Haiku 3.5 (Opencode Zen)
+    provider_id: opencode-zen
     backend: litellm
-    litellm_model: openai/claude-haiku-3.5
-    api_base: https://api.cline.bot/api/v1
-    api_key_env: CLINE_API_KEY
+    litellm_model: openai/claude-haiku-4-5
+    api_base: https://opencode.ai/zen/v1
+    api_key_env: OPENCODE_API_KEY
     capabilities: {tools: true, mutation: true, reasoning: medium, local: false}
     allowed_roles: [recon, implementer, adversary, repairer]
 
-  # Opencode Go (via ClinePass)
+  # OpenCode Go
   opencode-go-sonnet:
-    display_name: Sonnet 4 (Opencode Go)
+    display_name: Kimi K2.7 Code (Opencode Go)
+    provider_id: opencode-go
     backend: litellm
-    litellm_model: openai/claude-sonnet-4
-    api_base: https://api.cline.bot/api/v1
-    api_key_env: CLINEPASS_API_KEY
+    litellm_model: openai/kimi-k2.7-code
+    api_base: https://opencode.ai/zen/go/v1
+    api_key_env: OPENCODEGO_API_KEY
     capabilities: {tools: true, mutation: true, reasoning: high, local: false}
     allowed_roles: [recon, implementer, adversary, repairer]
 
   opencode-go-opus:
-    display_name: Opus 4 (Opencode Go)
+    display_name: GLM 5.2 (Opencode Go)
+    provider_id: opencode-go
     backend: litellm
-    litellm_model: openai/claude-opus-4
-    api_base: https://api.cline.bot/api/v1
-    api_key_env: CLINEPASS_API_KEY
+    litellm_model: openai/glm-5.2
+    api_base: https://opencode.ai/zen/go/v1
+    api_key_env: OPENCODEGO_API_KEY
     capabilities: {tools: true, mutation: true, reasoning: high, local: false}
     allowed_roles: [recon, implementer, adversary, repairer]
 

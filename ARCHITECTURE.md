@@ -9,9 +9,19 @@ controller.
 
 ClaudeBrigade is a loopback proxy and control plane for Claude Code. The
 router runs on `127.0.0.1` and never receives provider infrastructure
-credentials from FreeInference itself. The user supplies provider keys in the
-local provider environment; the router owns those keys and Claude Code gets
-only a per-run local router credential.
+credentials from a provider itself. The user supplies provider keys through
+the interactive configuration CLI. The preferred store is the OS keyring;
+the owner-readable `providers.env` file is a compatibility fallback for
+headless installations. The router owns loaded keys and Claude Code gets only
+a per-run local router credential.
+
+The controller/native-agent inference profile and sidecar profile are
+independent configuration lanes. A named inference profile chooses the
+controller and native roles, including ordered model/provider fallbacks. A
+named sidecar chooses a bounded read-only model call. Multiple named key slots
+may be configured for one provider and rotated round-robin independently of
+model/provider fallback. A deployment can therefore change models, providers,
+or credentials without conflating those decisions.
 
 The optional `integrations/freeinference-litellm` package is a reusable local
 LiteLLM integration kit. It discovers the models available to the user's
@@ -135,6 +145,13 @@ available.
 Provider settings are configurable in `config/providers.yaml` and may be
 overridden through the provider-specific environment variable. FreeInference
 credentials remain process-local.
+
+Provider discovery is catalog-driven. The bundled provider definitions include
+OpenRouter plus the configured Kilo/Crush, OpenCode Zen/Go, Cline, NVIDIA NIM,
+FreeInference, FreeTheAI, Requesty, and FreeModel routes. The interactive CLI
+can refresh compatible `/models` catalogs and stores discovered model metadata
+separately from hand-authored registry authority. Search in the CLI filters
+the loaded catalog by model ID, description, and provider.
 
 ## Execution lanes and native-agent ownership
 
@@ -267,8 +284,15 @@ completion evidence.
 
 ## Credential and protocol rules
 
-- Provider keys are loaded from the hardened provider parser and isolated from
-  Claude Code.
+- Provider keys are loaded from the OS keyring when available, with the
+  hardened `providers.env` parser as a compatibility fallback, and isolated
+  from Claude Code.
+- Multiple key slots for one provider remain separate router/LiteLLM
+  deployments under the same logical model group. Round-robin key rotation is
+  independent from ordered model/provider fallback.
+- Secret values never appear in YAML model/sidecar configuration, catalog
+  metadata, statusline output, or audit logs. Only slot names and availability
+  are persisted outside the credential backend.
 - Internal router and Brigade headers are stripped before upstream dispatch.
 - Supported provider protocol headers are forwarded only under endpoint policy.
 - LiteLLM uses explicit provider namespaces such as `openai/model` for generic

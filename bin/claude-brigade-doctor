@@ -71,6 +71,15 @@ if [[ -r "$CONFIG_DIR/providers.env" ]]; then
   [[ "$mode" == "600" ]] && ok "providers.env mode is 0600" || warn "providers.env mode is $mode; run chmod 600"
 fi
 
+if [[ -x "$APP_DIR/venv/bin/python" ]]; then
+  keyring_status="$($APP_DIR/venv/bin/python -c 'from enhanced_router.credential_store import backend_label; print(backend_label())' 2>/dev/null || true)"
+  if [[ -n "$keyring_status" ]]; then
+    ok "OS credential store available: $keyring_status"
+  else
+    warn "No usable OS credential store; claude-brigade-config will use providers.env fallback"
+  fi
+fi
+
 if [[ -r "$CONFIG_DIR/providers.yaml" ]]; then
   ok "Provider limits configuration is present"
 else

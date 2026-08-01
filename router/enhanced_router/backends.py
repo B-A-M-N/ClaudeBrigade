@@ -34,6 +34,21 @@ class ProviderAuthSpec(BaseModel):
     header_name: str | None = None
 
 
+def _credential_value(key_name: str | None) -> str | None:
+    """Resolve a router-local rotating credential without exposing it upstream."""
+    if not key_name:
+        return None
+    try:
+        from enhanced_router.credential_store import resolve_loaded
+
+        value = resolve_loaded(key_name)
+        if value:
+            return value
+    except Exception:
+        pass
+    return os.environ.get(key_name) or None
+
+
 def resolve_provider_auth(
     api_key_env: str | None,
     auth_spec: ModelAuthSpec | None = None,
@@ -89,7 +104,7 @@ def _resolve_pinned_auth(
             env = api_key_env
             if not env:
                 raise ValueError("No api_key_env in binding for credential lookup")
-            key = os.environ.get(env)
+            key = _credential_value(env)
             if not key:
                 raise ValueError(f"API key env var '{env}' is not set")
             header = spec.effective_header()
@@ -104,7 +119,7 @@ def _resolve_pinned_auth(
     auth = resolve_provider_auth(api_key_env, None)
     if auth.type == "none" or not auth.env:
         raise ValueError("No credential configured")
-    key = os.environ.get(auth.env)
+    key = _credential_value(auth.env)
     if not key:
         raise ValueError(f"API key env var '{auth.env}' is not set")
     if auth.header_name == "x-api-key":

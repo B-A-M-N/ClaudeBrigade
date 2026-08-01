@@ -46,6 +46,16 @@ ALLOWED_PROVIDER_KEYS = frozenset({
     "REPLICATE_API_KEY",
     "PALM_API_KEY",
     "VERTEX_PROJECT",
+    "KILO_API_KEY",
+    "CLINE_API_KEY",
+    "CLINEPASS_API_KEY",
+    "OPENCODE_API_KEY",
+    "OPENCODEGO_API_KEY",
+    "NVIDIA_API_KEY",
+    "OLLAMA_API_KEY",
+    "FREETHEAI_API_KEY",
+    "REQUESTY_API_KEY",
+    "FREEMODEL_API_KEY",
 })
 
 # Provider keys that should be passed to the router process (not Claude Code)
@@ -58,7 +68,23 @@ PROVIDER_KEYS_FOR_ROUTER = frozenset({
     "DEEPSEEK_API_KEY",
     "GLM_API_KEY",
     "ANTHROPIC_API_KEY",
+    "KILO_API_KEY",
+    "CLINE_API_KEY",
+    "CLINEPASS_API_KEY",
+    "OPENCODE_API_KEY",
+    "OPENCODEGO_API_KEY",
+    "NVIDIA_API_KEY",
+    "OLLAMA_API_KEY",
+    "FREETHEAI_API_KEY",
+    "REQUESTY_API_KEY",
+    "FREEMODEL_API_KEY",
 })
+
+# Only API credentials belong in the OS keyring.  Non-secret tuning values
+# such as FREEINFERENCE_MAX_CONCURRENCY remain ordinary configuration.
+PROVIDER_SECRET_KEYS = frozenset(
+    key for key in ALLOWED_PROVIDER_KEYS if key.endswith("_API_KEY")
+)
 
 
 @dataclass(frozen=True)
@@ -87,6 +113,38 @@ def load_providers_env(config_dir: Path) -> BootstrapResult:
     provider_keys = list(router_env.keys())
 
     return BootstrapResult(router_env, tuple(provider_keys))
+
+
+def load_router_credentials(config_dir: Path) -> BootstrapResult:
+    """Load router credentials with the OS keyring taking precedence.
+
+    ``providers.env`` is retained as a migration path for existing installs,
+    but new credentials saved by the configuration CLI live in the OS
+    keyring.  This function is called inside the router process, so keyring
+    values never need to pass through the launcher shell or Claude Code.
+    """
+    file_result = load_providers_env(config_dir) if (config_dir / "providers.env").exists() else BootstrapResult({}, ())
+    merged = dict(file_result.provider_env)
+    keyring_keys: tuple[str, ...] = ()
+    try:
+        from enhanced_router.credential_store import all_materialized, resolve
+
+        secure = {
+            key: value
+            for key in PROVIDER_SECRET_KEYS
+            if (value := resolve(key, config_dir))
+        }
+        # LiteLLM receives generated slot-specific names inside the router
+        # process so a model group can load several keys without exposing
+        # them to Claude Code or the launcher shell.
+        secure.update(all_materialized(config_dir, PROVIDER_SECRET_KEYS))
+        merged.update(secure)
+        keyring_keys = tuple(sorted(set(secure) & set(PROVIDER_SECRET_KEYS)))
+    except Exception:
+        # A missing desktop keyring must not make a legacy file-only install
+        # unusable.  The CLI reports the fallback explicitly when saving.
+        pass
+    return BootstrapResult(merged, tuple(sorted(set(file_result.provider_keys) | set(keyring_keys))))
 
 
 def main() -> int:

@@ -21,6 +21,9 @@ failure paths, not merely exercise happy-path syntax.
   for controller-only operations, create the active controller binding.
 - New authority, lifecycle, retry, workspace, or completion behavior needs a
   negative test for wrong actor/resource, replay, stale state, or failure.
+- Credential tests must mock the keyring backend, never contain real secrets,
+  and must verify that slot names/availability can be shown without exposing
+  values. Cover both same-provider key rotation and model/provider fallback.
 - Preserve the project import convention: `enhanced_router` is loaded from
   `router/`, and hook modules are loaded from `hooks/` via `conftest.py`.
 

@@ -64,30 +64,35 @@ def generate_litellm_config(
                 alias = f"brigade-{spec.deployment_group or model_id}"
             else:
                 alias = f"brigade-{model_id}--{endpoint_id}" if spec.endpoints else f"brigade-{model_id}"
-            entry: dict[str, Any] = {
-                "model_name": alias,
-                "litellm_params": {"model": litellm_model},
-                "model_info": {
-                    "logical_model_id": model_id,
-                    "deployment_group": spec.deployment_group or model_id,
-                    "deployment_id": endpoint_id,
-                    "provider_id": endpoint.provider_id or spec.provider_id,
-                    "priority": getattr(endpoint, "priority", 0),
-                    "routing_mode": spec.routing_mode,
-                },
-            }
+            credential_envs = _credential_env_names(endpoint.api_key_env)
+            for credential_env in credential_envs:
+                entry: dict[str, Any] = {
+                    "model_name": alias,
+                    "litellm_params": {"model": litellm_model},
+                    "model_info": {
+                        "logical_model_id": model_id,
+                        "deployment_group": spec.deployment_group or model_id,
+                        "deployment_id": endpoint_id,
+                        "provider_id": endpoint.provider_id or spec.provider_id,
+                        "priority": getattr(endpoint, "priority", 0),
+                        "routing_mode": spec.routing_mode,
+                    },
+                }
 
-            # API base — static URL or env var reference
-            if endpoint.api_base:
-                entry["litellm_params"]["api_base"] = endpoint.api_base
-            elif endpoint.api_base_env:
-                entry["litellm_params"]["api_base"] = f"os.environ/{endpoint.api_base_env}"
+                # API base — static URL or env var reference
+                if endpoint.api_base:
+                    entry["litellm_params"]["api_base"] = endpoint.api_base
+                elif endpoint.api_base_env:
+                    entry["litellm_params"]["api_base"] = f"os.environ/{endpoint.api_base_env}"
 
-            # API key — always via env var, never materialized
-            if endpoint.api_key_env:
-                entry["litellm_params"]["api_key"] = f"os.environ/{endpoint.api_key_env}"
+                # API keys remain env references. Named key slots become
+                # equivalent LiteLLM deployments in the same model group.
+                if credential_env:
+                    entry["litellm_params"]["api_key"] = f"os.environ/{credential_env}"
+                    if credential_env != endpoint.api_key_env:
+                        entry["model_info"]["credential_env"] = credential_env
 
-            model_list.append(entry)
+                model_list.append(entry)
 
     config: dict[str, Any] = {
         "model_list": model_list,
@@ -107,6 +112,25 @@ def generate_litellm_config(
     }
 
     return yaml.dump(config, default_flow_style=False, sort_keys=False)
+
+
+def _credential_env_names(api_key_env: str | None) -> list[str | None]:
+    if not api_key_env:
+        return [None]
+    try:
+        from enhanced_router.credential_store import materialized_env_name, slot_names
+
+        slots = slot_names(api_key_env)
+        materialized: list[str | None] = [
+            materialized_env_name(api_key_env, slot)
+            for slot in slots
+            if os.environ.get(materialized_env_name(api_key_env, slot))
+        ]
+        if materialized:
+            return materialized
+    except Exception:
+        pass
+    return [api_key_env]
 
 
 def config_digest(models: dict[str, ModelSpec]) -> str:

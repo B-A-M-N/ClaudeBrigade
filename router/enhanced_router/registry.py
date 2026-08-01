@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -20,11 +21,38 @@ from enhanced_router.config_models import (
     ProviderSpec,
     RecommendationConstraints,
     RankedModel,
+    SidecarSpec,
     SpecialistSpec,
     WorkflowSpec,
 )
 
 _VALID_ROLES = frozenset(("recon", "implementer", "adversary", "repairer"))
+
+
+def _number_value(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _credential_available(key_name: str | None) -> bool:
+    if not key_name:
+        return True
+    try:
+        from enhanced_router.credential_store import resolve_loaded
+
+        if resolve_loaded(key_name):
+            return True
+    except Exception:
+        pass
+    return bool(os.environ.get(key_name))
 
 # One-time migration aliases for the pre-logical-model FreeInference catalog.
 # They are accepted at input boundaries but are never published as separate
@@ -49,6 +77,7 @@ class ModelRegistry:
         self._profiles: dict[str, ProfileSpec] = {}
         self._workflows: dict[str, WorkflowSpec] = {}
         self._providers: dict[str, ProviderSpec] = {}
+        self._sidecars: dict[str, SidecarSpec] = {}
         self._fastpath: FastpathConfigSpec | None = None
         self._discovered_digest: str = ""
         self._raw_yaml: dict[str, str] = {}
@@ -65,6 +94,19 @@ class ModelRegistry:
         raw = target.read_text(encoding="utf-8")
         self._raw_yaml["models"] = raw
         data = yaml.safe_load(raw)
+        discovered_target = self._config_path("discovered_models.yaml")
+        if discovered_target.exists():
+            discovered_raw = discovered_target.read_text(encoding="utf-8")
+            self._raw_yaml["discovered_models"] = discovered_raw
+            discovered_data = yaml.safe_load(discovered_raw) or {}
+            merged = dict(data or {})
+            merged_models = dict(merged.get("models") or {})
+            for model_id, model in (discovered_data.get("models") or {}).items():
+                merged_models.setdefault(model_id, model)
+            merged["models"] = merged_models
+            data = merged
+        else:
+            self._raw_yaml.pop("discovered_models", None)
         models: dict[str, ModelSpec] = {}
         for model_id, raw_model in (data or {}).get("models", {}).items():
             caps = raw_model.get("capabilities", {})
@@ -151,6 +193,9 @@ class ModelRegistry:
                 implementer=canonical(raw_profile["implementer"]),
                 adversary=canonical(raw_profile["adversary"]),
                 repairer=canonical(raw_profile["repairer"]),
+                controller_model=canonical(raw_profile.get("controller_model"))
+                if raw_profile.get("controller_model")
+                else None,
                 specialists=specialists,
             )
             profiles[profile_id] = spec
@@ -201,6 +246,22 @@ class ModelRegistry:
         self._fastpath = FastpathConfigSpec(**(data.get("fastpath") or {}))
         return data
 
+    def load_sidecars(self, path: str | Path | None = None) -> dict[str, SidecarSpec]:
+        """Load independent sidecar policies from the operator config."""
+        target = Path(path) if path else self._config_path("sidecars.yaml")
+        if not target.exists():
+            self._sidecars = {}
+            self._raw_yaml.pop("sidecars", None)
+            return self._sidecars
+        raw = target.read_text(encoding="utf-8")
+        self._raw_yaml["sidecars"] = raw
+        data = yaml.safe_load(raw) or {}
+        self._sidecars = {
+            str(sidecar_id): SidecarSpec(**sidecar)
+            for sidecar_id, sidecar in (data.get("sidecars") or {}).items()
+        }
+        return self._sidecars
+
     def apply_discovered_catalog(self, entries: Sequence[Any], response_digest: str = "") -> None:
         """Merge authenticated provider metadata into the active generation.
 
@@ -211,14 +272,16 @@ class ModelRegistry:
         seen_by_provider_endpoint: dict[tuple[str, str], set[str]] = {}
         for entry in entries:
             model_id = str(getattr(entry, "model_id"))
+            logical_model_id = str(getattr(entry, "logical_model_id", None) or model_id)
             provider_id = str(getattr(entry, "provider_id"))
             endpoint_id = str(getattr(entry, "endpoint_id", "openai"))
             context = getattr(entry, "context_tokens", None)
             output = getattr(entry, "max_output_tokens", None)
             provider = self._providers.get(provider_id)
             api_base = provider.endpoints.get(endpoint_id) if provider else None
-            seen_by_provider_endpoint.setdefault((provider_id, endpoint_id), set()).add(model_id)
-            if model_id not in self._models:
+            seen_models = seen_by_provider_endpoint.setdefault((provider_id, endpoint_id), set())
+            seen_models.update({model_id, logical_model_id})
+            if logical_model_id not in self._models:
                 endpoint_backend = "direct-anthropic" if endpoint_id == "anthropic" else "litellm"
                 discovered_endpoint = ModelEndpointSpec(
                     backend=endpoint_backend,
@@ -236,7 +299,7 @@ class ModelRegistry:
                     certified=False,
                     availability="public",
                 )
-                self._models[model_id] = ModelSpec(
+                self._models[logical_model_id] = ModelSpec(
                     display_name=str(getattr(entry, "display_name", None) or model_id),
                     provider_id=provider_id,
                     backend="litellm",
@@ -255,7 +318,7 @@ class ModelRegistry:
                     catalog_source="discovered", availability="account-specific",
                 )
                 continue
-            spec = self._models[model_id]
+            spec = self._models[logical_model_id]
             caps = spec.capabilities.model_copy(update={
                 "context_tokens": context if context is not None else spec.capabilities.context_tokens,
                 "max_context_tokens": context if context is not None else spec.capabilities.max_context_tokens,
@@ -281,7 +344,7 @@ class ModelRegistry:
                     "max_context_tokens": context if context is not None else endpoint.max_context_tokens,
                     "max_output_tokens": output if output is not None else endpoint.max_output_tokens,
                 })
-            self._models[model_id] = spec.model_copy(update={
+            self._models[logical_model_id] = spec.model_copy(update={
                 "capabilities": caps,
                 "availability": "public" if spec.provider_id == provider_id else spec.availability,
             })
@@ -325,7 +388,12 @@ class ModelRegistry:
             raise ValueError(f"provider '{provider_id}' has no '{endpoint_id}' catalog endpoint")
         if not provider.api_key_env:
             raise ValueError(f"provider '{provider_id}' has no API key environment variable")
-        api_key = os.environ.get(provider.api_key_env, "").strip()
+        try:
+            from enhanced_router.credential_store import resolve_loaded
+
+            api_key = (resolve_loaded(provider.api_key_env) or "").strip()
+        except Exception:
+            api_key = os.environ.get(provider.api_key_env, "").strip()
         if not api_key:
             raise ValueError(f"provider credential '{provider.api_key_env}' is not configured")
         entries = discover_openai_models(
@@ -335,8 +403,26 @@ class ModelRegistry:
             api_key=api_key,
             timeout=timeout,
         )
+        if provider.discovery.get("free_only"):
+            entries = [
+                entry for entry in entries
+                if self._catalog_entry_is_free(provider_id, entry)
+            ]
+            if provider.discovery.get("strip_free_suffix"):
+                entries = [
+                    replace(entry, model_id=entry.model_id.removesuffix(":free"))
+                    for entry in entries
+                ]
+        # Provider catalogs frequently reuse the same upstream model ID. Keep
+        # logical registry IDs provider-qualified while retaining the raw ID
+        # for the actual OpenAI-compatible request.
+        entries = [
+            replace(entry, logical_model_id=f"{provider_id}/{entry.model_id}")
+            for entry in entries
+        ]
         digest = response_digest(entries)
         self.apply_discovered_catalog(entries, digest)
+        self._persist_discovered_catalog(entries)
         self._validate_cross_refs()
         if state is not None:
             persist = getattr(state, "store_provider_catalog_entries", None)
@@ -348,6 +434,95 @@ class ModelRegistry:
                     request_id=request_id,
                 )
         return digest, len(entries)
+
+    @staticmethod
+    def _catalog_entry_is_free(provider_id: str, entry: Any) -> bool:
+        """Apply provider-specific free-catalog rules without guessing price."""
+        raw = getattr(entry, "raw", {})
+        raw_id = str(raw.get("id", getattr(entry, "model_id", "")))
+        if provider_id in {"kilocode", "kilo"}:
+            if raw_id == "kilo-auto/free" or raw_id.endswith(":free"):
+                return True
+            pricing = raw.get("pricing")
+            if isinstance(pricing, dict):
+                return (
+                    _number_value(pricing.get("input")) == 0
+                    and _number_value(pricing.get("output")) == 0
+                )
+            return (
+                _number_value(raw.get("input_price")) == 0
+                and _number_value(raw.get("output_price")) == 0
+            )
+        if provider_id == "requesty":
+            return _number_value(raw.get("input_price")) == 0 and _number_value(raw.get("output_price")) == 0
+        pricing = raw.get("pricing")
+        if isinstance(pricing, dict):
+            return _number_value(pricing.get("input")) == 0 and _number_value(pricing.get("output")) == 0
+        return False
+
+    def _persist_discovered_catalog(self, entries: Sequence[Any]) -> None:
+        """Persist provider-discovered model metadata without credentials."""
+        if not entries:
+            return
+        target = self._config_path("discovered_models.yaml")
+        existing: dict[str, Any] = {}
+        if target.exists():
+            existing = yaml.safe_load(target.read_text(encoding="utf-8")) or {}
+        models = dict(existing.get("models") or {})
+        for entry in entries:
+            provider_id = str(getattr(entry, "provider_id"))
+            endpoint_id = str(getattr(entry, "endpoint_id", "openai"))
+            raw_model_id = str(getattr(entry, "model_id"))
+            model_id = str(
+                getattr(entry, "logical_model_id", None)
+                or f"{provider_id}/{raw_model_id}"
+            )
+            provider = self._providers.get(provider_id)
+            api_base = provider.endpoints.get(endpoint_id) if provider else None
+            api_key_env = provider.api_key_env if provider else None
+            models[model_id] = {
+                "display_name": str(getattr(entry, "display_name", None) or model_id),
+                "catalog_source": "discovered",
+                "availability": "account-specific",
+                "backend": "litellm",
+                "litellm_model": f"openai/{raw_model_id}",
+                "api_base": api_base,
+                "api_key_env": api_key_env,
+                "provider_id": provider_id,
+                "capabilities": {
+                    "tools": False,
+                    "mutation": False,
+                    "read_tool_certified": False,
+                    "write_tool_certified": False,
+                    "context_tokens": getattr(entry, "context_tokens", None),
+                    "max_output_tokens": getattr(entry, "max_output_tokens", None),
+                    "openai_chat_completions": True,
+                    "streaming": True,
+                },
+                "allowed_roles": [],
+                "endpoints": {
+                    endpoint_id: {
+                        "backend": "litellm",
+                        "provider_id": provider_id,
+                        "protocol": "openai-chat",
+                        "litellm_model": f"openai/{raw_model_id}",
+                        "api_base": api_base,
+                        "api_key_env": api_key_env,
+                        "max_context_tokens": getattr(entry, "context_tokens", None),
+                        "max_output_tokens": getattr(entry, "max_output_tokens", None),
+                        "availability": "account-specific",
+                        "certified": False,
+                    }
+                },
+            }
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.tmp")
+        temporary.write_text(
+            yaml.safe_dump({"models": models}, sort_keys=False), encoding="utf-8"
+        )
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+        self._raw_yaml["discovered_models"] = target.read_text(encoding="utf-8")
 
     # ------------------------------------------------------------------
     # Validation helpers (called after loading all sections)
@@ -365,6 +540,26 @@ class ModelRegistry:
         - if auth required, api_key_env is set
         """
         for pid, profile in self._profiles.items():
+            if profile.controller_model:
+                controller = self._models.get(profile.controller_model)
+                if controller is None:
+                    raise ValueError(
+                        f"Profile '{pid}' references unknown controller model "
+                        f"'{profile.controller_model}'"
+                    )
+                if not controller.enabled:
+                    raise ValueError(
+                        f"Profile '{pid}' references disabled controller model "
+                        f"'{profile.controller_model}'"
+                    )
+                if not (
+                    controller.capabilities.controller_eligible
+                    or controller.backend == "anthropic-passthrough"
+                ):
+                    raise ValueError(
+                        f"Profile '{pid}' controller model '{profile.controller_model}' "
+                        "is not controller-compatible"
+                    )
             for role in ("recon", "implementer", "adversary", "repairer"):
                 mid = profile.route_target(role).model
                 if mid not in self._models:
@@ -419,6 +614,29 @@ class ModelRegistry:
                             f"Model '{mid}' (litellm) has no litellm_model"
                         )
 
+                for fallback_model_id in profile.route_target(role).fallback_models:
+                    fallback = self._models.get(fallback_model_id)
+                    if fallback is None:
+                        raise ValueError(
+                            f"Profile '{pid}' fallback model '{fallback_model_id}' "
+                            f"for role '{role}' is unknown"
+                        )
+                    if not fallback.enabled:
+                        raise ValueError(
+                            f"Profile '{pid}' fallback model '{fallback_model_id}' "
+                            f"for role '{role}' is disabled"
+                        )
+                    if role not in fallback.allowed_roles:
+                        raise ValueError(
+                            f"Profile '{pid}' fallback model '{fallback_model_id}' "
+                            f"does not allow role '{role}'"
+                        )
+                    if role in {"implementer", "repairer"} and fallback.capabilities.write_tool_certified is not True:
+                        raise ValueError(
+                            f"Profile '{pid}' fallback model '{fallback_model_id}' "
+                            f"is not write-tool certified for role '{role}'"
+                        )
+
             for specialist_id, specialist in profile.specialists.items():
                 if not specialist_id.strip():
                     raise ValueError(f"Profile '{pid}' contains an empty specialist name")
@@ -465,6 +683,36 @@ class ModelRegistry:
                     raise ValueError("fastpath model must be enabled when fastpath is enabled")
                 if fastpath_model.capabilities.write_tool_certified:
                     raise ValueError("fastpath model cannot be write-tool certified")
+
+        for sidecar_id, sidecar in self._sidecars.items():
+            if not sidecar_id.strip():
+                raise ValueError("sidecar IDs must not be empty")
+            model = self._models.get(sidecar.model_id)
+            if model is None:
+                raise ValueError(
+                    f"sidecar '{sidecar_id}' references unknown model '{sidecar.model_id}'"
+                )
+            if not model.enabled:
+                raise ValueError(
+                    f"sidecar '{sidecar_id}' references disabled model '{sidecar.model_id}'"
+                )
+            if model.backend == "anthropic-passthrough":
+                raise ValueError(
+                    f"sidecar '{sidecar_id}' cannot use the controller passthrough backend"
+                )
+            if sidecar.endpoint != "auto" and sidecar.endpoint not in model.endpoints:
+                raise ValueError(
+                    f"sidecar '{sidecar_id}' references unknown endpoint "
+                    f"'{sidecar.endpoint}' on model '{sidecar.model_id}'"
+                )
+
+        for workflow_id, workflow in self._workflows.items():
+            for phase in workflow.phases:
+                if phase.sidecar and phase.sidecar not in self._sidecars:
+                    raise ValueError(
+                        f"workflow '{workflow_id}' phase '{phase.id}' references "
+                        f"unknown sidecar '{phase.sidecar}'"
+                    )
 
     # ------------------------------------------------------------------
     # Lookup
@@ -523,59 +771,90 @@ class ModelRegistry:
 
         return native_agent_name(self, model_id, role)
 
+    def _model_readiness_reasons(
+        self, model_id: str, role: str, endpoint: str = "auto",
+    ) -> list[str]:
+        """Return concrete reasons why one model route cannot start."""
+        try:
+            spec = self.get_model(model_id)
+        except KeyError:
+            return ["model is not in the active registry"]
+        reasons: list[str] = []
+        if not spec.enabled:
+            reasons.append("model is disabled")
+        if role in {"implementer", "repairer"} and not spec.capabilities.write_tool_certified:
+            reasons.append("write-tool certification is missing")
+        if spec.provider_id and spec.provider_id not in self._providers:
+            reasons.append(f"provider '{spec.provider_id}' is not configured")
+        endpoint_spec = spec.endpoints.get(endpoint) if endpoint != "auto" else None
+        candidates = [endpoint_spec] if endpoint_spec is not None else list(spec.endpoints.values())
+        if not candidates:
+            candidates = [spec]
+        configured_transport = False
+        for candidate in candidates:
+            provider_id = getattr(candidate, "provider_id", None) or spec.provider_id
+            provider = self._providers.get(provider_id) if provider_id else None
+            backend = getattr(candidate, "backend", spec.backend)
+            api_base = getattr(candidate, "api_base", None) or spec.api_base
+            api_base_env = getattr(candidate, "api_base_env", None) or spec.api_base_env
+            api_key_env = getattr(candidate, "api_key_env", None) or spec.api_key_env
+            if provider is not None:
+                api_base = api_base or provider.endpoints.get(endpoint)
+                api_key_env = api_key_env or provider.api_key_env
+            if backend == "direct-anthropic" and not (
+                api_base or (api_base_env and os.environ.get(api_base_env))
+            ):
+                continue
+            if api_key_env and not _credential_available(api_key_env):
+                continue
+            if backend == "litellm" and not (
+                getattr(candidate, "litellm_model", None) or spec.litellm_model
+            ):
+                continue
+            configured_transport = True
+            break
+        if not configured_transport:
+            reasons.append("no configured endpoint with available credentials")
+        return reasons
+
     def profile_readiness(self, profile_id: str) -> dict[str, Any]:
-        """Report whether every mandatory role has a configured transport."""
+        """Report whether every role has a usable primary or fallback route."""
         profile = self.get_profile(profile_id)
         roles: dict[str, dict[str, Any]] = {}
         for role in _VALID_ROLES:
-            model_id = profile.route_target(role).model
-            reasons: list[str] = []
-            try:
-                spec = self.get_model(model_id)
-            except KeyError:
-                roles[role] = {
-                    "model_id": model_id,
-                    "ready": False,
-                    "reasons": ["model is not in the active registry"],
-                }
-                continue
-            if not spec.enabled:
-                reasons.append("model is disabled")
-            if role in {"implementer", "repairer"} and not spec.capabilities.write_tool_certified:
-                reasons.append("write-tool certification is missing")
-            if spec.provider_id and spec.provider_id not in self._providers:
-                reasons.append(f"provider '{spec.provider_id}' is not configured")
-            endpoint = profile.route_target(role).endpoint
-            endpoint_spec = spec.endpoints.get(endpoint) if endpoint != "auto" else None
-            candidates = [endpoint_spec] if endpoint_spec is not None else list(spec.endpoints.values())
-            if not candidates:
-                candidates = [spec]
-            configured_transport = False
-            for candidate in candidates:
-                backend = getattr(candidate, "backend", spec.backend)
-                api_base = getattr(candidate, "api_base", None) or spec.api_base
-                api_base_env = getattr(candidate, "api_base_env", None) or spec.api_base_env
-                api_key_env = getattr(candidate, "api_key_env", None) or spec.api_key_env
-                if backend == "direct-anthropic" and not (api_base or (api_base_env and os.environ.get(api_base_env))):
-                    continue
-                if api_key_env and not os.environ.get(api_key_env):
-                    continue
-                if backend == "litellm" and not (
-                    getattr(candidate, "litellm_model", None) or spec.litellm_model
-                ):
-                    continue
-                configured_transport = True
-                break
-            if not configured_transport:
-                reasons.append("no configured endpoint with available credentials")
+            target = profile.route_target(role)
+            fallback_models = list(target.fallback_models)
+            candidates = [target.model, *fallback_models]
+            candidate_reasons = [
+                self._model_readiness_reasons(
+                    candidate, role, target.endpoint if index == 0 else "auto"
+                )
+                for index, candidate in enumerate(candidates)
+            ]
+            selected = next(
+                (candidate for candidate, reasons in zip(candidates, candidate_reasons) if not reasons),
+                None,
+            )
             roles[role] = {
-                "model_id": model_id,
-                "ready": not reasons,
-                "reasons": reasons,
+                "model_id": target.model,
+                "fallback_models": fallback_models,
+                "selected_candidate": selected,
+                "ready": selected is not None,
+                "reasons": [] if selected is not None else candidate_reasons[0],
             }
+        controller_reasons: list[str] = []
+        controller_model = profile.controller_model
+        if controller_model:
+            controller_reasons = self._model_readiness_reasons(controller_model, "controller")
+        controller_ready = not controller_model or not controller_reasons
         return {
             "profile_id": profile_id,
-            "ready": all(item["ready"] for item in roles.values()),
+            "controller": {
+                "model_id": controller_model,
+                "ready": controller_ready,
+                "reasons": controller_reasons,
+            },
+            "ready": controller_ready and all(item["ready"] for item in roles.values()),
             "roles": dict(sorted(roles.items())),
         }
 
@@ -730,6 +1009,7 @@ class ModelRegistry:
         self.load_workflows()
         self.load_providers()
         self.load_fastpath()
+        self.load_sidecars()
         self._validate_cross_refs()
 
     # ------------------------------------------------------------------
@@ -766,6 +1046,73 @@ class ModelRegistry:
     @property
     def fastpath(self) -> FastpathConfigSpec | None:
         return self._fastpath
+
+    @property
+    def sidecars(self) -> dict[str, SidecarSpec]:
+        return self._sidecars
+
+    def get_sidecar(self, sidecar_id: str) -> SidecarSpec:
+        """Return one configured sidecar or raise a stable lookup error."""
+        spec = self._sidecars.get(sidecar_id)
+        if spec is None:
+            raise KeyError(f"Unknown sidecar: {sidecar_id}")
+        return spec
+
+    def sidecar_readiness(self, sidecar_id: str) -> dict[str, Any]:
+        """Report static transport readiness without making an inference call."""
+        try:
+            sidecar = self.get_sidecar(sidecar_id)
+        except KeyError:
+            return {"sidecar_id": sidecar_id, "ready": False, "reasons": ["sidecar is not configured"]}
+        reasons: list[str] = []
+        if not sidecar.enabled:
+            reasons.append("sidecar is disabled")
+        try:
+            model = self.get_model(sidecar.model_id)
+        except KeyError:
+            reasons.append("model is not in the active registry")
+            return {"sidecar_id": sidecar_id, "model_id": sidecar.model_id, "ready": False, "reasons": reasons}
+        if not model.enabled:
+            reasons.append("model is disabled")
+        candidates = (
+            [model.endpoints[sidecar.endpoint]]
+            if sidecar.endpoint != "auto" and sidecar.endpoint in model.endpoints
+            else list(model.endpoints.values())
+        )
+        if not candidates:
+            candidates = [model]
+        configured_transport = False
+        provider_ids: set[str] = set()
+        for candidate in candidates:
+            provider_id = getattr(candidate, "provider_id", None) or model.provider_id
+            if provider_id:
+                provider_ids.add(provider_id)
+            provider = self._providers.get(provider_id) if provider_id else None
+            api_base = getattr(candidate, "api_base", None) or model.api_base
+            api_base_env = getattr(candidate, "api_base_env", None) or model.api_base_env
+            key_env = getattr(candidate, "api_key_env", None) or model.api_key_env
+            if provider is not None:
+                key_env = key_env or provider.api_key_env
+            if getattr(candidate, "backend", model.backend) == "direct-anthropic":
+                if not (api_base or (api_base_env and os.environ.get(api_base_env))):
+                    continue
+            if key_env and not _credential_available(key_env):
+                continue
+            if getattr(candidate, "backend", model.backend) == "litellm":
+                if not (getattr(candidate, "litellm_model", None) or model.litellm_model):
+                    continue
+            configured_transport = True
+            break
+        if not configured_transport:
+            reasons.append("no configured endpoint with an available credential")
+        return {
+            "sidecar_id": sidecar_id,
+            "model_id": sidecar.model_id,
+            "mode": sidecar.mode,
+            "provider_ids": sorted(provider_ids),
+            "ready": not reasons,
+            "reasons": reasons,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -819,5 +1166,6 @@ def get_registry() -> ModelRegistry:
         _registry_instance.load_workflows()
         _registry_instance.load_providers()
         _registry_instance.load_fastpath()
+        _registry_instance.load_sidecars()
         _registry_instance._validate_cross_refs()
     return _registry_instance

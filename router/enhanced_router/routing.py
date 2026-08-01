@@ -28,6 +28,19 @@ from enhanced_router.endpoint_selection import select_endpoint
 logger = logging.getLogger("claude-enhanced-router")
 
 
+def _credential_available(key_name: str | None) -> bool:
+    if not key_name:
+        return True
+    try:
+        from enhanced_router.credential_store import resolve_loaded
+
+        if resolve_loaded(key_name):
+            return True
+    except Exception:
+        pass
+    return bool(os.environ.get(key_name))
+
+
 def resolved_route_from_binding(
     binding: dict,
     litellm_base_url: str | None = None,
@@ -174,6 +187,9 @@ def resolve_request(
     *,
     identity: RequestIdentity,
     public_model: str,
+    explicit_model_id: str | None = None,
+    explicit_endpoint: str | None = None,
+    sidecar: bool = False,
 ) -> ResolvedRoute:
     """Resolve a Claude Code request to a backend route using identity-first dispatch.
 
@@ -282,61 +298,73 @@ def resolve_request(
 
         # Resolve role route from epoch
         route = state.get_role_route(identity.run_id, epoch_id, role)
+        if route is None and sidecar and explicit_model_id:
+            route = {"version": 0, "model_id": explicit_model_id}
         if route is None:
             raise HTTPException(
                 status_code=404,
                 detail=f"No route defined for role '{role}' in epoch {epoch_id}",
             )
 
-        model_id_value = registry.role_model_bindings().get(public_model, route["model_id"])
+        model_id_value = explicit_model_id or registry.role_model_bindings().get(
+            public_model, route["model_id"]
+        )
         if not isinstance(model_id_value, str) or not model_id_value:
             raise HTTPException(status_code=500, detail=f"Role '{role}' has no model binding")
         model_id = model_id_value
-        assignment = state.get_spawn_assignment(
-            identity.run_id, epoch_id, str(identity.claude_agent_id),
-        )
-        if assignment is None:
-            pending = state.get_unattached_spawn_claim_for_role(
-                identity.run_id, epoch_id, role,
+        assignment = None
+        if not sidecar:
+            assignment = state.get_spawn_assignment(
+                identity.run_id, epoch_id, str(identity.claude_agent_id),
             )
-            if pending is not None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "native agent lifecycle is not attached; wait for "
-                        "SubagentStart before the first model request"
-                    ),
+            if assignment is None:
+                pending = state.get_unattached_spawn_claim_for_role(
+                    identity.run_id, epoch_id, role,
                 )
-        if assignment is not None:
-            if assignment.get("role") != role or assignment.get("model_id") != model_id:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "native agent assignment mismatch: the first request must use "
-                        f"role={assignment.get('role')!r}, model={assignment.get('model_id')!r}"
-                    ),
-                )
+                if pending is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "native agent lifecycle is not attached; wait for "
+                            "SubagentStart before the first model request"
+                        ),
+                    )
+            if assignment is not None:
+                if assignment.get("role") != role or assignment.get("model_id") != model_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "native agent assignment mismatch: the first request must use "
+                            f"role={assignment.get('role')!r}, model={assignment.get('model_id')!r}"
+                        ),
+                    )
         spec = registry.get_model(model_id)
 
-        # Validate the model against the role
+        # Validate the model against the role. A configured sidecar is a
+        # read-only structured call and may intentionally use a model that is
+        # not approved for Claude Code's native role routes.
         if not spec.enabled:
             raise HTTPException(
                 status_code=503,
                 detail=f"Model '{model_id}' for role '{role}' is disabled.",
             )
-        if role not in spec.allowed_roles:
+        if not sidecar and role not in spec.allowed_roles:
             raise HTTPException(
                 status_code=400,
                 detail=f"Model '{model_id}' does not allow role '{role}'.",
             )
-        if role in ("implementer", "repairer") and spec.capabilities.write_tool_certified is not True:
+        if not sidecar and role in ("implementer", "repairer") and spec.capabilities.write_tool_certified is not True:
             raise HTTPException(
                 status_code=400,
                 detail=f"Model '{model_id}' is not write-tool certified for role '{role}'.",
             )
 
         reg_hash = registry.registry_hash()
-        endpoint_override = route.get("endpoint_override") or route.get("endpoint_id")
+        endpoint_override = (
+            explicit_endpoint
+            or route.get("endpoint_override")
+            or route.get("endpoint_id")
+        )
         managed_group = spec.routing_mode == "managed-group" and not endpoint_override
         managed_deployments: tuple[str, ...] = ()
         managed_provider_ids: set[str | None] = set()
@@ -352,7 +380,7 @@ def resolve_request(
                         require_certified=True,
                         provider_id=spec.endpoints[candidate_id].provider_id or spec.provider_id,
                         configuration_hash=reg_hash,
-                        required_capabilities=("messages", "streaming", "tools"),
+                        required_capabilities=("messages",) if sidecar else ("messages", "streaming", "tools"),
                     ))
                 except ValueError:
                     continue
@@ -377,7 +405,7 @@ def resolve_request(
                     require_certified=True,
                     provider_id=spec.provider_id,
                     configuration_hash=reg_hash,
-                    required_capabilities=("messages", "streaming", "tools"),
+                    required_capabilities=("messages",) if sidecar else ("messages", "streaming", "tools"),
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -397,7 +425,7 @@ def resolve_request(
                         f"Set api_base or api_base_env='{spec.api_base_env or '...'}'."
                     ),
                 )
-            if endpoint.api_key_env and not os.environ.get(endpoint.api_key_env):
+            if endpoint.api_key_env and not _credential_available(endpoint.api_key_env):
                 raise HTTPException(
                     status_code=503,
                     detail=f"API key env var '{endpoint.api_key_env}' for model '{model_id}' is not set.",
@@ -577,7 +605,7 @@ def resolve_request(
     resolved_api_base = _resolve_api_base(endpoint.api_base, endpoint.api_base_env)
     if endpoint.backend == "direct-anthropic" and not resolved_api_base:
         raise HTTPException(status_code=503, detail=f"No endpoint configured for controller '{public_model}'")
-    if endpoint.api_key_env and not os.environ.get(endpoint.api_key_env):
+    if endpoint.api_key_env and not _credential_available(endpoint.api_key_env):
         raise HTTPException(status_code=503, detail=f"API key env var '{endpoint.api_key_env}' is not set")
 
     kind = _backend_kind(endpoint.backend)

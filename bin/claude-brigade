@@ -7,7 +7,7 @@ set -euo pipefail
 # Canonical paths (accept old CLAUDE_ENHANCED_* as fallback for migration):
 #   APP_DIR     ~/.local/share/claude-brigade         (application code / venv)
 #   PROFILE_DIR ~/.claude-brigade                     (settings, agents, hooks, prompts)
-#   CONFIG_DIR  ~/.config/claude-brigade              (models.yaml, profiles.yaml, tokens, providers.env)
+#   CONFIG_DIR  ~/.config/claude-brigade              (models.yaml, profiles.yaml, tokens, credentials)
 #   CACHE_DIR   ~/.cache/claude-brigade               (logs, PID files, MCP config)
 #   STATE_DIR   ~/.local/state/claude-brigade          (SQLite databases)
 # ---------------------------------------------------------------------------
@@ -144,47 +144,6 @@ export CLAUDE_BRIGADE_RUN_ID="$RUN_ID"
 CONTROLLER_CAPABILITY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
 
 # ---------------------------------------------------------------------------
-# Provider-secret loader (hardened via Python bootstrap_env module)
-#
-# Uses the hardened env_parser.py via bootstrap_env.py to parse providers.env
-# and emit JSON with validated provider environment variables.
-# ---------------------------------------------------------------------------
-
-_load_providers_env() {
-  local providers_file="$CONFIG_DIR/providers.env"
-  if [[ ! -r "$providers_file" ]]; then
-    return 0
-  fi
-
-  # Use a temporary file so NUL-delimited credentials are never passed through
-  # command substitution (which strips NUL bytes) or echoed into a shell.
-  local bootstrap_output
-  bootstrap_output="$(mktemp "$CACHE_DIR/providers.XXXXXX")"
-  if ! "$APP_DIR/venv/bin/python" -m enhanced_router.bootstrap_env \
-      --config-dir "$CONFIG_DIR" --emit-nul >"$bootstrap_output"; then
-    rm -f "$bootstrap_output"
-    echo "ERROR: Failed to parse providers.env" >&2
-    exit 1
-  fi
-
-  while IFS= read -r -d '' pair; do
-    if [[ "$pair" != *=* ]]; then
-      rm -f "$bootstrap_output"
-      echo "ERROR: Bootstrap emitted malformed provider assignment" >&2
-      exit 1
-    fi
-    key="${pair%%=*}"
-    value="${pair#*=}"
-    export "$key=$value"
-    PROVIDER_KEYS+=("$key")
-  done <"$bootstrap_output"
-  rm -f "$bootstrap_output"
-}
-
-# Load providers
-_load_providers_env
-
-# ---------------------------------------------------------------------------
 # LiteLLM internal key
 # ---------------------------------------------------------------------------
 
@@ -311,6 +270,9 @@ BANNED_ENV_KEYS=(
   OPENROUTER_API_KEY DEEPSEEK_API_KEY GROQ_API_KEY GLM_API_KEY
   OPENAI_API_KEY MISTRAL_API_KEY CEREBRAS_API_KEY COHERE_API_KEY
   REPLICATE_API_KEY PALM_API_KEY VERTEX_PROJECT
+  KILO_API_KEY CLINE_API_KEY CLINEPASS_API_KEY OPENCODE_API_KEY OPENCODEGO_API_KEY
+  NVIDIA_API_KEY OLLAMA_API_KEY
+  FREETHEAI_API_KEY REQUESTY_API_KEY FREEMODEL_API_KEY
 )
 
 # Helper: compare daemon_metadata from a healthz response with our current
@@ -402,19 +364,20 @@ if [[ -n "$HEALTHZ_RESPONSE" ]]; then
     # Rotate router log before starting fresh
     _rotate_log "$ROUTER_LOG"
 
-    # Provider keys are passed to the router process, NOT to Claude Code
-    # Build env array for nohup: banned keys are unset, Brigade paths set
+    # Provider keys are loaded inside the router from the OS keyring or the
+    # protected providers.env compatibility file. Remove inherited keys from
+    # the child environment before it starts.
     nohup env \
+      -u OPENROUTER_API_KEY -u DEEPSEEK_API_KEY -u GLM_API_KEY \
+      -u ANTHROPIC_API_KEY -u FREEINFERENCE_API_KEY \
+      -u KILO_API_KEY -u CLINE_API_KEY -u CLINEPASS_API_KEY \
+      -u OPENCODE_API_KEY -u OPENCODEGO_API_KEY -u NVIDIA_API_KEY -u OLLAMA_API_KEY \
+      -u FREETHEAI_API_KEY -u REQUESTY_API_KEY -u FREEMODEL_API_KEY \
       ENHANCED_ROUTER_TOKEN="$ROUTER_TOKEN" \
       BRIGADE_LITELLM_KEY="$LITELLM_KEY" \
       BRIGADE_CONFIG_DIR="$CONFIG_DIR" \
       BRIGADE_STATE_DIR="$STATE_DIR" \
       BRIGADE_CACHE_DIR="$CACHE_DIR" \
-      OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}" \
-      DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-}" \
-      GLM_API_KEY="${GLM_API_KEY:-}" \
-      ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
-      FREEINFERENCE_API_KEY="${FREEINFERENCE_API_KEY:-}" \
       PYTHONPATH="$APP_DIR/router" \
       "$APP_DIR/venv/bin/python" -m uvicorn enhanced_router.app:app \
         --host 127.0.0.1 --port "$PORT" --no-access-log \
@@ -436,19 +399,20 @@ else
   # Rotate router log before starting fresh
   _rotate_log "$ROUTER_LOG"
 
-  # Provider keys are passed to the router process, NOT to Claude Code
-  # Build env array for nohup: banned keys are unset, Brigade paths set
+  # Provider keys are loaded inside the router from the OS keyring or the
+  # protected providers.env compatibility file. Remove inherited keys from
+  # the child environment before it starts.
   nohup env \
+    -u OPENROUTER_API_KEY -u DEEPSEEK_API_KEY -u GLM_API_KEY \
+    -u ANTHROPIC_API_KEY -u FREEINFERENCE_API_KEY \
+    -u KILO_API_KEY -u CLINE_API_KEY -u CLINEPASS_API_KEY \
+    -u OPENCODE_API_KEY -u OPENCODEGO_API_KEY -u NVIDIA_API_KEY -u OLLAMA_API_KEY \
+    -u FREETHEAI_API_KEY -u REQUESTY_API_KEY -u FREEMODEL_API_KEY \
     ENHANCED_ROUTER_TOKEN="$ROUTER_TOKEN" \
     BRIGADE_LITELLM_KEY="$LITELLM_KEY" \
     BRIGADE_CONFIG_DIR="$CONFIG_DIR" \
     BRIGADE_STATE_DIR="$STATE_DIR" \
     BRIGADE_CACHE_DIR="$CACHE_DIR" \
-    OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}" \
-    DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-}" \
-    GLM_API_KEY="${GLM_API_KEY:-}" \
-    ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
-    FREEINFERENCE_API_KEY="${FREEINFERENCE_API_KEY:-}" \
     PYTHONPATH="$APP_DIR/router" \
     "$APP_DIR/venv/bin/python" -m uvicorn enhanced_router.app:app \
       --host 127.0.0.1 --port "$PORT" --no-access-log \
@@ -483,11 +447,6 @@ for _key in "${BANNED_ENV_KEYS[@]}"; do
   unset "$_key" 2>/dev/null || true
 done
 
-# Also unset provider keys that were loaded for the router
-for _key in "${PROVIDER_KEYS[@]}"; do
-  unset "$_key" 2>/dev/null || true
-done
-
 # Ensure Claude Code cannot pick up provider keys from the parent shell
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL
 unset ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
@@ -498,6 +457,9 @@ unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
 unset OPENROUTER_API_KEY DEEPSEEK_API_KEY GROQ_API_KEY GLM_API_KEY
 unset OPENAI_API_KEY MISTRAL_API_KEY CEREBRAS_API_KEY COHERE_API_KEY
 unset REPLICATE_API_KEY PALM_API_KEY VERTEX_PROJECT
+unset KILO_API_KEY CLINE_API_KEY CLINEPASS_API_KEY OPENCODE_API_KEY OPENCODEGO_API_KEY
+unset NVIDIA_API_KEY OLLAMA_API_KEY
+unset FREETHEAI_API_KEY REQUESTY_API_KEY FREEMODEL_API_KEY
 export CLAUDE_CODE_FORK_SUBAGENT=0
 export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 
@@ -560,6 +522,7 @@ export ANTHROPIC_CUSTOM_HEADERS="$(
 # translated to the same Claude Code flag.
 CLAUDE_ARGS=()
 CONTROLLER_MODEL=""
+BRIGADE_PROFILE="${CLAUDE_BRIGADE_PROFILE:-}"
 while [ "$#" -gt 0 ]; do
   argument="$1"
   case "$argument" in
@@ -573,6 +536,17 @@ while [ "$#" -gt 0 ]; do
         exit 2
       fi
       CONTROLLER_MODEL="$1"
+      ;;
+    --brigade-profile=*)
+      BRIGADE_PROFILE="${argument#*=}"
+      ;;
+    --brigade-profile)
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "--brigade-profile requires a saved profile ID" >&2
+        exit 2
+      fi
+      BRIGADE_PROFILE="$1"
       ;;
     --model=*)
       requested_model="${argument#*=}"
@@ -599,9 +573,32 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+if [ -n "$BRIGADE_PROFILE" ]; then
+  export CLAUDE_BRIGADE_PROFILE="$BRIGADE_PROFILE"
+fi
+
 if [ -n "$CONTROLLER_MODEL" ]; then
   CLAUDE_ARGS+=(--model "$CONTROLLER_MODEL")
   requested_model="$CONTROLLER_MODEL"
+fi
+
+if [ -z "${requested_model:-}" ] && [ -n "$BRIGADE_PROFILE" ]; then
+  profile_controller="$(BRIGADE_CONFIG_DIR="$CONFIG_DIR" PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" - "$BRIGADE_PROFILE" <<'PY'
+import sys
+from enhanced_router.registry import get_registry
+
+profile_id = sys.argv[1]
+profile = get_registry().get_profile(profile_id)
+print(profile.controller_model or "")
+PY
+)" || {
+    echo "Unable to load saved Brigade profile '$BRIGADE_PROFILE'." >&2
+    exit 2
+  }
+  if [ -n "$profile_controller" ]; then
+    CLAUDE_ARGS+=(--model "$profile_controller")
+    requested_model="$profile_controller"
+  fi
 fi
 
 if [ -n "${requested_model:-}" ]; then

@@ -193,7 +193,15 @@ async def set_role_route(
     if spec.backend == "direct-anthropic":
         import os
 
-        if spec.api_key_env and not os.environ.get(spec.api_key_env):
+        credential_available = bool(os.environ.get(spec.api_key_env)) if spec.api_key_env else True
+        if spec.api_key_env:
+            try:
+                from enhanced_router.credential_store import resolve_loaded
+
+                credential_available = bool(resolve_loaded(spec.api_key_env))
+            except Exception:
+                pass
+        if spec.api_key_env and not credential_available:
             return {
                 "changed": False,
                 "error": (

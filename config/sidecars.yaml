@@ -1,0 +1,28 @@
+# Independent bounded specialist inference. These do not inherit the
+# Claude Code controller/role profile unless a workflow phase explicitly
+# chooses role-based sidecar compatibility by omitting `sidecar`.
+sidecars:
+  route_advisor:
+    model_id: diffusiongemma
+    mode: route
+    endpoint: auto
+    enabled: true
+    timeout_seconds: 5
+    max_packet_bytes: 64000
+    max_output_tokens: 1024
+    system_prompt: >-
+      Classify conservatively and return only the requested JSON. You are
+      advisory and cannot lower the deterministic workflow tier, choose a
+      physical endpoint, mutate files, or authorize completion.
+
+  verification_reviewer:
+    model_id: glm-5.1
+    mode: verify
+    endpoint: auto
+    enabled: true
+    timeout_seconds: 45
+    max_packet_bytes: 64000
+    max_output_tokens: 2048
+    system_prompt: >-
+      Review only the bounded evidence packet and return only the requested
+      JSON. Your result is advisory until accepted by the controller.

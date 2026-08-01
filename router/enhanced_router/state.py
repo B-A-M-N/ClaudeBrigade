@@ -103,6 +103,7 @@ CREATE TABLE IF NOT EXISTS role_routes (
     reason TEXT,
     version INTEGER NOT NULL,
     changed_at TEXT NOT NULL,
+    fallback_models_json TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (run_id, epoch_id, role)
 );
 
@@ -333,8 +334,10 @@ def _needs_v37_hardening(conn: sqlite3.Connection) -> bool:
         "workflow_phases": {
             "execution_kind", "required_actor", "started_by_actor", "started_by_principal",
             "max_parallelism", "required_successes", "max_attempts", "max_attempts_per_model",
+            "sidecar_id",
         },
         "runnable_action_claims": {"spawn_call_id", "execution_id", "action_kind"},
+        "role_routes": {"fallback_models_json"},
     }
     for table, columns in required.items():
         present = {
@@ -1308,8 +1311,10 @@ def _migrate_v37(conn: sqlite3.Connection) -> None:
         "required_successes": "INTEGER",
         "max_attempts": "INTEGER NOT NULL DEFAULT 1",
         "max_attempts_per_model": "INTEGER",
+        "sidecar_id": "TEXT",
     }.items():
         _add_column_if_missing(conn, "workflow_phases", name, declaration)
+    _add_column_if_missing(conn, "role_routes", "fallback_models_json", "TEXT NOT NULL DEFAULT '[]'")
     conn.execute(
         "UPDATE workflow_phases SET required_actor=actor "
         "WHERE required_actor IS NULL"
@@ -1796,9 +1801,16 @@ class RouteState:
             fallback_policy = str(phase.get("fallback_policy") or "").strip().lower()
             if active_count >= max_parallelism or len(executions) >= max_attempts:
                 continue
-            if executions and any(item.get("status") in {"failed", "timeout", "cancelled"}
-                                  for item in executions) and not fallback_policy:
-                continue
+            execution_kind = str(phase.get("execution_kind") or "native_agent")
+            sidecar_id = str(phase.get("sidecar_id") or "").strip() or None
+            sidecar_spec = None
+            if execution_kind == "sidecar_call" and sidecar_id:
+                try:
+                    sidecar_spec = registry.get_sidecar(sidecar_id)
+                except KeyError:
+                    continue
+                if not sidecar_spec.enabled:
+                    continue
             for role in allowed_roles:
                 controller_binding = None
                 if controller_phase:
@@ -1811,10 +1823,53 @@ class RouteState:
                         "endpoint_override": controller_binding.get("endpoint_id"),
                         "model_id": controller_binding["registry_model_id"],
                     }
+                elif sidecar_spec is not None:
+                    route = {
+                        "endpoint_override": (
+                            None if sidecar_spec.endpoint == "auto" else sidecar_spec.endpoint
+                        ),
+                        "model_id": sidecar_spec.model_id,
+                        "version": 0,
+                    }
                 else:
                     route = self.get_role_route(run_id, epoch_id, role)
                     if not route:
                         continue
+                if executions and any(
+                    item.get("status") in {"failed", "timeout", "timed_out", "cancelled", "orphaned"}
+                    for item in executions
+                ) and not fallback_policy:
+                    try:
+                        route_fallbacks = json.loads(route.get("fallback_models_json") or "[]")
+                    except (TypeError, ValueError):
+                        route_fallbacks = []
+                    if not (
+                        execution_kind == "native_agent"
+                        and isinstance(route_fallbacks, list)
+                        and route_fallbacks
+                    ):
+                        continue
+                if (
+                    execution_kind == "native_agent"
+                    and not controller_phase
+                ):
+                    try:
+                        fallback_models = json.loads(route.get("fallback_models_json") or "[]")
+                    except (TypeError, ValueError):
+                        fallback_models = []
+                    failed_attempts = sum(
+                        item.get("status") in {"failed", "timeout", "timed_out", "cancelled", "orphaned"}
+                        for item in executions
+                    )
+                    if fallback_models and failed_attempts > len(fallback_models):
+                        continue
+                    fallback_index = int(failed_attempts) - 1
+                    if failed_attempts > 0 and isinstance(fallback_models, list) and fallback_index < len(fallback_models):
+                        fallback_model = fallback_models[fallback_index]
+                        if isinstance(fallback_model, str) and fallback_model:
+                            route = dict(route)
+                            route["model_id"] = fallback_model
+                            route["endpoint_override"] = None
                 model_id = str(route["model_id"])
                 if max_attempts_per_model is not None:
                     model_attempts = sum(
@@ -1828,7 +1883,6 @@ class RouteState:
                 ) if model else None
                 provider_id = str(provider_value) if provider_value else None
                 provider = registry.providers.get(provider_id) if provider_id else None
-                execution_kind = str(phase.get("execution_kind") or "native_agent")
                 if controller_phase:
                     execution_kind = "native_agent"
                 if execution_kind not in {"native_agent", "sidecar_call"}:
@@ -1842,10 +1896,10 @@ class RouteState:
                     )
                 ):
                     continue
-                native_name = (
-                    "controller-direct"
-                    if controller_phase
-                    else registry.native_agent_name(model_id, role)
+                native_name = "controller-direct" if controller_phase else (
+                    registry.native_agent_name(model_id, role)
+                    if hasattr(registry, "native_agent_name")
+                    else f"brigade-{role}"
                 )
                 if execution_kind == "sidecar_call" and not controller_phase:
                     native_name = f"sidecar-{role}"
@@ -1869,6 +1923,14 @@ class RouteState:
                     "current_fanout": len(executions),
                     "requires_main_controller": controller_phase,
                 }
+                if sidecar_spec is not None:
+                    action.update({
+                        "sidecar_id": sidecar_id,
+                        "sidecar_mode": sidecar_spec.mode,
+                        "timeout_seconds": sidecar_spec.timeout_seconds,
+                        "max_packet_bytes": sidecar_spec.max_packet_bytes,
+                        "max_output_tokens": sidecar_spec.max_output_tokens,
+                    })
                 if claim is not None:
                     action.update({
                         "status": str(claim["status"]),
@@ -3201,6 +3263,10 @@ class RouteState:
                     (None if target.endpoint == "auto" else target.endpoint, run_id, epoch_id, role),
                 )
                 conn.execute(
+                    "UPDATE role_routes SET fallback_models_json=? WHERE run_id=? AND epoch_id=? AND role=?",
+                    (json.dumps(target.fallback_models), run_id, epoch_id, role),
+                )
+                conn.execute(
                     "INSERT INTO route_events (run_id, epoch_id, event_type, role, new_model_id, created_at) "
                     "VALUES (?, ?, 'profile_set', ?, ?, ?)",
                     (run_id, epoch_id, role, model_id, now),
@@ -3232,6 +3298,7 @@ class RouteState:
                     "required_successes": p.required_successes,
                     "max_attempts": p.max_attempts,
                     "max_attempts_per_model": p.max_attempts_per_model,
+                    "sidecar_id": p.sidecar,
                 }
                 for p in spec.phases
             ]
@@ -3246,7 +3313,7 @@ class RouteState:
                        specification_hash, ordinal, distinct_agent_from_json, max_duration_seconds,
                        turn_budget, provider_requirements_json, min_fanout, max_fanout, result_schema,
                        quality_quorum, fallback_policy, execution_kind, required_actor,
-                       max_parallelism, required_successes, max_attempts, max_attempts_per_model)
+                       max_parallelism, required_successes, max_attempts, max_attempts_per_model, sidecar_id)
                        VALUES (
                            ?, ?, ?, ?,
                            ?, ?, ?, ?,
@@ -3254,7 +3321,7 @@ class RouteState:
                            ?, ?, ?, ?,
                            ?, ?, ?, ?,
                            ?, ?, ?, ?,
-                           ?, ?, ?, ?
+                           ?, ?, ?, ?, ?
                        )""",
                     (
                         run_id, epoch_id, phase["id"], "pending",
@@ -3274,6 +3341,7 @@ class RouteState:
                         phase.get("execution_kind", "native_agent"), phase.get("actor", ""),
                         phase.get("max_parallelism"), phase.get("required_successes"),
                         phase.get("max_attempts") or phase.get("max_fanout", 1), phase.get("max_attempts_per_model"),
+                        phase.get("sidecar_id"),
                     ),
                 )
 
@@ -3802,6 +3870,10 @@ class RouteState:
                         "UPDATE role_routes SET endpoint_id=? WHERE run_id=? AND epoch_id=? AND role=?",
                         (None if target.endpoint == "auto" else target.endpoint, run_id, epoch_id, role),
                     )
+                    conn.execute(
+                        "UPDATE role_routes SET fallback_models_json=? WHERE run_id=? AND epoch_id=? AND role=?",
+                        (json.dumps(target.fallback_models), run_id, epoch_id, role),
+                    )
 
                     # 2. Read actual version after upsert
                     row = conn.execute(
@@ -3889,6 +3961,10 @@ class RouteState:
                         "UPDATE role_routes SET endpoint_id=? WHERE run_id=? AND epoch_id=? AND role=?",
                         (None if target.endpoint == "auto" else target.endpoint, run_id, epoch_id, role),
                     )
+                    conn.execute(
+                        "UPDATE role_routes SET fallback_models_json=? WHERE run_id=? AND epoch_id=? AND role=?",
+                        (json.dumps(target.fallback_models), run_id, epoch_id, role),
+                    )
 
                     # Append route_event for each role
                     conn.execute(
@@ -3933,6 +4009,7 @@ class RouteState:
     def set_role_route(
         self, run_id: str, epoch_id: str, role: str, model_id: str, source: str,
         reason: str = "", endpoint_override: str | None = None,
+        fallback_models: list[str] | None = None,
     ) -> dict:
         """Upsert role_routes row (increment version). Append route_events. Returns route dict."""
         if role not in _VALID_ROLES:
@@ -3970,6 +4047,12 @@ class RouteState:
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (run_id, epoch_id, "route_change", role, old_model_id, model_id, now),
             )
+            if fallback_models is not None:
+                conn.execute(
+                    "UPDATE role_routes SET fallback_models_json=? "
+                    "WHERE run_id=? AND epoch_id=? AND role=?",
+                    (json.dumps(fallback_models), run_id, epoch_id, role),
+                )
             conn.commit()
 
             return {
@@ -3982,6 +4065,7 @@ class RouteState:
                 "version": new_version,
                 "changed_at": now,
                 "endpoint_override": endpoint_override,
+                "fallback_models": fallback_models or [],
             }
         finally:
             conn.close()
@@ -3990,14 +4074,14 @@ class RouteState:
         conn = self._new_conn()
         try:
             row = conn.execute(
-                "SELECT run_id, epoch_id, role, model_id, source, reason, version, changed_at, endpoint_id, endpoint_override "
+                "SELECT run_id, epoch_id, role, model_id, source, reason, version, changed_at, endpoint_id, endpoint_override, fallback_models_json "
                 "FROM role_routes WHERE run_id = ? AND epoch_id = ? AND role = ?",
                 (run_id, epoch_id, role),
             ).fetchone()
             if row is None:
                 return None
             return dict(zip(
-                ("run_id", "epoch_id", "role", "model_id", "source", "reason", "version", "changed_at", "endpoint_id", "endpoint_override"), row
+                ("run_id", "epoch_id", "role", "model_id", "source", "reason", "version", "changed_at", "endpoint_id", "endpoint_override", "fallback_models_json"), row
             ))
         finally:
             conn.close()
@@ -4007,7 +4091,7 @@ class RouteState:
         conn = self._new_conn()
         try:
             rows = conn.execute(
-                "SELECT run_id, epoch_id, role, model_id, source, reason, version, changed_at, endpoint_id, endpoint_override "
+                "SELECT run_id, epoch_id, role, model_id, source, reason, version, changed_at, endpoint_id, endpoint_override, fallback_models_json "
                 "FROM role_routes WHERE run_id = ? AND epoch_id = ? ORDER BY role",
                 (run_id, epoch_id),
             ).fetchall()
@@ -4015,7 +4099,7 @@ class RouteState:
             for row in rows:
                 role = row[2]
                 result[role] = dict(zip(
-                    ("run_id", "epoch_id", "role", "model_id", "source", "reason", "version", "changed_at", "endpoint_id", "endpoint_override"), row
+                    ("run_id", "epoch_id", "role", "model_id", "source", "reason", "version", "changed_at", "endpoint_id", "endpoint_override", "fallback_models_json"), row
                 ))
             return result
         finally:
@@ -4461,12 +4545,17 @@ class RouteState:
         conn = self._new_conn()
         try:
             routes_rows = conn.execute(
-                "SELECT role, model_id, version, endpoint_id FROM role_routes "
+                "SELECT role, model_id, version, endpoint_id, fallback_models_json FROM role_routes "
                 "WHERE run_id = ? AND epoch_id = ?",
                 (run_id, epoch_id),
             ).fetchall()
             routes = {
-                row[0]: {"model_id": row[1], "version": row[2], "endpoint_id": row[3]}
+                row[0]: {
+                    "model_id": row[1],
+                    "version": row[2],
+                    "endpoint_id": row[3],
+                    "fallback_models": json.loads(row[4] or "[]"),
+                }
                 for row in routes_rows
             }
 
@@ -5842,7 +5931,7 @@ class RouteState:
                         specification_hash, ordinal, distinct_agent_from_json, max_duration_seconds,
                         turn_budget, provider_requirements_json, min_fanout, max_fanout, result_schema,
                         quality_quorum, fallback_policy, execution_kind, required_actor,
-                        max_parallelism, required_successes, max_attempts, max_attempts_per_model)
+                       max_parallelism, required_successes, max_attempts, max_attempts_per_model, sidecar_id)
                        VALUES (
                            ?, ?, ?, ?,
                            ?, ?, ?, ?,
@@ -5850,7 +5939,7 @@ class RouteState:
                            ?, ?, ?, ?,
                            ?, ?, ?, ?,
                            ?, ?, ?, ?,
-                           ?, ?, ?, ?
+                           ?, ?, ?, ?, ?
                        )""",
                     (
                         run_id, epoch_id, phase["id"], "pending",
@@ -5870,6 +5959,7 @@ class RouteState:
                         phase.get("execution_kind", "native_agent"), phase.get("actor", ""),
                         phase.get("max_parallelism"), phase.get("required_successes"),
                         phase.get("max_attempts") or phase.get("max_fanout", 1), phase.get("max_attempts_per_model"),
+                        phase.get("sidecar") or phase.get("sidecar_id"),
                     ),
                 )
             conn.commit()

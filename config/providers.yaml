@@ -41,3 +41,167 @@ providers:
       retryable_statuses: [429, 500, 502, 503, 504]
       max_backoff_seconds: 10
     routing_owner: brigade
+
+  kilocode:
+    display_name: Kilo Code
+    api_key_env: KILO_API_KEY
+    endpoints:
+      openai: https://api.kilo.ai/api/gateway
+    discovery:
+      type: openai-models
+      url: https://api.kilo.ai/api/gateway/models
+      free_only: true
+      strip_free_suffix: true
+    limits:
+      max_concurrency: 2
+      max_queued_agents: 4
+      queue_timeout_seconds: 20
+    retry:
+      max_attempts: 1
+      retryable_statuses: [429, 500, 502, 503, 504]
+      max_backoff_seconds: 10
+    routing_owner: brigade
+
+  cline:
+    display_name: Cline API
+    api_key_env: CLINE_API_KEY
+    endpoints:
+      openai: https://api.cline.bot/api/v1
+    discovery:
+      type: openai-models
+      url: https://api.cline.bot/api/v1/models
+    limits:
+      max_concurrency: 2
+      max_queued_agents: 4
+      queue_timeout_seconds: 20
+    retry:
+      max_attempts: 1
+      retryable_statuses: [429, 500, 502, 503, 504]
+      max_backoff_seconds: 10
+    routing_owner: brigade
+
+  clinepass:
+    display_name: Cline API (legacy ClinePass slot)
+    api_key_env: CLINEPASS_API_KEY
+    endpoints:
+      openai: https://api.cline.bot/api/v1
+    discovery:
+      type: openai-models
+      url: https://api.cline.bot/api/v1/models
+    limits:
+      max_concurrency: 2
+      max_queued_agents: 4
+      queue_timeout_seconds: 20
+    retry:
+      max_attempts: 1
+      retryable_statuses: [429, 500, 502, 503, 504]
+      max_backoff_seconds: 10
+    routing_owner: brigade
+
+  opencode-zen:
+    display_name: OpenCode Zen
+    api_key_env: OPENCODE_API_KEY
+    endpoints:
+      openai: https://opencode.ai/zen/v1
+    discovery:
+      type: openai-models
+      url: https://opencode.ai/zen/v1/models
+    limits:
+      max_concurrency: 2
+      max_queued_agents: 4
+      queue_timeout_seconds: 20
+    retry:
+      max_attempts: 1
+      retryable_statuses: [429, 500, 502, 503, 504]
+      max_backoff_seconds: 10
+    routing_owner: brigade
+
+  opencode-go:
+    display_name: OpenCode Go
+    api_key_env: OPENCODEGO_API_KEY
+    endpoints:
+      openai: https://opencode.ai/zen/go/v1
+    discovery:
+      type: openai-models
+      url: https://opencode.ai/zen/go/v1/models
+    limits:
+      max_concurrency: 2
+      max_queued_agents: 4
+      queue_timeout_seconds: 20
+    retry:
+      max_attempts: 1
+      retryable_statuses: [429, 500, 502, 503, 504]
+      max_backoff_seconds: 10
+    routing_owner: brigade
+
+  freetheai:
+    display_name: FreeTheAI
+    api_key_env: FREETHEAI_API_KEY
+    endpoints:
+      openai: https://api.freetheai.xyz/v1
+    discovery:
+      type: openai-models
+      url: https://api.freetheai.xyz/v1/models
+    limits:
+      max_concurrency: 2
+      max_queued_agents: 4
+      queue_timeout_seconds: 20
+    retry:
+      max_attempts: 1
+      retryable_statuses: [429, 500, 502, 503, 504]
+      max_backoff_seconds: 10
+    routing_owner: brigade
+
+  requesty:
+    display_name: Requesty
+    api_key_env: REQUESTY_API_KEY
+    endpoints:
+      openai: https://router.requesty.ai/v1
+    discovery:
+      type: openai-models
+      url: https://router.requesty.ai/v1/models
+    limits:
+      max_concurrency: 2
+      max_queued_agents: 4
+      queue_timeout_seconds: 20
+    retry:
+      max_attempts: 1
+      retryable_statuses: [429, 500, 502, 503, 504]
+      max_backoff_seconds: 10
+    routing_owner: brigade
+
+  freemodel:
+    display_name: FreeModel
+    api_key_env: FREEMODEL_API_KEY
+    endpoints:
+      openai: https://api.freemodel.dev/v1
+    discovery:
+      type: openai-models
+      url: https://api.freemodel.dev/v1/models
+    limits:
+      max_concurrency: 2
+      max_queued_agents: 4
+      queue_timeout_seconds: 20
+    retry:
+      max_attempts: 1
+      retryable_statuses: [429, 500, 502, 503, 504]
+      max_backoff_seconds: 10
+    routing_owner: brigade
+
+  nvidia:
+    display_name: NVIDIA NIM
+    api_key_env: NVIDIA_API_KEY
+    endpoints:
+      openai: https://integrate.api.nvidia.com/v1
+    discovery:
+      type: openai-models
+      url: https://integrate.api.nvidia.com/v1/models
+    limits:
+      max_concurrency: 2
+      max_queued_agents: 4
+      queue_timeout_seconds: 20
+    retry:
+      max_attempts: 1
+      retryable_statuses: [429, 500, 502, 503, 504]
+      max_backoff_seconds: 10
+    routing_owner: brigade

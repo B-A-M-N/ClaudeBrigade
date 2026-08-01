@@ -35,12 +35,32 @@ scheduling contract. MCP is the authenticated local control surface for
 changing models, profiles, endpoint overrides, and workflow state; it is not
 the specialist execution engine.
 
+## Configure inference, sidecars, and credentials
+
+Use the interactive configuration CLI after installation:
+
+```bash
+claude-brigade-config
+```
+
+It keeps the Claude Code controller/native-agent inference profile and the
+bounded sidecar profile independent. You can save, edit, delete, and reuse
+named profiles. Model selection searches the currently loaded catalog, and
+`claude-brigade-config refresh` updates provider-backed catalogs when a usable
+credential is available.
+
+Inference profiles support ordered model/provider fallback per role. Key
+rotation is a separate control: save multiple named keys for the same
+provider, and requests rotate between those slots without changing the model
+or provider route. These controls can be used independently or together.
+
 ## Local FreeInference BYOK
 
 FreeInference can be used as the controller or as a visible specialist
-provider without Anthropic credentials. Put the user-owned key in the local
-`providers.env` file and keep Claude Code pointed at the loopback router. The
-default FreeInference concurrency is four and can be adjusted with:
+provider without Anthropic credentials. The preferred credential store is the
+user's OS keyring; the locked-down `providers.env` file remains a compatibility
+fallback for headless installations. The default FreeInference concurrency is
+four and can be adjusted with:
 
 ```bash
 FREEINFERENCE_MAX_CONCURRENCY=4
@@ -91,7 +111,15 @@ The script installs to:
 - `~/.local/state/claude-brigade/` — SQLite route state
 - `~/.local/bin/` — `claude-brigade`, `claude-brigade-doctor`, etc. (plus `claude-enhanced*` symlinks for backward compatibility)
 
-Edit the protected key file:
+For interactive setup, use:
+
+```bash
+claude-brigade-config
+```
+
+The CLI stores provider keys in the OS keyring when available. It never
+prints them, and `show` displays only provider/slot names and availability.
+Use the legacy file only when no usable keyring backend is available:
 
 ```bash
 nano ~/.config/claude-brigade/providers.env
@@ -104,6 +132,13 @@ FREEINFERENCE_API_KEY='your_freeinference_key_here'
 LONGCAT_API_KEY='your_key_here'
 LONGCAT_API_BASE='https://api.longcat.chat/anthropic'
 ```
+
+Named key slots are recorded as non-secret metadata in
+`~/.config/claude-brigade/credential_slots.yaml`; their values stay in the
+OS keyring. Slots use round-robin rotation by default. Providers currently
+covered by the bundled catalog include FreeInference, OpenRouter, Kilo/Crush
+free models, OpenCode Zen/Go, Cline free models, NVIDIA NIM, FreeTheAI,
+Requesty, FreeModel, and direct Anthropic-compatible endpoints.
 
 Authenticate the separate profile only when the selected arrangement needs a
 Claude/Anthropic route. FreeInference-only sessions use the local router token
@@ -253,6 +288,17 @@ profiles:
 
 The router validates at load time that every role reference points to an existing, enabled model.
 
+The interactive CLI may also add `controller_model` and per-role ordered
+`fallback_models`. Those fallbacks are model/provider choices; they are
+separate from multiple credential slots within one provider.
+
+### `sidecars.yaml`
+
+Defines bounded, read-only sidecar calls independently from the controller and
+native-agent inference profile. A sidecar selects its own model, endpoint,
+mode, timeout, packet/output bounds, and prompt. Sidecars cannot mutate files
+or workflow authority and are displayed explicitly as sidecars in status.
+
 ### `workflows.yaml`
 
 Maps workflow tiers (`trivial`, `normal`, `cross-cutting`, `high-risk`) to a `default_profile` and an ordered list of phases with role assignments, dependency edges, and mutation flags.
@@ -297,14 +343,16 @@ execution boundary.
 
 ### Environment isolation
 
-- Provider API keys (`LONGCAT_API_KEY`, `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, etc.) are loaded only into the router process from `providers.env`.
+- Provider API keys (`LONGCAT_API_KEY`, `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, etc.) are loaded only into the router process from the OS keyring or, for compatibility, `providers.env`.
+- Named key-slot values are materialized only under router-generated internal environment names for the router/LiteLLM child; Claude Code never receives them.
 - `FREEINFERENCE_MAX_CONCURRENCY` is a non-secret router setting; it changes the shared FreeInference admission limit without exposing `FREEINFERENCE_API_KEY` to Claude Code.
 - The launcher explicitly unsets inherited API-key, OAuth-token, cloud-provider, model-override, and global-subagent-model environment variables before starting Claude Code.
 - This prevents a shell-level override from silently replacing the selected controller or forcing every subagent onto the wrong model.
 
 ### Safe env-file parsing (env_parser.py)
 
-The `providers.env` file is parsed by a strict, non-executing dotenv parser with:
+When used as a fallback, the `providers.env` file is parsed by a strict,
+non-executing dotenv parser with:
 
 - **Symlink rejection** — file is rejected outright when it is a symlink.
 - **Ownership validation** — file must be owned by the current user or root.
@@ -318,7 +366,10 @@ The launcher uses POSIX `flock(2)` to prevent concurrent invocations from racing
 
 ### Symlink protection
 
-Token files (`router.token`, `litellm.token`) and `providers.env` are rejected when they are symlinks. File writes use `O_NOFOLLOW | O_EXCL` flags to prevent symlink-based token substitution.
+Token files (`router.token`, `litellm.token`), `providers.env`, and the
+non-secret slot manifest are rejected or replaced safely when symlinked. File
+writes use owner-only permissions and atomic replacement to prevent
+symlink-based credential substitution.
 
 ### Restrictive umask
 
@@ -326,7 +377,9 @@ The launcher sets `umask 077` before creating any runtime files, ensuring owner-
 
 ### Launch audit trail
 
-Every invocation writes a structured JSON event to `$CACHE_DIR/audit.jsonl` (mode `0600`) with timestamp, run ID, PID, provider keys loaded, and a truncated hash of the router token.
+Every invocation writes a structured JSON event to `$CACHE_DIR/audit.jsonl`
+(mode `0600`) with timestamp, run ID, PID, credential names loaded, and a
+truncated hash of the router token. Secret values are not logged.
 
 ### Log rotation
 
@@ -372,7 +425,8 @@ configured fallback policy.
 
 - Normal Claude profile: `~/.claude`
 - Enhanced Claude profile: `~/.claude-brigade`
-- Provider keys: `~/.config/claude-brigade/providers.env` with mode `0600`
+- Provider keys: OS keyring (preferred); legacy `~/.config/claude-brigade/providers.env` fallback with mode `0600`
+- Credential slot metadata: `~/.config/claude-brigade/credential_slots.yaml` with mode `0600`
 - Router token: `~/.config/claude-brigade/router.token` with mode `0600`
 - LiteLLM key: `~/.config/claude-brigade/litellm.token` with mode `0600`
 - Launch audit trail: `$CACHE_DIR/audit.jsonl` with mode `0600`
@@ -380,10 +434,10 @@ configured fallback policy.
 
 ### Security primitives (BrokeLLM-derived)
 
-- **Symlink protection**: Token files (`router.token`, `litellm.token`) and `providers.env` are rejected when they are symlinks. File writes use `O_NOFOLLOW | O_EXCL` flags to prevent symlink-based token substitution.
+- **Symlink protection**: Token files (`router.token`, `litellm.token`), `providers.env`, and the slot manifest are rejected when they are symlinks. Credential/configuration writes use exclusive temporary files and atomic replacement to prevent symlink-based substitution.
 - **Restrictive umask**: The launcher sets `umask 077` before creating any runtime files, ensuring owner-only permissions by default.
 - **Expanded env key ban list**: All common provider API keys (`OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, `GROQ_API_KEY`, `OPENAI_API_KEY`, etc.) are unset before Claude Code starts — they are only available to the router process.
-- **Launch audit trail**: Every invocation writes a structured JSON event to `audit.jsonl` with timestamp, run ID, PID, provider keys loaded, and a truncated hash of the router token.
+- **Launch audit trail**: Every invocation writes a structured JSON event to `audit.jsonl` with timestamp, run ID, PID, credential names loaded, and a truncated hash of the router token; secret values are never logged.
 - **Log rotation**: The router log auto-rotates at 10 MB with 5 retained backups, preventing unbounded disk usage.
 
 ## Diagnostics

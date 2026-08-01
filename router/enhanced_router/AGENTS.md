@@ -29,6 +29,18 @@ Agent process lifecycle; hooks report and guard that lifecycle.
   only native actions are represented as Claude Code native agents.
 - Model-qualified agent names and public aliases come from the registry
   manifest. Do not add parallel hardcoded identity maps.
+- Sidecar definitions are independently selected from `sidecars.yaml`; their
+  model/provider route must not be inferred from a native role profile when a
+  phase names a sidecar.
+- Saved role/controller inference profiles may include ordered fallbacks. A
+  fallback is a new route candidate, not permission to mutate an existing
+  immutable binding.
+- Provider API keys are read inside the router from the OS credential store;
+  the owner-only `providers.env` file is a compatibility fallback. Do not
+  reintroduce provider-key exports into the Claude Code launcher environment.
+- Explicit catalog refreshes may persist non-secret model metadata in
+  `discovered_models.yaml`. Discovered entries are sidecar/read-only by
+  default and must not gain native role or certification authority implicitly.
 - `state.py` remains a large transactional boundary for now. Keep changes
   localized and preserve existing transaction/invariant tests; do not perform a
   broad state/repository refactor in this workstream without explicit approval.

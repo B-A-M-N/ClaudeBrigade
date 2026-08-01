@@ -57,8 +57,22 @@ class SidecarExecutor:
         packet: dict[str, Any],
     ) -> dict[str, Any]:
         encoded = json.dumps(packet, separators=(",", ":"), ensure_ascii=False)
-        if len(encoded.encode("utf-8")) > _MAX_PACKET_BYTES:
-            raise WorkflowStateError("sidecar packet exceeds the 64 KiB bound")
+        action = next(
+            (
+                item for item in self.state.get_runnable_actions(
+                    run_id, epoch_id, include_claimed=True
+                )
+                if item.get("action_id") == action_id
+            ),
+            None,
+        )
+        max_packet_bytes = int(
+            (action or {}).get("max_packet_bytes") or _MAX_PACKET_BYTES
+        )
+        if len(encoded.encode("utf-8")) > min(max_packet_bytes, _MAX_PACKET_BYTES):
+            raise WorkflowStateError(
+                f"sidecar packet exceeds the {min(max_packet_bytes, _MAX_PACKET_BYTES)} byte bound"
+            )
         execution_id = f"scx_{uuid.uuid4().hex}"
         execution = self.state.start_sidecar_execution(
             run_id=run_id,
@@ -133,11 +147,15 @@ class SidecarExecutor:
         try:
             self.state.update_agent_execution(execution_id, status="running")
             self._event(execution_id, execution, "running", {})
-            response_payload, status_code, usage = await self._request(
-                run_id=run_id,
-                epoch_id=epoch_id,
-                execution=execution,
-                packet=packet,
+            timeout_seconds = self._timeout_seconds(execution)
+            response_payload, status_code, usage = await asyncio.wait_for(
+                self._request(
+                    run_id=run_id,
+                    epoch_id=epoch_id,
+                    execution=execution,
+                    packet=packet,
+                ),
+                timeout=timeout_seconds,
             )
             if status_code < 200 or status_code >= 300:
                 raise RuntimeError(f"sidecar provider returned HTTP {status_code}")
@@ -203,6 +221,7 @@ class SidecarExecutor:
     ) -> tuple[dict[str, Any], int, dict[str, int]]:
         role = str(execution["role"])
         public_model = f"anthropic-brigade-{role}"
+        sidecar = self._sidecar_spec(execution)
         identity = RequestIdentity(
             run_id=run_id,
             claude_session_id=None,
@@ -210,7 +229,17 @@ class SidecarExecutor:
             claude_parent_agent_id=None,
             endpoint_kind="/v1/messages",
         )
-        resolved = resolve_request(identity=identity, public_model=public_model)
+        resolved = resolve_request(
+            identity=identity,
+            public_model=public_model,
+            explicit_model_id=sidecar.model_id if sidecar is not None else None,
+            explicit_endpoint=(
+                sidecar.endpoint
+                if sidecar is not None and sidecar.endpoint != "auto"
+                else None
+            ),
+            sidecar=sidecar is not None,
+        )
         request = _InternalRequest(
             method="POST",
             headers={
@@ -220,13 +249,17 @@ class SidecarExecutor:
                 "x-claude-code-agent-id": str(execution["claude_agent_id"]),
             },
         )
+        messages: list[dict[str, str]] = []
+        if sidecar is not None and sidecar.system_prompt.strip():
+            messages.append({"role": "system", "content": sidecar.system_prompt})
+        messages.append({
+            "role": "user",
+            "content": json.dumps(packet, separators=(",", ":"), ensure_ascii=False),
+        })
         payload = {
             "model": public_model,
-            "messages": [{
-                "role": "user",
-                "content": json.dumps(packet, separators=(",", ":"), ensure_ascii=False),
-            }],
-            "max_tokens": 2_048,
+            "messages": messages,
+            "max_tokens": sidecar.max_output_tokens if sidecar is not None else 2_048,
             "stream": False,
         }
         if resolved.kind is BackendType.DIRECT_ANTHROPIC:
@@ -254,6 +287,31 @@ class SidecarExecutor:
             "output_tokens": int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0),
             "total_tokens": int(usage.get("total_tokens", 0) or 0),
         }
+
+    def _sidecar_spec(self, execution: dict[str, Any]) -> Any | None:
+        phase = next(
+            (
+                item for item in self.state.get_workflow_phases(
+                    str(execution["run_id"]), str(execution["epoch_id"])
+                )
+                if item.get("phase_id") == execution.get("phase_id")
+            ),
+            None,
+        )
+        sidecar_id = str((phase or {}).get("sidecar_id") or "").strip()
+        if not sidecar_id:
+            return None
+        from enhanced_router.registry import get_registry
+
+        registry = get_registry()
+        getter = getattr(registry, "get_sidecar", None)
+        if getter is None:
+            return None
+        return getter(sidecar_id)
+
+    def _timeout_seconds(self, execution: dict[str, Any]) -> float:
+        sidecar = self._sidecar_spec(execution)
+        return float(sidecar.timeout_seconds) if sidecar is not None else 45.0
 
     @staticmethod
     def _extract_result(response: dict[str, Any]) -> Any:

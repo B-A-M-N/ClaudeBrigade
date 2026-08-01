@@ -182,6 +182,27 @@ class FastpathConfigSpec(StrictConfigModel):
         return self
 
 
+class SidecarSpec(StrictConfigModel):
+    """Independent, bounded inference policy for one router sidecar."""
+
+    model_id: str
+    mode: Literal["route", "verify", "structured"] = "structured"
+    endpoint: str = "auto"
+    enabled: bool = True
+    timeout_seconds: float = Field(default=45.0, gt=0, le=600)
+    max_packet_bytes: int = Field(default=64_000, ge=1_024, le=256_000)
+    max_output_tokens: int = Field(default=2_048, ge=64, le=131_072)
+    system_prompt: str = ""
+
+    @model_validator(mode="after")
+    def _validate_sidecar_policy(self) -> "SidecarSpec":
+        if not self.model_id.strip():
+            raise ValueError("sidecar model_id must not be empty")
+        if self.endpoint != "auto" and not self.endpoint.strip():
+            raise ValueError("sidecar endpoint must be 'auto' or a named endpoint")
+        return self
+
+
 class ModelAuthSpec(StrictConfigModel):
     """Explicit transport authentication for a provider backend.
 
@@ -285,6 +306,7 @@ class ProfileSpec(StrictConfigModel):
     implementer: "str | RouteTargetSpec"
     adversary: "str | RouteTargetSpec"
     repairer: "str | RouteTargetSpec"
+    controller_model: str | None = None
     specialists: dict[str, "SpecialistSpec"] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -316,6 +338,7 @@ class RouteTargetSpec(StrictConfigModel):
 
     model: str
     endpoint: str = "auto"
+    fallback_models: list[str] = Field(default_factory=list)
 
 
 class SpecialistSpec(StrictConfigModel):
@@ -395,6 +418,17 @@ class WorkflowPhase(StrictConfigModel):
     required_successes: int | None = Field(default=None, ge=1)
     max_attempts: int | None = Field(default=None, ge=1)
     max_attempts_per_model: int | None = Field(default=None, ge=1)
+    sidecar: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_sidecar_phase(self) -> "WorkflowPhase":
+        if self.sidecar and self.execution_kind != "sidecar_call":
+            raise ValueError("workflow phase sidecar requires execution_kind='sidecar_call'")
+        if self.sidecar and self.mutation:
+            raise ValueError("sidecar phases must remain read-only")
+        if self.execution_kind == "sidecar_call" and self.mutation:
+            raise ValueError("sidecar_call phases must remain read-only")
+        return self
 
 
 class WorkflowSpec(StrictConfigModel):

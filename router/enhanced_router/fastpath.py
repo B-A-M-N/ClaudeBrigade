@@ -210,7 +210,12 @@ class FastpathClient:
         self.max_output_tokens = max_output_tokens
 
     async def request(self, mode: Literal["route", "verify"], packet: dict[str, Any]) -> dict[str, Any]:
-        key = os.environ.get(self.api_key_env)
+        try:
+            from enhanced_router.credential_store import resolve_loaded
+
+            key = resolve_loaded(self.api_key_env)
+        except Exception:
+            key = os.environ.get(self.api_key_env)
         if not key:
             raise RuntimeError(f"fastpath credential '{self.api_key_env}' is unavailable")
         prompt = json.dumps(packet, separators=(",", ":"), ensure_ascii=False)

@@ -25,10 +25,12 @@ This document describes the essential knowledge for an agent to work effectively
 
 **Key architectural components:**
 - `router/enhanced_router/` — FastAPI app, routing logic, state, registry, backends, LiteLLM supervisor, MCP control
-- `config/` — YAML configs: `models.yaml`, `profiles.yaml`, `workflows.yaml`, `providers.yaml`, `fastpath.yaml`
+- `config/` — YAML configs for models, profiles, workflows, providers,
+  sidecars, fastpath, and generated discovered model catalogs
 - `hooks/` — Claude Code hooks for guardrails, audit, session lifecycle, completion
 - `agents/` — Agent definition files (injected via `--agents` flag at launch)
-- `bin/` — Launcher scripts (`claude-brigade`, `claude-brigade-doctor`, etc.)
+- `bin/` — Launcher scripts, including `claude-brigade-config` for credentials,
+  catalogs, saved sidecars, and inference profiles
 - `tests/` — pytest coverage for routing, state, hooks, provider admission,
   fastpath, LiteLLM, and shadow-worktree integration (run the suite for the
   current count)
@@ -75,6 +77,7 @@ ruff format router/enhanced_router/
 
 ```bash
 claude-brigade-doctor                    # health check
+claude-brigade-config                     # interactive credentials/catalogs/profiles/sidecars
 claude-brigade-router-stop               # stop background router
 cat ~/.cache/claude-brigade/router.log   # router logs (rotated at 10MB, 5 backups)
 CLAUDE_CONFIG_DIR=~/.claude-brigade claude doctor
@@ -89,9 +92,12 @@ CLAUDE_CONFIG_DIR=~/.claude-brigade claude auth status --text
 ~/.config/claude-brigade/profiles.yaml
 ~/.config/claude-brigade/workflows.yaml
 ~/.config/claude-brigade/providers.yaml     # provider limits and deadlines
+~/.config/claude-brigade/sidecars.yaml      # independent sidecar policies
+~/.config/claude-brigade/discovered_models.yaml # generated catalog metadata
 
 # Provider keys (LONGCAT_API_KEY, OPENROUTER_API_KEY, etc.)
-~/.config/claude-brigade/providers.env      # mode 0600
+# Preferred: OS credential store managed by claude-brigade-config.
+~/.config/claude-brigade/providers.env      # legacy fallback, mode 0600
 
 # Secrets (auto-generated, mode 0600)
 ~/.config/claude-brigade/router.token
@@ -125,6 +131,8 @@ CLAUDE_CONFIG_DIR=~/.claude-brigade claude auth status --text
 - **`models.yaml`** — Model definitions: `display_name`, `backend` (`direct-anthropic` | `litellm`), `upstream_model`/`litellm_model`, `api_base`/`api_base_env`/`api_key_env`, `capabilities`, `allowed_roles`, `enabled`
 - **`providers.yaml`** — Provider-wide admission limits; FreeInference defaults to `max_concurrency: 4` across controller, agents, and transports
 - **`fastpath.yaml`** — Optional DiffusionGemma route/verify sidecar; advisory and read-only, never an authority for endpoints, merges, or completion
+- **`sidecars.yaml`** — Independent bounded sidecar model/provider policies
+- **`discovered_models.yaml`** — Generated non-secret provider catalog metadata
 - **`profiles.yaml`** — Maps 4 roles (`recon`, `implementer`, `adversary`, `repairer`) to model IDs
 - **`workflows.yaml`** — Maps workflow names (`normal`, `cross-cutting`, `high-risk`, `trivial`) to `default_profile`
 
@@ -270,7 +278,7 @@ Key invariants (enforced by unique indexes):
 | `CLAUDE_BRIGADE_RUN_ID` | Passed to hooks for session correlation |
 | `ENHANCED_ROUTER_TOKEN` | Router auth (from `router.token`) |
 | `BRIGADE_LITELLM_KEY` | LiteLLM internal auth (from `litellm.token`) |
-| `LONGCAT_API_KEY` / `OPENROUTER_API_KEY` / etc. | Provider keys (loaded from `providers.env`) |
+| `LONGCAT_API_KEY` / `OPENROUTER_API_KEY` / etc. | Router-only provider keys; preferred source is the OS credential store, with `providers.env` as fallback |
 | `ANTHROPIC_UPSTREAM` | Override Anthropic base URL |
 | `LONGCAT_UPSTREAM` | Override LongCat base URL |
 
@@ -453,7 +461,7 @@ All 9 milestones complete (see `bin/plan.md` and `meta/M*.md`):
 ## Version & Dependencies
 
 - **Python**: >=3.10
-- **Core deps**: `fastapi`, `httpx`, `mcp`, `PyYAML`, `uvicorn`, `litellm[proxy]==1.93.0`
+- **Core deps**: `fastapi`, `httpx`, `mcp`, `PyYAML`, `keyring`, `uvicorn`, `litellm[proxy]==1.93.0`
 - **Test deps**: `pytest`, `pytest-asyncio`, `pytest-cov`
 - **Package**: `enhanced_router` (installed editable in venv)
 - **Entry point**: `claude-brigade` (bash launcher)

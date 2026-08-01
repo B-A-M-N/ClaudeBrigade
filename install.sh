@@ -67,7 +67,7 @@ cp "$SOURCE_DIR/agents/controller-append.md" "$PROFILE_DIR/controller-append.md"
 cp "$SOURCE_DIR"/hooks/*.py "$PROFILE_DIR/hooks/"
 
 # Copy only declared executables to $BIN_DIR (not plan.md, etc.)
-for _exe in claude-brigade claude-brigade-doctor claude-brigade-login claude-brigade-router-stop; do
+for _exe in claude-brigade claude-brigade-config claude-brigade-doctor claude-brigade-login claude-brigade-router-stop; do
   if [[ -f "$SOURCE_DIR/bin/$_exe" ]]; then
     cp "$SOURCE_DIR/bin/$_exe" "$BIN_DIR/$_exe"
     chmod 700 "$BIN_DIR/$_exe"
@@ -109,6 +109,12 @@ if [[ ! -f "$CONFIG_MIGRATED" ]]; then
   if [[ ! -f "$CONFIG_DIR/providers.yaml" ]]; then
     cp "$SOURCE_DIR/config/providers.yaml" "$CONFIG_DIR/providers.yaml"
   fi
+  if [[ ! -f "$CONFIG_DIR/fastpath.yaml" ]]; then
+    cp "$SOURCE_DIR/config/fastpath.yaml" "$CONFIG_DIR/fastpath.yaml"
+  fi
+  if [[ ! -f "$CONFIG_DIR/sidecars.yaml" ]]; then
+    cp "$SOURCE_DIR/config/sidecars.yaml" "$CONFIG_DIR/sidecars.yaml"
+  fi
 
   # Generate router token (only on first install)
   if [[ ! -f "$CONFIG_DIR/router.token" ]]; then
@@ -139,6 +145,15 @@ os.chmod(path, 0o600)
 LONGCAT_API_KEY=replace_me
 # OPENROUTER_API_KEY=
 # DEEPSEEK_API_KEY=
+# KILO_API_KEY=
+# CLINE_API_KEY=
+# CLINEPASS_API_KEY=
+# OPENCODE_API_KEY=
+# OPENCODEGO_API_KEY=
+# NVIDIA_API_KEY=
+# FREETHEAI_API_KEY=
+# REQUESTY_API_KEY=
+# FREEMODEL_API_KEY=
 ENV
   fi
   chmod 600 "$CONFIG_DIR/providers.env"
@@ -173,7 +188,7 @@ os.chmod(path, 0o600)
   touch "$CONFIG_MIGRATED"
 else
   # ---- Upgrade path: install new defaults as .example files ---------------
-  for _default in models.yaml profiles.yaml workflows.yaml providers.yaml fastpath.yaml; do
+  for _default in models.yaml profiles.yaml workflows.yaml providers.yaml fastpath.yaml sidecars.yaml; do
     if [[ -f "$CONFIG_DIR/$_default" ]]; then
       cp "$SOURCE_DIR/config/$_default" "$CONFIG_DIR/${_default}.example"
     else
@@ -205,6 +220,16 @@ PY
 # FREEINFERENCE_API_KEY=
 # FREEINFERENCE_MAX_CONCURRENCY=4
 LONGCAT_API_KEY=replace_me
+# OPENROUTER_API_KEY=
+# KILO_API_KEY=
+# CLINE_API_KEY=
+# CLINEPASS_API_KEY=
+# OPENCODE_API_KEY=
+# OPENCODEGO_API_KEY=
+# NVIDIA_API_KEY=
+# FREETHEAI_API_KEY=
+# REQUESTY_API_KEY=
+# FREEMODEL_API_KEY=
 ENV
     fi
     chmod 600 "$CONFIG_DIR/providers.env"

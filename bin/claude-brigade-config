@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+APP_DIR="${CLAUDE_BRIGADE_APP_DIR:-${CLAUDE_ENHANCED_APP_DIR:-$HOME/.local/share/claude-brigade}}"
+
+if [[ -x "$APP_DIR/venv/bin/python" ]]; then
+  exec "$APP_DIR/venv/bin/python" -m enhanced_router.config_cli "$@"
+fi
+
+PYTHONPATH="$SOURCE_DIR/router${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m enhanced_router.config_cli "$@"

@@ -18,7 +18,6 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from enhanced_router.backends import (
     BackendType,
     ResolvedRoute,
-    ROLE_MODEL_ALIASES,
     parse_request_identity,
     proxy_direct_anthropic as _proxy_direct_anthropic_backend,
     proxy_litellm_messages as _proxy_litellm_messages_backend,
@@ -142,8 +141,27 @@ def _configure_provider_admission() -> None:
     configure_provider_admission(configured)
 
 
+def _load_runtime_credentials() -> None:
+    """Load provider credentials inside the router process only.
+
+    The launcher deliberately starts the router without provider keys in its
+    own environment.  The router may read the OS keyring, with the protected
+    providers.env file retained as a compatibility fallback.
+    """
+    from enhanced_router.base import BRIGADE_CONFIG_DIR
+    from enhanced_router.bootstrap_env import load_router_credentials
+
+    result = load_router_credentials(BRIGADE_CONFIG_DIR)
+    os.environ.update(result.provider_env)
+    global LONGCAT_API_KEY
+    LONGCAT_API_KEY = os.environ.get("LONGCAT_API_KEY", "")
+    if result.provider_keys:
+        LOGGER.info("loaded %d provider credential/config entries inside router", len(result.provider_keys))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _load_runtime_credentials()
     _configure_provider_admission()
     try:
         state = get_state()

@@ -12,6 +12,7 @@ dependencies = [
     "httpx>=0.28,<1",
     "mcp>=1.27,<2",
     "PyYAML>=6.0,<7",
+    "keyring>=25.0,<26",
     "uvicorn>=0.34,<1",
     "litellm[proxy]==1.93.0",
 ]

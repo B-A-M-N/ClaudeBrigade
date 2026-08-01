@@ -26,6 +26,7 @@ class DiscoveredEndpoint:
     max_output_tokens: int | None
     capabilities: dict[str, Any]
     raw: dict[str, Any]
+    logical_model_id: str | None = None
 
 
 def _first_int(payload: dict[str, Any], *keys: str) -> int | None:

@@ -845,6 +845,46 @@ def test_retry_policy_keeps_phase_active_until_attempt_budget_is_exhausted(
     assert state.complete_phase_if_ready("r1", "ep-1", "recon")["status"] == "failed"
 
 
+def test_role_route_fallback_is_used_without_phase_retry_policy(
+    state: RouteState, monkeypatch: pytest.MonkeyPatch,
+):
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    state.set_role_route(
+        "r1", "ep-1", "recon", "model-a", "manual",
+        fallback_models=["model-b"],
+    )
+    state.initialize_workflow_phases(
+        "r1", "ep-1", [{"id": "recon", "roles": ["recon"], "max_fanout": 1, "max_attempts": 2}],
+    )
+    state.start_phase("r1", "ep-1", "recon")
+
+    class FakeRegistry:
+        providers: dict = {}
+
+        @staticmethod
+        def get_model(model_id: str) -> SimpleNamespace:
+            return SimpleNamespace(provider_id=None)
+
+        @staticmethod
+        def native_agent_name(model_id: str, role: str) -> str:
+            return f"brigade-{model_id}-{role}"
+
+    import enhanced_router.registry as registry_module
+    monkeypatch.setattr(registry_module, "get_registry", lambda: FakeRegistry())
+
+    first = next(item for item in state.get_runnable_actions("r1", "ep-1"))
+    assert first["model_id"] == "model-a"
+    execution = state.create_agent_execution(
+        "ex-fallback-1", "r1", "ep-1", "agent-fallback-1", "recon", "model-a",
+        phase_id="recon",
+    )
+    state.update_agent_execution(execution["execution_id"], status="failed")
+
+    second = next(item for item in state.get_runnable_actions("r1", "ep-1"))
+    assert second["model_id"] == "model-b"
+
+
 def test_completion_token_is_bound_to_workspace_and_consumed_once(state: RouteState):
     state.create_run("r1")
     state.create_epoch("r1", "ep-1", "normal", "hybrid")

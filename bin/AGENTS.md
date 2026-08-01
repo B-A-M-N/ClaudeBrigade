@@ -16,12 +16,18 @@ diagnostics, and operator-facing shell behavior.
   appendix, router credentials, MCP configuration, provider-key isolation,
   run ID, and router process lifecycle.
 - Provider keys stay in the router process and must be removed from the
-  Claude Code environment before launch.
+  Claude Code environment before launch. The launcher starts the router
+  without inherited provider keys; the router reads the OS credential store
+  directly, with `providers.env` as a locked-down compatibility fallback.
 - Token and provider files must remain owner-only and reject symlink attacks.
 - User-supplied Claude flags that would replace the managed agent/system
   contract must be rejected; controller model selection is explicitly allowed.
 - `claude-brigade-doctor` reports readiness and configuration problems; it must
   not claim a route is healthy merely because an alias is present.
+- `claude-brigade-config` is the interactive saved-configuration manager. It
+  uses hidden input and the OS credential store by default, may write the
+  owner-only `providers.env` fallback through atomic replacement, and must
+  never print credential values.
 - Do not add destructive cleanup, reset, stash, commit, or force-merge logic
   to hooks or launcher paths.
 
