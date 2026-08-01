@@ -2234,6 +2234,86 @@ class RouteState:
         finally:
             conn.close()
 
+    def start_detached_sidecar_execution(
+        self,
+        *,
+        run_id: str,
+        epoch_id: str,
+        execution_id: str,
+        phase_id: str,
+        role: str,
+        model_id: str,
+        provider_id: str | None,
+        packet: dict,
+    ) -> dict:
+        """Create a persisted router-owned advisory sidecar execution.
+
+        Fastpath jobs are created by the router itself rather than by a
+        workflow claim.  They still use the same execution ledger and event
+        stream as claimed sidecars, but are scoped to an existing run/epoch
+        and cannot become native-agent or mutation work.
+        """
+        encoded_packet = json.dumps(packet, separators=(",", ":"), ensure_ascii=False)
+        if len(encoded_packet.encode("utf-8")) > 64_000:
+            raise WorkflowStateError("detached sidecar packet exceeds the 64 KiB bound")
+        sidecar_agent_id = f"sidecar:{execution_id}"
+        conn = self._new_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            owned = conn.execute(
+                "SELECT 1 FROM runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            epoch = conn.execute(
+                "SELECT 1 FROM epochs WHERE run_id=? AND epoch_id=? AND closed_at IS NULL",
+                (run_id, epoch_id),
+            ).fetchone()
+            if owned is None or epoch is None:
+                raise WorkflowStateError("detached sidecar run or epoch is not active")
+            existing = conn.execute(
+                "SELECT * FROM agent_executions WHERE execution_id=?", (execution_id,)
+            ).fetchone()
+            if existing is not None:
+                if existing["run_id"] != run_id or existing["epoch_id"] != epoch_id:
+                    raise WorkflowStateError("execution ID is owned by another run")
+                conn.rollback()
+                return dict(existing)
+            now = _utcnow()
+            independence_key = hashlib.sha256(
+                json.dumps({
+                    "model_id": model_id,
+                    "provider_id": provider_id,
+                    "role": role,
+                    "phase_id": phase_id,
+                    "execution_id": execution_id,
+                }, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            conn.execute(
+                "INSERT INTO agent_executions "
+                "(execution_id, run_id, epoch_id, claude_agent_id, role, model_id, phase_id, "
+                "status, actor_kind, execution_kind, provider_id, independence_key) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'started', 'sidecar', 'sidecar_call', ?, ?)",
+                (execution_id, run_id, epoch_id, sidecar_agent_id, role, model_id,
+                 phase_id, provider_id, independence_key),
+            )
+            conn.execute(
+                "INSERT INTO execution_events "
+                "(execution_id, run_id, epoch_id, seq, event_type, payload_json, created_at) "
+                "VALUES (?, ?, ?, 1, 'started', ?, ?)",
+                (execution_id, run_id, epoch_id, encoded_packet, now),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM agent_executions WHERE execution_id=?", (execution_id,)
+            ).fetchone()
+            assert row is not None
+            return dict(row)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def append_execution_event(
         self,
         run_id: str,

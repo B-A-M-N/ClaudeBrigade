@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from typing import Any
@@ -41,14 +42,6 @@ LONGCAT_API_KEY = os.getenv("LONGCAT_API_KEY", "")
 ROUTER_TOKEN_ENV = "ENHANCED_ROUTER_TOKEN"
 LONGCAT_PUBLIC_ID = os.getenv("LONGCAT_PUBLIC_ID", "anthropic-longcat-2-0")
 LONGCAT_UPSTREAM_ID = os.getenv("LONGCAT_UPSTREAM_ID", "LongCat-2.0")
-
-_FASTPATH_TASKS: set[asyncio.Task[object]] = set()
-
-
-def _finish_fastpath_task(task: asyncio.Task[object]) -> None:
-    _FASTPATH_TASKS.discard(task)
-    if not task.cancelled() and task.exception() is not None:
-        LOGGER.error("fastpath sidecar task failed: %s", task.exception())
 
 async def _init_litellm_supervisor(app: FastAPI) -> None:
     """Initialise the LiteLLM supervisor if BRIGADE_LITELLM_KEY is set.
@@ -108,16 +101,6 @@ async def _shutdown_litellm(app: FastAPI) -> None:
             LOGGER.warning("LiteLLM shutdown error: %s", exc)
     from enhanced_router.backends import configure_litellm_supervisor
     configure_litellm_supervisor(None)
-
-
-async def _shutdown_fastpath_tasks() -> None:
-    tasks = list(_FASTPATH_TASKS)
-    for task in tasks:
-        if not task.done():
-            task.cancel()
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    _FASTPATH_TASKS.clear()
 
 
 def _configure_provider_admission() -> None:
@@ -184,7 +167,6 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        await _shutdown_fastpath_tasks()
         from enhanced_router.sidecar_executor import shutdown_sidecar_executor
         await shutdown_sidecar_executor()
         await _shutdown_litellm(app)
@@ -222,7 +204,7 @@ def _require_local(request: Request) -> None:
 
 @app.post("/internal/fastpath/route")
 async def internal_fastpath_route(request: Request) -> JSONResponse:
-    """Queue or run the optional advisory fastpath on bounded input."""
+    """Queue or run the optional advisory fastpath as a sidecar execution."""
     _require_local(request)
     try:
         packet = await request.json()
@@ -233,16 +215,75 @@ async def internal_fastpath_route(request: Request) -> JSONResponse:
     encoded = json.dumps(packet, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     if len(encoded) > 64_000:
         raise HTTPException(status_code=413, detail="fastpath packet exceeds byte limit")
+    execution = await _queue_fastpath_job(
+        packet=packet,
+        mode="route",
+        runner=lambda: _run_fastpath_route(packet),
+    )
     if request.headers.get("x-brigade-fastpath-async") == "1":
-        task = asyncio.create_task(_run_fastpath_route(packet), name="brigade-fastpath-route")
-        _FASTPATH_TASKS.add(task)
-        task.add_done_callback(_finish_fastpath_task)
         return JSONResponse({
             "validation_status": "queued",
+            "execution_id": execution["execution_id"],
             "proposal_id": packet.get("proposal_id"),
             "intake_id": packet.get("intake_id"),
         }, status_code=202)
-    return JSONResponse(await _run_fastpath_route(packet))
+    return JSONResponse(await _wait_fastpath_job(str(execution["execution_id"])))
+
+
+async def _queue_fastpath_job(
+    *,
+    packet: dict[str, Any],
+    mode: str,
+    runner: Any,
+) -> dict[str, Any]:
+    """Create one persisted advisory sidecar job and start its task."""
+    from enhanced_router.registry import get_registry
+    from enhanced_router.sidecar_executor import get_sidecar_executor
+
+    registry = get_registry()
+    config = registry.fastpath
+    if config is None or not config.enabled or mode not in config.modes:
+        raise HTTPException(status_code=404, detail=f"fastpath {mode} mode is disabled")
+    run_id = str(packet.get("run_id") or "")
+    epoch_id = str(packet.get("epoch_id") or "")
+    if not run_id or not epoch_id:
+        raise HTTPException(status_code=409, detail="fastpath requires an active run and epoch")
+    model = registry.get_model(config.model_id)
+    if not model.provider_id:
+        raise HTTPException(status_code=503, detail="fastpath model has no provider")
+    execution_id = f"fp_{uuid.uuid4().hex}"
+    return await get_sidecar_executor().invoke_detached(
+        run_id=run_id,
+        epoch_id=epoch_id,
+        execution_id=execution_id,
+        phase_id=f"fastpath:{mode}",
+        role="fastpath",
+        model_id=config.model_id,
+        provider_id=model.provider_id,
+        packet=packet,
+        timeout_seconds=config.timeout_seconds,
+        runner=runner,
+    )
+
+
+async def _wait_fastpath_job(execution_id: str) -> dict[str, Any]:
+    from enhanced_router.sidecar_executor import get_sidecar_executor
+
+    execution = await get_sidecar_executor().wait(execution_id)
+    if execution is None:
+        raise HTTPException(status_code=502, detail="fastpath execution disappeared")
+    if execution.get("status") != "completed":
+        raise HTTPException(
+            status_code=502,
+            detail=str(execution.get("error") or "fastpath execution failed"),
+        )
+    try:
+        result = json.loads(str(execution.get("result_json") or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=502, detail="fastpath result was malformed") from exc
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=502, detail="fastpath result was not an object")
+    return result
 
 
 async def _run_fastpath_route(packet: dict[str, Any]) -> dict[str, Any]:
@@ -347,18 +388,11 @@ async def internal_fastpath_verify(request: Request) -> JSONResponse:
     """Run advisory fastpath verification over an authoritative evidence packet.
 
     The endpoint deliberately returns a recommendation only.  It never marks
-    a workflow phase, finding, or completion state as satisfied.  Callers may
-    provide ``run_id``/``epoch_id`` to persist the recommendation for audit.
+    a workflow phase, finding, or completion state as satisfied.  The request
+    is represented as a persisted detached sidecar execution.
     """
     _require_local(request)
-    from enhanced_router.fastpath import (
-        FastpathClient,
-        FastpathLimits,
-        FastpathPolicyValidator,
-        FastpathVerification,
-    )
     from enhanced_router.registry import get_registry
-    from enhanced_router.backends import _provider_admission
 
     registry = get_registry()
     config = registry.fastpath
@@ -376,27 +410,47 @@ async def internal_fastpath_verify(request: Request) -> JSONResponse:
     encoded = json.dumps(packet, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     if len(encoded) > config.max_packet_bytes:
         raise HTTPException(status_code=413, detail="fastpath packet exceeds byte limit")
+    body_packet = dict(body)
+    body_packet["packet"] = packet
+    execution = await _queue_fastpath_job(
+        packet=body_packet,
+        mode="verify",
+        runner=lambda: _run_fastpath_verify(body_packet),
+    )
+    return JSONResponse(await _wait_fastpath_job(str(execution["execution_id"])))
 
+
+async def _run_fastpath_verify(body: dict[str, Any]) -> dict[str, Any]:
+    """Execute and persist one advisory verification inside the sidecar lane."""
+    from enhanced_router.fastpath import (
+        FastpathClient,
+        FastpathLimits,
+        FastpathPolicyValidator,
+        FastpathVerification,
+    )
+    from enhanced_router.registry import get_registry
+    from enhanced_router.backends import _provider_admission
+
+    registry = get_registry()
+    config = registry.fastpath
+    if config is None:
+        raise RuntimeError("fastpath is not configured")
+    packet = body["packet"]
     model = registry.get_model(config.model_id)
     provider_id = model.provider_id
     if not provider_id:
-        raise HTTPException(status_code=503, detail="fastpath model has no provider")
+        raise RuntimeError("fastpath model has no provider")
     try:
         from enhanced_router.endpoint_selection import select_endpoint
 
         selected = select_endpoint(
-            config.model_id,
-            model,
-            get_state(),
-            explicit_endpoint=config.endpoint,
-            require_certified=True,
-            provider_id=provider_id,
+            config.model_id, model, get_state(), explicit_endpoint=config.endpoint,
+            require_certified=True, provider_id=provider_id,
             configuration_hash=registry.registry_hash(),
             required_capabilities=("messages",),
         )
     except (KeyError, ValueError) as exc:
-        raise HTTPException(status_code=503, detail=f"fastpath endpoint is not certified: {exc}") from exc
-
+        raise RuntimeError(f"fastpath endpoint is not certified: {exc}") from exc
     client = FastpathClient(
         api_base=(selected.spec.api_base or model.api_base or "").rstrip("/"),
         model=(selected.spec.litellm_model or model.litellm_model or config.model_id).removeprefix("openai/"),
@@ -408,13 +462,9 @@ async def internal_fastpath_verify(request: Request) -> JSONResponse:
     request_id = f"fastpath-verify:{body.get('verification_id', body.get('epoch_id', 'unknown'))}"
     try:
         await _provider_admission.acquire_request(
-            provider_id,
-            request_id,
+            provider_id, request_id,
             deadline=asyncio.get_running_loop().time() + config.timeout_seconds,
         )
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail="fastpath provider capacity unavailable") from exc
-    try:
         result = await client.request("verify", packet)
         verification = FastpathVerification.model_validate(result)
         FastpathPolicyValidator().validate_verification(
@@ -440,7 +490,9 @@ async def internal_fastpath_verify(request: Request) -> JSONResponse:
                 contract_digest=hashlib.sha256(
                     json.dumps(packet.get("contract", {}), sort_keys=True, separators=(",", ":")).encode()
                 ).hexdigest(),
-                evidence_digest=hashlib.sha256(encoded).hexdigest(),
+                evidence_digest=hashlib.sha256(
+                    json.dumps(packet, separators=(",", ":"), ensure_ascii=False).encode()
+                ).hexdigest(),
                 decision=verification.decision,
                 checks_json=json.dumps(verification.checks, sort_keys=True, separators=(",", ":")),
                 violations_json=json.dumps(verification.violations, separators=(",", ":")),
@@ -448,17 +500,17 @@ async def internal_fastpath_verify(request: Request) -> JSONResponse:
                 policy_disposition="advisory",
             )
             response["verification_id"] = verification_id
-        return JSONResponse(response)
+        return response
     except Exception as exc:
         if config.failure_policy == "fail":
-            raise HTTPException(status_code=502, detail=f"fastpath verification failed: {exc}") from exc
-        return JSONResponse({
+            raise RuntimeError(f"fastpath verification failed: {exc}") from exc
+        return {
             "decision": "escalate",
             "validation_status": "bypassed",
             "validation_reason": str(exc)[:500],
             "fastpath_model_id": config.model_id,
             "confidence": 0.0,
-        })
+        }
     finally:
         await _provider_admission.release_request(request_id)
 

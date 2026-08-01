@@ -8,6 +8,7 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from enhanced_router.backends import (
@@ -100,7 +101,26 @@ class SidecarExecutor:
         task = self._tasks.get(execution_id)
         if task is not None and not task.done():
             task.cancel()
-            return self.state.get_agent_execution(execution_id)
+            try:
+                await task
+            except asyncio.CancelledError:
+                # A task can be cancelled before its coroutine gets a chance
+                # to enter the lifecycle handler. Reconcile that edge below.
+                pass
+            execution = self.state.get_agent_execution(execution_id)
+            if execution is not None and execution.get("status") not in {
+                "completed", "failed", "timeout", "cancelled",
+            }:
+                updated = self.state.update_agent_execution(
+                    execution_id,
+                    status="cancelled",
+                    error="cancelled by controller",
+                    error_class="cancelled_by_controller",
+                )
+                if updated is not None:
+                    execution = updated
+                    self._event(execution_id, execution, "cancelled", {"reason": "controller"})
+            return execution
         execution = self.state.get_agent_execution(execution_id)
         if execution is None:
             return None
@@ -123,6 +143,56 @@ class SidecarExecutor:
             claim_token=str(retry["claim_token"]),
             packet=dict(retry["packet"]),
         )
+
+    async def invoke_detached(
+        self,
+        *,
+        run_id: str,
+        epoch_id: str,
+        execution_id: str,
+        phase_id: str,
+        role: str,
+        model_id: str,
+        provider_id: str | None,
+        packet: dict[str, Any],
+        timeout_seconds: float,
+        runner: Callable[[], Awaitable[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Run a router-owned advisory job under persisted sidecar lifecycle."""
+        execution = self.state.start_detached_sidecar_execution(
+            run_id=run_id,
+            epoch_id=epoch_id,
+            execution_id=execution_id,
+            phase_id=phase_id,
+            role=role,
+            model_id=model_id,
+            provider_id=provider_id,
+            packet=packet,
+        )
+        task = asyncio.create_task(
+            self._run_detached(
+                execution_id=execution_id,
+                run_id=run_id,
+                epoch_id=epoch_id,
+                timeout_seconds=timeout_seconds,
+                runner=runner,
+            ),
+            name=f"brigade-sidecar-{execution_id}",
+        )
+        async with self._lock:
+            self._tasks[execution_id] = task
+        task.add_done_callback(lambda finished: self._forget(execution_id, finished))
+        return execution
+
+    async def wait(self, execution_id: str) -> dict[str, Any] | None:
+        """Wait for a locally owned detached job and return durable state."""
+        task = self._tasks.get(execution_id)
+        if task is not None:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        return self.state.get_agent_execution(execution_id)
 
     async def shutdown(self) -> None:
         tasks = list(self._tasks.values())
@@ -210,6 +280,63 @@ class SidecarExecutor:
                 "reason": str(exc)[:500],
             })
             self.state.finish_spawn_assignment(run_id, epoch_id, agent_id, "failed")
+
+    async def _run_detached(
+        self,
+        *,
+        execution_id: str,
+        run_id: str,
+        epoch_id: str,
+        timeout_seconds: float,
+        runner: Callable[[], Awaitable[dict[str, Any]]],
+    ) -> None:
+        execution = self.state.get_agent_execution_scoped(run_id, epoch_id, execution_id)
+        if execution is None:
+            return
+        try:
+            running = self.state.update_agent_execution(execution_id, status="running")
+            self._event(execution_id, running or execution, "running", {})
+            result = await asyncio.wait_for(runner(), timeout=timeout_seconds)
+            if not isinstance(result, dict):
+                raise ValueError("detached sidecar result must be an object")
+            result_json = json.dumps(result, separators=(",", ":"), ensure_ascii=False)
+            if len(result_json.encode("utf-8")) > _MAX_RESULT_BYTES:
+                raise ValueError("detached sidecar result exceeds the 128 KiB bound")
+            completed = self.state.update_agent_execution(
+                execution_id,
+                status="completed",
+                result_type="structured_json",
+                result_summary=self._summary(result),
+                output_hash=hashlib.sha256(result_json.encode("utf-8")).hexdigest(),
+                result_json=result_json,
+                schema_valid=True,
+                evidence_valid=True,
+                accepted_by_controller=False,
+                quality_score=1.0,
+            )
+            self._event(execution_id, completed or execution, "completed", {
+                "result_type": "structured_json",
+            })
+        except asyncio.CancelledError:
+            cancelled = self.state.update_agent_execution(
+                execution_id,
+                status="cancelled",
+                error="cancelled by controller",
+                error_class="cancelled_by_controller",
+            )
+            self._event(execution_id, cancelled or execution, "cancelled", {})
+        except Exception as exc:
+            error_class = self._error_class(exc)
+            failed = self.state.update_agent_execution(
+                execution_id,
+                status="timed_out" if isinstance(exc, asyncio.TimeoutError) else "failed",
+                error=str(exc)[:500],
+                error_class=error_class,
+            )
+            self._event(execution_id, failed or execution, "failed", {
+                "error_class": error_class,
+                "reason": str(exc)[:500],
+            })
 
     async def _request(
         self,

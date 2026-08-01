@@ -27,6 +27,9 @@ Agent process lifecycle; hooks report and guard that lifecycle.
   is not a substitute for an action claim where one is required.
 - Native, sidecar, and controller actions share persisted execution evidence;
   only native actions are represented as Claude Code native agents.
+- Router-owned fastpath route/verify jobs are persisted `sidecar_call`
+  executions even though their OpenAI-compatible response adapter is
+  specialized. Keep their advisory authority boundary intact.
 - Model-qualified agent names and public aliases come from the registry
   manifest. Do not add parallel hardcoded identity maps.
 - Sidecar definitions are independently selected from `sidecars.yaml`; their

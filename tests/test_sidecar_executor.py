@@ -90,3 +90,41 @@ async def test_sidecar_retry_uses_bounded_original_packet(tmp_path: Path, monkey
     await asyncio.sleep(0.02)
     assert state.get_agent_execution(second["execution_id"])["status"] == "completed"
     await executor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_detached_sidecar_persists_lifecycle_and_is_cancellable(tmp_path: Path):
+    state = RouteState(tmp_path / "state.db")
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    executor = SidecarExecutor(state)
+
+    async def fake_runner() -> dict:
+        await asyncio.sleep(10)
+        return {"decision": "pass"}
+
+    execution = await executor.invoke_detached(
+        run_id="r1",
+        epoch_id="ep-1",
+        execution_id="fp-test",
+        phase_id="fastpath:verify",
+        role="fastpath",
+        model_id="diffusiongemma",
+        provider_id="freeinference",
+        packet={"verification_id": "v1"},
+        timeout_seconds=30,
+        runner=fake_runner,
+    )
+    assert execution["execution_kind"] == "sidecar_call"
+    assert execution["claude_agent_id"] == "sidecar:fp-test"
+    cancelled = await executor.cancel("fp-test")
+    assert cancelled is not None
+    assert cancelled["status"] == "cancelled"
+    await executor.wait("fp-test")
+    final = state.get_agent_execution("fp-test")
+    assert final is not None
+    assert final["status"] == "cancelled"
+    assert [event["event_type"] for event in state.get_execution_events(
+        "r1", "ep-1", "fp-test",
+    )] == ["started", "cancelled"]
+    await executor.shutdown()

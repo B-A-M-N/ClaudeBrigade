@@ -95,25 +95,6 @@ def main() -> int:
         minimum_tier=minimum_tier,
     )
 
-    fastpath = _fastpath_route({
-        "intake_id": intake_id,
-        "run_id": run_id,
-        "proposal_id": f"proposal_{uuid.uuid4().hex}",
-        "task": prompt[:8_000],
-        "repository": {
-            "languages": features.languages,
-            "likely_files": features.explicit_files,
-            "subsystems": features.subsystems,
-            "estimated_context_tokens": features.estimated_context_tokens,
-        },
-        "deterministic_minimum_tier": minimum_tier,
-        "risk_signals": features.risk_signals,
-        "required_capabilities": features.required_capabilities,
-    })
-    proposal_id = None
-    if fastpath and fastpath.get("validation_status") == "queued":
-        proposal_id = str(fastpath.get("proposal_id") or "") or None
-
     active = state.get_active_epoch(run_id)
     if active is None:
         profile_id = os.environ.get("BRIGADE_DEFAULT_PROFILE", "hybrid")
@@ -131,7 +112,7 @@ def main() -> int:
             contract={
                 "request_kind": features.request_kind,
                 "required_capabilities": features.required_capabilities,
-                "proposal_id": proposal_id,
+                "proposal_id": None,
             },
         )
         epoch_id = contract["epoch_id"]
@@ -147,6 +128,29 @@ def main() -> int:
             "baseline_fingerprint": current_fp,
             "source": "user_prompt_submit",
         })
+
+    active = state.get_active_epoch(run_id)
+    epoch_id = str(active.get("epoch_id")) if active else ""
+    proposal_request_id = f"proposal_{uuid.uuid4().hex}"
+    fastpath = _fastpath_route({
+        "intake_id": intake_id,
+        "run_id": run_id,
+        "epoch_id": epoch_id,
+        "proposal_id": proposal_request_id,
+        "task": prompt[:8_000],
+        "repository": {
+            "languages": features.languages,
+            "likely_files": features.explicit_files,
+            "subsystems": features.subsystems,
+            "estimated_context_tokens": features.estimated_context_tokens,
+        },
+        "deterministic_minimum_tier": minimum_tier,
+        "risk_signals": features.risk_signals,
+        "required_capabilities": features.required_capabilities,
+    })
+    proposal_id = None
+    if fastpath and fastpath.get("validation_status") == "queued":
+        proposal_id = str(fastpath.get("proposal_id") or "") or None
 
     context = {
         "intake_id": intake_id,

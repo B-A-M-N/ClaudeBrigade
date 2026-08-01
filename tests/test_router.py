@@ -123,28 +123,39 @@ def test_router_head_probe(monkeypatch):
     assert resp.status_code == 200
 
 
-def test_fastpath_route_can_detach_from_prompt_intake(monkeypatch):
+@pytest.mark.asyncio
+async def test_fastpath_route_can_detach_from_prompt_intake(monkeypatch):
     """Prompt intake receives a job receipt instead of waiting on inference."""
-    import asyncio
+    from types import SimpleNamespace
 
-    observed: list[dict] = []
+    class FakeRegistry:
+        fastpath = SimpleNamespace(
+            enabled=True, modes=["route"], model_id="diffusiongemma",
+            timeout_seconds=5,
+        )
 
-    async def fake_run(packet: dict) -> dict:
-        observed.append(packet)
-        await asyncio.sleep(0)
-        return {"validation_status": "accepted_for_controller_review"}
+        @staticmethod
+        def get_model(model_id: str) -> SimpleNamespace:
+            return SimpleNamespace(provider_id="freeinference")
 
-    monkeypatch.setattr("enhanced_router.app._run_fastpath_route", fake_run)
-    monkeypatch.setenv("ENHANCED_ROUTER_TOKEN", "")
-    client = TestClient(app)
-    response = client.post(
-        "/internal/fastpath/route",
-        headers={"x-brigade-fastpath-async": "1"},
-        json={"run_id": "run-1", "intake_id": "intake-1", "proposal_id": "proposal-1"},
+    class FakeExecutor:
+        async def invoke_detached(self, **kwargs):
+            return {"execution_id": "fp-test"}
+
+    monkeypatch.setattr("enhanced_router.registry.get_registry", lambda: FakeRegistry())
+    monkeypatch.setattr("enhanced_router.sidecar_executor.get_sidecar_executor", lambda: FakeExecutor())
+    import enhanced_router.app as app_module
+
+    execution = await app_module._queue_fastpath_job(
+        packet={
+            "run_id": "run-1", "epoch_id": "ep-1",
+            "intake_id": "intake-1", "proposal_id": "proposal-1",
+        },
+        mode="route",
+        runner=app_module._run_fastpath_route,
     )
 
-    assert response.status_code == 202
-    assert response.json()["proposal_id"] == "proposal-1"
+    assert execution["execution_id"] == "fp-test"
 
 
 # ==================================================================

@@ -284,9 +284,10 @@ advisory and never satisfies a mandatory adversarial phase. Any mutation after
 verification invalidates the verification evidence. The current fastpath hook
 has a short relevance wait and receives a queued job receipt; the router owns
 the detached bounded call and persists the proposal against its intake. The
-legacy fastpath transport is still separate from the general persisted
-sidecar-execution lane, so it must not be treated as a native worker or as
-completion evidence.
+fastpath request protocol remains specialized OpenAI-compatible JSON, but its
+job lifecycle is a persisted `sidecar_call` execution with cancellation and
+status visibility. It must not be treated as a native worker or as completion
+evidence.
 
 ## Credential and protocol rules
 
@@ -347,8 +348,9 @@ Implemented in the current working tree:
   visibility, and profile readiness reporting;
 - registry-backed model-qualified native-agent manifest generation and
   dynamic role-alias/model binding projection;
-- detached fastpath route jobs with bounded prompt-intake latency, persisted
-  proposal correlation, and shutdown cancellation;
+- detached fastpath route/verify jobs using persisted sidecar executions,
+  bounded prompt-intake latency, proposal/verification correlation, and
+  shutdown cancellation;
 - read-only agent definitions without Bash, observational Bash allowlisting as
   a fallback guard, and SQLite-backed session-resume marker rehydration;
 - controller-only route-proposal disposition operations; DiffusionGemma
@@ -367,9 +369,8 @@ Remaining work before a production-quality proving ground:
    changeset path, persisted patches, overlap classification, deterministic
    preflight, and controller-action gate are implemented; semantic conflict
    resolution is intentionally not automatic.
-3. Move detached fastpath route/verify jobs onto the general persisted sidecar
-   executor so they share execution events, cancellation, retry, and status
-   visibility with other bounded specialists.
+3. Route fastpath's specialized OpenAI-compatible transport through the common
+   outbound executor and add a bounded retry action for failed detached jobs.
 4. Expand the local fixture integration suite for tools, parallel tools,
    tool-result continuation, structured output, cancellation, SSE usage, 401,
    429, 503, and generation pinning.
