@@ -56,9 +56,39 @@ def _compute_status() -> str:
             if session_binding:
                 model = session_binding.get("registry_model_id") or model
             active_epoch = state.get_active_epoch(run_id)
-            reservations = state.get_provider_reservations(active_only=True)
+            epoch_id = str(active_epoch.get("epoch_id")) if active_epoch else None
+            executions = state.get_agent_executions(run_id, epoch_id=epoch_id)
+            live_statuses = {"started", "running", "streaming", "verifying"}
+            state_agents = []
+            for item in executions:
+                if item.get("status") not in live_statuses:
+                    continue
+                prefix = "[S]" if item.get("execution_kind") == "sidecar_call" else "[N]"
+                state_agents.append(
+                    f"{prefix} {item.get('role') or 'agent'}:"
+                    f"{item.get('model_id') or '?'} {item.get('status') or 'unknown'}"
+                )
+            if state_agents:
+                agents = state_agents
+            recent_failures = [
+                item for item in executions
+                if item.get("status") in {"failed", "timeout", "cancelled"}
+            ]
+            if recent_failures:
+                latest = recent_failures[0]
+                provider_summary += " | last-fail " + ":".join(
+                    str(value or "?")
+                    for value in (
+                        latest.get("role"),
+                        latest.get("error_class") or latest.get("status"),
+                    )
+                )
+            reservations = state.get_provider_reservations(
+                run_id=run_id, epoch_id=epoch_id, active_only=True,
+            )
             if reservations:
                 by_provider: dict[str, tuple[int, int]] = {}
+                registry = get_registry()
                 for reservation in reservations:
                     provider = str(reservation.get("provider_id") or "unknown")
                     active_count, queued_count = by_provider.get(provider, (0, 0))
@@ -67,15 +97,15 @@ def _compute_status() -> str:
                     else:
                         queued_count += 1
                     by_provider[provider] = (active_count, queued_count)
-                provider_summary = " | " + ",".join(
-                    f"{provider} {active_count}/{get_registry().providers[provider].limits.max_active_agents}"
+                provider_summary += " | " + ",".join(
+                    f"{provider} {active_count}/{registry.providers[provider].limits.max_active_agents}"
                     + (f" queued {queued_count}" if queued_count else "")
                     for provider, (active_count, queued_count) in sorted(by_provider.items())
-                    if provider in get_registry().providers
+                    if provider in registry.providers
                 )
             pending_candidates = state.get_integration_candidates(
                 run_id=run_id,
-                epoch_id=str(active_epoch.get("epoch_id")) if active_epoch else None,
+                epoch_id=epoch_id,
             )
             pending_merge = sum(
                 1 for item in pending_candidates

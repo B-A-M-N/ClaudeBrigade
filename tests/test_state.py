@@ -812,6 +812,24 @@ def test_retry_policy_keeps_phase_active_until_attempt_budget_is_exhausted(
     assert state.complete_phase_if_ready("r1", "ep-1", "recon")["status"] == "failed"
 
 
+def test_completion_token_is_bound_to_workspace_and_consumed_once(state: RouteState):
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+
+    prepared = state.prepare_completion_token("r1", "ep-1", "a" * 64)
+    assert prepared["route_snapshot_sha256"]
+    consumed = state.consume_completion_token(
+        "r1", "ep-1", prepared["token"], "a" * 64,
+        prepared["route_snapshot_sha256"],
+    )
+    assert consumed["valid"] is True
+    replay = state.consume_completion_token(
+        "r1", "ep-1", prepared["token"], "a" * 64,
+        prepared["route_snapshot_sha256"],
+    )
+    assert replay == {"valid": False, "reason": "completion token was already consumed"}
+
+
 # ================================================================== Mutation lease
 # ==================================================================
 

@@ -1000,6 +1000,33 @@ async def validate_completion(
 
 
 @control_mcp.tool()
+async def prepare_completion(
+    run_id: str,
+    epoch_id: str,
+    workspace_fingerprint: str,
+    ttl_seconds: int = 300,
+) -> dict[str, Any]:
+    """Issue a one-time completion attestation bound to current state."""
+    authorization_error = _authorize_explicit_run(run_id)
+    if authorization_error:
+        return {"prepared": False, "error": authorization_error}
+    state: RouteState = get_state()
+    authorization_error = _require_capability(
+        state, run_id, "complete_workflow", epoch_id=epoch_id,
+        controller_only=True,
+    )
+    if authorization_error:
+        return {"prepared": False, "error": authorization_error}
+    try:
+        token = state.prepare_completion_token(
+            run_id, epoch_id, workspace_fingerprint, ttl_seconds=ttl_seconds,
+        )
+    except (ValueError, WorkflowStateError) as exc:
+        return {"prepared": False, "error": str(exc)}
+    return {"prepared": True, **token}
+
+
+@control_mcp.tool()
 async def get_integration_candidates(
     run_id: str,
     epoch_id: str | None = None,

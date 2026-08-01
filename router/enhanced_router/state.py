@@ -346,6 +346,8 @@ def _needs_v37_hardening(conn: sqlite3.Connection) -> bool:
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='integration_journal'"
     ).fetchone() is None or conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_events'"
+    ).fetchone() is None or conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='completion_tokens'"
     ).fetchone() is None
 
 
@@ -1408,6 +1410,20 @@ def _migrate_v37(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_execution_events_scope
             ON execution_events(run_id, epoch_id, execution_id, seq);
+
+        CREATE TABLE IF NOT EXISTS completion_tokens (
+            token_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES runs(run_id),
+            epoch_id TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            workspace_fingerprint TEXT NOT NULL,
+            route_snapshot_sha256 TEXT NOT NULL,
+            issued_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            consumed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_completion_tokens_scope
+            ON completion_tokens(run_id, epoch_id, consumed_at, expires_at);
     """)
 
 
@@ -3315,7 +3331,7 @@ class RouteState:
         active_executions = self.get_agent_executions(run_id, epoch_id=epoch_id)
         active_executions = [
             execution for execution in active_executions
-            if execution.get("status") in {"started", "running"}
+            if execution.get("status") not in {"completed", "failed", "timeout", "cancelled"}
         ]
         if active_executions:
             return {
@@ -3363,24 +3379,6 @@ class RouteState:
                 "reason": "Integration candidates require main-controller adjudication: "
                 + ", ".join(f"{row[0]} ({row[1]})" for row in red_candidates),
             }
-        try:
-            from enhanced_router.backends import provider_admission_snapshots
-
-            busy_providers: list[str] = []
-            for provider_id, snapshot in provider_admission_snapshots().items():
-                active_requests = snapshot.get("active_requests")
-                if isinstance(active_requests, int) and active_requests > 0:
-                    busy_providers.append(provider_id)
-            if busy_providers:
-                return {
-                    "valid": False,
-                    "reason": "Provider request stream(s) remain active: " + ", ".join(sorted(busy_providers)),
-                }
-        except (ImportError, RuntimeError):
-            # The hook can run in a sidecar without the ASGI application
-            # process. Durable state checks above remain mandatory there.
-            pass
-
         reported_workflow = parsed.get("Workflow-ID", "")
         if reported_workflow and reported_workflow != active.get("workflow_id"):
             return {
@@ -3388,6 +3386,16 @@ class RouteState:
                 "reason": (
                     f"Workflow-ID mismatch: message says '{reported_workflow}' "
                     f"but active epoch has workflow '{active['workflow_id']}'"
+                ),
+            }
+
+        reported_tier = parsed.get("Workflow-Tier", "")
+        if reported_tier and reported_tier != active.get("workflow_id"):
+            return {
+                "valid": False,
+                "reason": (
+                    f"Workflow-Tier mismatch: message says '{reported_tier}' "
+                    f"but active epoch has workflow '{active.get('workflow_id')}'"
                 ),
             }
 
@@ -3448,16 +3456,111 @@ class RouteState:
 
         # 7. Validate route snapshot
         snapshot_sha256 = parsed.get("Route-Snapshot-SHA256", "").lower()
-        if snapshot_sha256:
-            actual_snapshot = self.create_route_snapshot(run_id, epoch_id, purpose="verified-completion")
-            if snapshot_sha256 != actual_snapshot:
-                return {
-                    "valid": False,
-                    "reason": f"Route snapshot mismatch: reported {snapshot_sha256} but current state produces {actual_snapshot}",
-                    "snapshot_sha256": actual_snapshot,
-                }
+        if not snapshot_sha256:
+            return {"valid": False, "reason": "Route-Snapshot-SHA256 is required"}
+        actual_snapshot = self.create_route_snapshot(run_id, epoch_id, purpose="verified-completion")
+        if snapshot_sha256 != actual_snapshot:
+            return {
+                "valid": False,
+                "reason": f"Route snapshot mismatch: reported {snapshot_sha256} but current state produces {actual_snapshot}",
+                "snapshot_sha256": actual_snapshot,
+            }
 
         return {"valid": True, "reason": None, "snapshot_sha256": snapshot_sha256 or None}
+
+    def prepare_completion_token(
+        self,
+        run_id: str,
+        epoch_id: str,
+        workspace_fingerprint: str,
+        *,
+        ttl_seconds: int = 300,
+    ) -> dict:
+        """Issue a short-lived, state-generated completion attestation."""
+        if not hmac.compare_digest(
+            workspace_fingerprint.lower(), workspace_fingerprint
+        ) or len(workspace_fingerprint) != 64:
+            raise WorkflowStateError("workspace fingerprint must be 64 lowercase hexadecimal characters")
+        try:
+            int(workspace_fingerprint, 16)
+        except ValueError as exc:
+            raise WorkflowStateError("workspace fingerprint must be hexadecimal") from exc
+        if ttl_seconds < 1:
+            raise ValueError("completion token TTL must be positive")
+        active = self.get_active_epoch(run_id)
+        if not active or active.get("epoch_id") != epoch_id:
+            raise WorkflowStateError("completion token requires the active epoch")
+        snapshot = self.create_route_snapshot(run_id, epoch_id, purpose="verified-completion")
+        token = secrets.token_urlsafe(32)
+        token_id = f"completion:{secrets.token_hex(12)}"
+        issued_at = datetime.now(timezone.utc)
+        expires_at = issued_at + timedelta(seconds=ttl_seconds)
+        conn = self._new_conn()
+        try:
+            conn.execute(
+                "INSERT INTO completion_tokens "
+                "(token_id, run_id, epoch_id, token_hash, workspace_fingerprint, "
+                "route_snapshot_sha256, issued_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    token_id, run_id, epoch_id,
+                    hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                    workspace_fingerprint, snapshot,
+                    issued_at.isoformat(), expires_at.isoformat(),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return {
+            "token_id": token_id,
+            "token": token,
+            "run_id": run_id,
+            "epoch_id": epoch_id,
+            "workspace_fingerprint": workspace_fingerprint,
+            "route_snapshot_sha256": snapshot,
+            "expires_at": expires_at.isoformat(),
+        }
+
+    def consume_completion_token(
+        self,
+        run_id: str,
+        epoch_id: str,
+        token: str,
+        workspace_fingerprint: str,
+        route_snapshot_sha256: str,
+    ) -> dict:
+        """Consume a completion attestation exactly once and verify its binding."""
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        conn = self._new_conn()
+        try:
+            row = conn.execute(
+                "SELECT * FROM completion_tokens WHERE run_id=? AND epoch_id=? "
+                "AND token_hash=?",
+                (run_id, epoch_id, token_hash),
+            ).fetchone()
+            if row is None:
+                return {"valid": False, "reason": "completion token not found"}
+            if row["consumed_at"] is not None:
+                return {"valid": False, "reason": "completion token was already consumed"}
+            if datetime.fromisoformat(str(row["expires_at"])) < datetime.now(timezone.utc):
+                return {"valid": False, "reason": "completion token expired"}
+            if not hmac.compare_digest(str(row["workspace_fingerprint"]), workspace_fingerprint):
+                return {"valid": False, "reason": "completion token workspace mismatch"}
+            if not hmac.compare_digest(str(row["route_snapshot_sha256"]), route_snapshot_sha256):
+                return {"valid": False, "reason": "completion token route snapshot mismatch"}
+            consumed_at = _utcnow()
+            updated = conn.execute(
+                "UPDATE completion_tokens SET consumed_at=? "
+                "WHERE token_id=? AND consumed_at IS NULL",
+                (consumed_at, row["token_id"]),
+            )
+            if updated.rowcount != 1:
+                conn.rollback()
+                return {"valid": False, "reason": "completion token was already consumed"}
+            conn.commit()
+            return {"valid": True, "token_id": row["token_id"], "consumed_at": consumed_at}
+        finally:
+            conn.close()
 
     def create_run(
         self,

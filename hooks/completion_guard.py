@@ -28,6 +28,7 @@ REQUIRED = {
     "Adversarial-Review",
     "Accepted-Findings",
     "Verification",
+    "Route-Snapshot-SHA256",
     "Verified-Workspace-SHA256",
 }
 
@@ -239,7 +240,7 @@ def validate_completion_via_state(
     try:
         from enhanced_router.state import get_state
     except ImportError:
-        return True, None  # not available; skip SQLite validation
+        return False, "Authoritative workflow state is unavailable"
 
     state = get_state()
     result = state.validate_completion(
@@ -360,6 +361,35 @@ def main() -> int:
         return block_with_retry_guard("Verified workspace hash must be exactly 64 lowercase hexadecimal characters", session_dir, stop_hook_active, message)
     if expected != actual:
         return block_with_retry_guard(f"Verified workspace hash does not match current workspace. expected={expected} current={actual}", session_dir, stop_hook_active, message)
+
+    if run_id:
+        try:
+            from enhanced_router.state import get_state
+            state = get_state()
+            attestation = state.prepare_completion_token(
+                run_id, active_epoch_id, actual,
+            )
+            consumed = state.consume_completion_token(
+                run_id,
+                active_epoch_id,
+                attestation["token"],
+                actual,
+                parsed["Route-Snapshot-SHA256"].lower(),
+            )
+            if not consumed.get("valid"):
+                return block_with_retry_guard(
+                    str(consumed.get("reason") or "Completion attestation failed"),
+                    session_dir,
+                    stop_hook_active,
+                    message,
+                )
+        except Exception as exc:
+            return block_with_retry_guard(
+                f"State-generated completion attestation failed: {exc}",
+                session_dir,
+                stop_hook_active,
+                message,
+            )
 
     # Close SQLite epoch (authoritative state), then clean up file-based markers.
     # This order ensures that if a crash occurs between the two, the SQLite state

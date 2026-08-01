@@ -310,6 +310,7 @@ def test_completion_guard_required_fields():
         "Adversarial-Review",
         "Accepted-Findings",
         "Verification",
+        "Route-Snapshot-SHA256",
         "Verified-Workspace-SHA256",
     }
     assert REQUIRED == expected
