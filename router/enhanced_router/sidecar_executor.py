@@ -142,11 +142,16 @@ class SidecarExecutor:
             and execution.get("execution_kind") == "sidecar_call"
             and str(execution.get("phase_id") or "").startswith("fastpath:")
         ):
+            if execution.get("status") not in {"failed", "timeout"}:
+                raise WorkflowStateError("detached fastpath execution is not retryable")
             job = self._detached_jobs.get(execution_id)
             if job is None:
                 raise WorkflowStateError(
                     "detached fastpath retry is unavailable after router restart"
                 )
+            attempt = int(job.get("attempt", 1)) + 1
+            if attempt > 2:
+                raise WorkflowStateError("detached fastpath retry budget exhausted")
             retry_id = f"{execution_id}:retry:{uuid.uuid4().hex[:8]}"
             return await self.invoke_detached(
                 run_id=str(job["run_id"]),
@@ -159,6 +164,7 @@ class SidecarExecutor:
                 packet=dict(job["packet"]),
                 timeout_seconds=float(job["timeout_seconds"]),
                 runner=job["runner"],
+                attempt=attempt,
             )
         retry = self.state.prepare_sidecar_retry(execution_id)
         return await self.invoke(
@@ -182,6 +188,7 @@ class SidecarExecutor:
         packet: dict[str, Any],
         timeout_seconds: float,
         runner: Callable[[], Awaitable[dict[str, Any]]],
+        attempt: int = 1,
     ) -> dict[str, Any]:
         """Run a router-owned advisory job under persisted sidecar lifecycle."""
         execution = self.state.start_detached_sidecar_execution(
@@ -204,6 +211,7 @@ class SidecarExecutor:
             "packet": dict(packet),
             "timeout_seconds": timeout_seconds,
             "runner": runner,
+            "attempt": attempt,
         }
         task = asyncio.create_task(
             self._run_detached(

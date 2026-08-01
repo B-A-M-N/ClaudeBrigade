@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from enhanced_router.sidecar_executor import SidecarExecutor
-from enhanced_router.state import RouteState
+from enhanced_router.state import RouteState, WorkflowStateError
 
 
 def _setup_sidecar(state: RouteState, monkeypatch: pytest.MonkeyPatch) -> dict:
@@ -158,4 +158,6 @@ async def test_detached_fastpath_failure_can_retry_while_router_is_alive(tmp_pat
     await executor.wait(retry["execution_id"])
     assert state.get_agent_execution(retry["execution_id"])["status"] == "completed"
     assert attempts == 2
+    with pytest.raises(WorkflowStateError, match="not retryable"):
+        await executor.retry(retry["execution_id"])
     await executor.shutdown()
