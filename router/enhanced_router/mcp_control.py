@@ -345,6 +345,137 @@ async def claim_runnable_action(action_id: str) -> dict[str, Any]:
 
 
 @control_mcp.tool()
+async def invoke_specialist(
+    action_id: str,
+    claim_token: str,
+    packet: dict[str, Any],
+) -> dict[str, Any]:
+    """Start a bounded read-only sidecar for a claimed workflow action."""
+    state = get_state()
+    run_id = _get_current_run_id()
+    if not run_id:
+        return {"started": False, "error": "No active run ID"}
+    authorization_error = _require_capability(
+        state, run_id, "invoke_sidecar", controller_only=True,
+    )
+    if authorization_error:
+        return {"started": False, "error": authorization_error}
+    active = state.get_active_epoch(run_id)
+    if active is None:
+        return {"started": False, "error": "No active epoch"}
+    try:
+        from enhanced_router.sidecar_executor import get_sidecar_executor
+        execution = await get_sidecar_executor(state).invoke(
+            run_id=run_id,
+            epoch_id=str(active["epoch_id"]),
+            action_id=action_id,
+            claim_token=claim_token,
+            packet=packet,
+        )
+    except (ValueError, WorkflowStateError) as exc:
+        return {"started": False, "error": str(exc)}
+    return {
+        "started": True,
+        "run_id": run_id,
+        "epoch_id": str(active["epoch_id"]),
+        "execution_id": execution["execution_id"],
+        "execution": execution,
+    }
+
+
+@control_mcp.tool()
+async def get_execution(
+    run_id: str,
+    epoch_id: str,
+    execution_id: str,
+) -> dict[str, Any]:
+    """Read one execution and enforce run/epoch ownership."""
+    state = get_state()
+    authorization_error = _require_capability(
+        state, run_id, "read_routes", epoch_id=epoch_id,
+    )
+    if authorization_error:
+        return {"error": authorization_error}
+    principal = _get_current_principal()
+    if principal is not None and principal.principal_kind != "controller":
+        if principal.execution_id != execution_id:
+            return {"error": "execution is not owned by the authenticated principal"}
+    execution = state.get_agent_execution_scoped(run_id, epoch_id, execution_id)
+    return execution or {"error": f"Execution '{execution_id}' not found"}
+
+
+@control_mcp.tool()
+async def get_execution_events(
+    run_id: str,
+    epoch_id: str,
+    execution_id: str,
+    after_seq: int = 0,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Read ordered execution events after a sequence number."""
+    state = get_state()
+    authorization_error = _require_capability(
+        state, run_id, "read_routes", epoch_id=epoch_id,
+    )
+    if authorization_error:
+        return [{"error": authorization_error}]
+    principal = _get_current_principal()
+    if principal is not None and principal.principal_kind != "controller" \
+            and principal.execution_id != execution_id:
+        return [{"error": "execution is not owned by the authenticated principal"}]
+    return state.get_execution_events(
+        run_id, epoch_id, execution_id, after_seq=after_seq, limit=limit,
+    )
+
+
+@control_mcp.tool()
+async def cancel_execution(
+    run_id: str,
+    epoch_id: str,
+    execution_id: str,
+) -> dict[str, Any]:
+    """Cancel a running sidecar execution."""
+    state = get_state()
+    authorization_error = _require_capability(
+        state, run_id, "cancel_execution", epoch_id=epoch_id, controller_only=True,
+    )
+    if authorization_error:
+        return {"cancelled": False, "error": authorization_error}
+    execution = state.get_agent_execution_scoped(run_id, epoch_id, execution_id)
+    if execution is None:
+        return {"cancelled": False, "error": f"Execution '{execution_id}' not found"}
+    if execution.get("execution_kind") != "sidecar_call":
+        return {"cancelled": False, "error": "only sidecar executions can be cancelled here"}
+    from enhanced_router.sidecar_executor import get_sidecar_executor
+    result = await get_sidecar_executor(state).cancel(execution_id)
+    return {"cancelled": True, "execution": result}
+
+
+@control_mcp.tool()
+async def retry_execution(
+    run_id: str,
+    epoch_id: str,
+    execution_id: str,
+) -> dict[str, Any]:
+    """Retry a failed sidecar within its bounded retry budget."""
+    state = get_state()
+    authorization_error = _require_capability(
+        state, run_id, "retry_execution", epoch_id=epoch_id, controller_only=True,
+    )
+    if authorization_error:
+        return {"started": False, "error": authorization_error}
+    execution = state.get_agent_execution_scoped(run_id, epoch_id, execution_id)
+    if execution is None:
+        return {"started": False, "error": f"Execution '{execution_id}' not found"}
+    from enhanced_router.sidecar_executor import get_sidecar_executor
+    try:
+        retried = await get_sidecar_executor(state).retry(execution_id)
+    except (ValueError, WorkflowStateError) as exc:
+        return {"started": False, "error": str(exc)}
+    return {"started": True, "execution": retried, "retry_of": execution_id}
+
+
+@control_mcp.tool()
 async def get_orchestration_status() -> dict[str, Any]:
     """Return controller-visible phase, execution, queue, and provider state."""
     state: RouteState = get_state()
@@ -1108,7 +1239,14 @@ async def start_phase(
             }
 
     try:
-        result = state.start_phase(run_id, epoch_id, phase_id, actor=actor)
+        principal = _get_current_principal()
+        started_by = (
+            principal.agent_id or principal.session_id or principal.credential_id or ""
+            if principal is not None else ""
+        )
+        result = state.start_phase(
+            run_id, epoch_id, phase_id, actor=actor, principal=started_by,
+        )
         return {"phase_id": phase_id, "status": result["status"], "condition_evaluated": False}
     except WorkflowPhaseStateError as exc:
         return {"error": str(exc)}
@@ -1578,6 +1716,7 @@ def set_current_run_id(run_id: str | None) -> None:
             allowed_capabilities=frozenset({
                 "read_routes", "claim_native_action", "report_worker_result",
                 "adjudicate_finding", "integrate_changeset", "complete_workflow",
+                "invoke_sidecar", "cancel_execution", "retry_execution",
             }),
             authenticated=False,
         ))

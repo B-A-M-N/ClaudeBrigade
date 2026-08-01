@@ -374,6 +374,11 @@ class WorkflowPhase(StrictConfigModel):
     result_schema: str | None = None
     quality_quorum: int = Field(default=1, ge=1)
     fallback_policy: str | None = None
+    execution_kind: Literal["native_agent", "sidecar_call", "controller_action"] = "native_agent"
+    max_parallelism: int | None = Field(default=None, ge=1)
+    required_successes: int | None = Field(default=None, ge=1)
+    max_attempts: int | None = Field(default=None, ge=1)
+    max_attempts_per_model: int | None = Field(default=None, ge=1)
 
 
 class WorkflowSpec(StrictConfigModel):

@@ -203,6 +203,23 @@ class ProviderAdmissionManager:
                     raise AdmissionTimeout("provider circuit is probing recovery")
                 state.half_open_probe = request_id
 
+    async def retry_allowed(
+        self, provider_ids: tuple[str, ...] | list[str], request_id: str,
+    ) -> bool:
+        """Check current circuits before a retry without taking new capacity."""
+        async with self._lock:
+            for provider_id in sorted(set(provider_ids)):
+                state = self._state(provider_id)
+                now = monotonic()
+                if state.circuit_state == "open":
+                    if state.circuit_open_until is not None and now < state.circuit_open_until:
+                        return False
+                    state.circuit_state = "half-open"
+                if state.circuit_state == "half-open" \
+                        and state.half_open_probe not in {None, request_id}:
+                    return False
+            return True
+
     async def record_response(
         self,
         provider_id: str,

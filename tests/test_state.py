@@ -726,6 +726,92 @@ def test_unclaimed_native_action_is_not_spawnable(state: RouteState, monkeypatch
     ) is None
 
 
+def test_sidecar_claim_creates_scoped_execution_events(
+    state: RouteState, monkeypatch: pytest.MonkeyPatch,
+):
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    state.set_role_route("r1", "ep-1", "recon", "model-a", "manual")
+    state.initialize_workflow_phases(
+        "r1", "ep-1", [{
+            "id": "recon", "roles": ["recon"], "execution_kind": "sidecar_call",
+        }],
+    )
+    state.start_phase("r1", "ep-1", "recon")
+
+    class FakeRegistry:
+        providers: dict = {}
+
+        @staticmethod
+        def get_model(model_id: str) -> SimpleNamespace:
+            return SimpleNamespace(provider_id=None)
+
+    import enhanced_router.registry as registry_module
+    monkeypatch.setattr(registry_module, "get_registry", lambda: FakeRegistry())
+
+    action = next(item for item in state.get_runnable_actions("r1", "ep-1")
+                  if item["action_kind"] == "sidecar_call")
+    claim = state.claim_runnable_action("r1", "ep-1", action["action_id"])
+    execution = state.start_sidecar_execution(
+        run_id="r1", epoch_id="ep-1", action_id=action["action_id"],
+        claim_token=claim["claim_token"], execution_id="scx-test", packet={"task": "inspect"},
+    )
+    assert execution["execution_kind"] == "sidecar_call"
+    assert execution["claude_agent_id"] == "sidecar:scx-test"
+    events = state.get_execution_events("r1", "ep-1", "scx-test")
+    assert events[0]["event_type"] == "started"
+    assert events[0]["payload"] == {"task": "inspect"}
+
+
+def test_retry_policy_keeps_phase_active_until_attempt_budget_is_exhausted(
+    state: RouteState, monkeypatch: pytest.MonkeyPatch,
+):
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    state.set_role_route("r1", "ep-1", "recon", "model-a", "manual")
+    state.initialize_workflow_phases(
+        "r1", "ep-1", [{
+            "id": "recon", "roles": ["recon"],
+            "execution_kind": "sidecar_call", "max_fanout": 1,
+            "max_attempts": 2, "fallback_policy": "retry",
+        }],
+    )
+    state.start_phase("r1", "ep-1", "recon")
+
+    class FakeRegistry:
+        providers: dict = {}
+
+        @staticmethod
+        def get_model(model_id: str) -> SimpleNamespace:
+            return SimpleNamespace(provider_id=None)
+
+    import enhanced_router.registry as registry_module
+    monkeypatch.setattr(registry_module, "get_registry", lambda: FakeRegistry())
+
+    first = next(item for item in state.get_runnable_actions("r1", "ep-1"))
+    first_claim = state.claim_runnable_action("r1", "ep-1", first["action_id"])
+    first_execution = state.start_sidecar_execution(
+        run_id="r1", epoch_id="ep-1", action_id=first["action_id"],
+        claim_token=first_claim["claim_token"], execution_id="scx-retry-1",
+        packet={"task": "retry"},
+    )
+    state.update_agent_execution(first_execution["execution_id"], status="failed")
+
+    assert state.complete_phase_if_ready("r1", "ep-1", "recon")["status"] == "active"
+    second = next(item for item in state.get_runnable_actions("r1", "ep-1"))
+    assert second["current_fanout"] == 1
+
+    second_claim = state.claim_runnable_action("r1", "ep-1", second["action_id"])
+    second_execution = state.start_sidecar_execution(
+        run_id="r1", epoch_id="ep-1", action_id=second["action_id"],
+        claim_token=second_claim["claim_token"], execution_id="scx-retry-2",
+        packet={"task": "retry"},
+    )
+    state.update_agent_execution(second_execution["execution_id"], status="failed")
+
+    assert state.complete_phase_if_ready("r1", "ep-1", "recon")["status"] == "failed"
+
+
 # ================================================================== Mutation lease
 # ==================================================================
 

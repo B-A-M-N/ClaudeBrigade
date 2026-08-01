@@ -225,6 +225,22 @@ class TestLiteLLMSupervisor:
         assert sup.active_port is None
         assert sup.active_generation is None
 
+    def test_generation_activity_tracks_requests_and_streams(self):
+        state = _make_mock_state()
+        sup = LiteLLMSupervisor(state, "/tmp/litellm-test-config")
+
+        sup.track_request_started(7, "request-1", streaming=True)
+        sup.track_request_started(7, "request-2", streaming=False)
+        activity = sup.generation_activity(7)
+        assert activity["active_requests"] == 2
+        assert activity["active_streams"] == 1
+        assert activity["oldest_request_started_at"] is not None
+
+        sup.track_request_finished(7, "request-1")
+        assert sup.generation_activity(7)["active_streams"] == 0
+        sup.track_request_finished(7, "request-2")
+        assert sup.generation_activity(7)["active_requests"] == 0
+
     # ------------------------------------------------------------------
     # start_generation -- happy path
     # ------------------------------------------------------------------

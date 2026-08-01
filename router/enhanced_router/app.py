@@ -58,6 +58,7 @@ async def _init_litellm_supervisor(app: FastAPI) -> None:
 
     from enhanced_router.litellm_supervisor import LiteLLMSupervisor
     from enhanced_router.mcp_control import set_litellm_supervisor
+    from enhanced_router.backends import configure_litellm_supervisor
     from enhanced_router.base import BRIGADE_CACHE_DIR
 
     from enhanced_router.registry import get_registry
@@ -65,6 +66,7 @@ async def _init_litellm_supervisor(app: FastAPI) -> None:
     state = get_state()
     supervisor = LiteLLMSupervisor(state, BRIGADE_CACHE_DIR, litellm_key)
     set_litellm_supervisor(supervisor)
+    configure_litellm_supervisor(supervisor)
     app.state.litellm_supervisor = supervisor
 
     # Create initial generation from current registry
@@ -98,6 +100,8 @@ async def _shutdown_litellm(app: FastAPI) -> None:
             await supervisor.shutdown()
         except Exception as exc:
             LOGGER.warning("LiteLLM shutdown error: %s", exc)
+    from enhanced_router.backends import configure_litellm_supervisor
+    configure_litellm_supervisor(None)
 
 
 def _configure_provider_admission() -> None:
@@ -145,6 +149,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        from enhanced_router.sidecar_executor import shutdown_sidecar_executor
+        await shutdown_sidecar_executor()
         await _shutdown_litellm(app)
         await close_upstream_client()
 

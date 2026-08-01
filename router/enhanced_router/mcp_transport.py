@@ -117,6 +117,9 @@ def authenticated_mcp_app(
                 "adjudicate_finding",
                 "integrate_changeset",
                 "complete_workflow",
+                "invoke_sidecar",
+                "cancel_execution",
+                "retry_execution",
             })
         else:
             if not agent_id or not execution_id:

@@ -294,7 +294,7 @@ def test_incremental_sse_usage_parser_handles_split_events():
     for chunk in (b'data: {"u', b'sage": {"input_tokens": 7}}', b'\r\n', b'data: [DONE]\r\n'):
         usage, overflowed = _consume_sse_usage_lines(buffer, chunk, usage)
         assert overflowed is False
-    assert usage == {"usage": {"input_tokens": 7}}
+    assert usage == {"usage": {"input_tokens": 7}, "usage_complete": False}
 
 
 def test_incremental_sse_usage_parser_merges_nested_anthropic_usage():

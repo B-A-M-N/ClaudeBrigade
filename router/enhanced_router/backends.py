@@ -7,8 +7,11 @@ from enhanced_router.config_models import ModelAuthSpec
 
 import json
 import asyncio
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 import logging
 import os
+import random
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -114,6 +117,13 @@ def _resolve_pinned_auth(
 
 LOGGER = logging.getLogger("claude-enhanced-router")
 _provider_admission = ProviderAdmissionManager()
+_litellm_supervisor: Any | None = None
+
+
+def configure_litellm_supervisor(supervisor: Any | None) -> None:
+    """Attach the process supervisor used for generation activity accounting."""
+    global _litellm_supervisor
+    _litellm_supervisor = supervisor
 
 
 def configure_provider_admission(limits: dict[str, ProviderLimits]) -> None:
@@ -458,12 +468,23 @@ def _consume_sse_usage_lines(
                 prior = current_usage.get("usage")
                 if isinstance(prior, dict):
                     merged.update(prior)
+            usage_complete = bool(
+                current_usage.get("usage_complete", False)
+                if isinstance(current_usage, dict) else False
+            )
             for key, value in usage.items():
                 if isinstance(value, (int, float)) and isinstance(merged.get(key), (int, float)):
                     merged[key] = max(merged[key], value)
                 else:
                     merged[key] = value
-            current_usage = {"usage": merged}
+            usage_complete = usage_complete or event.get("type") in {
+                "message_delta", "message_stop", "response.completed",
+            } or (event.get("choices") == [] and "usage" in event)
+            current_usage = (
+                {"usage": merged}
+                if usage_complete
+                else {"usage": merged, "usage_complete": False}
+            )
 
     if len(buffer) > max_line_bytes:
         buffer.clear()
@@ -504,8 +525,28 @@ async def _stream_upstream_with_admission(
                 )
                 usage_line_overflow |= overflowed
             yield chunk
-    except (asyncio.CancelledError, TimeoutError, asyncio.TimeoutError):
+    except asyncio.CancelledError:
         succeeded = False
+        if resolved is not None:
+            _record_execution_transport_failure(
+                resolved, "cancelled_by_controller", "stream cancelled",
+            )
+        raise
+    except (TimeoutError, asyncio.TimeoutError) as exc:
+        succeeded = False
+        if resolved is not None:
+            _record_execution_transport_failure(
+                resolved,
+                "stream_idle_timeout" if saw_token else "ttft_timeout",
+                str(exc),
+            )
+        raise
+    except Exception as exc:
+        succeeded = False
+        if resolved is not None:
+            _record_execution_transport_failure(
+                resolved, "malformed_stream", str(exc),
+            )
         raise
     finally:
         await response.aclose()
@@ -526,6 +567,22 @@ async def _stream_upstream_with_admission(
                 succeeded=succeeded,
             )
         await _release_provider_request(resolved, request_id)
+
+
+def _record_execution_transport_failure(
+    resolved: ResolvedRoute,
+    error_class: str,
+    reason: str,
+) -> None:
+    if resolved.agent_binding_id is None:
+        return
+    try:
+        from enhanced_router.state import get_state
+        get_state().record_execution_failure_for_binding(
+            resolved.agent_binding_id, error_class=error_class, error=reason,
+        )
+    except Exception:
+        LOGGER.debug("failed to persist stream failure", exc_info=True)
 
 
 def _provider_stream_deadlines(resolved: "ResolvedRoute | None") -> tuple[float, float, float]:
@@ -620,24 +677,57 @@ async def _send_with_provider_retry(
             last_error = exc
             if attempt + 1 >= max_attempts:
                 raise
-            await asyncio.sleep(min(max_backoff, 0.5 * (2**attempt)))
+            if not await _provider_admission.retry_allowed(
+                _provider_ids_for_route(resolved), request_id or "retry",
+            ):
+                raise AdmissionTimeout("provider circuit opened during retry")
+            ceiling = min(max_backoff, 0.5 * (2**attempt))
+            delay = random.uniform(0.0, max(0.1, ceiling))
+            _, _, wall_seconds = _provider_stream_deadlines(resolved)
+            if time.perf_counter() - started_at + delay >= wall_seconds:
+                raise TimeoutError("provider retry budget exceeded request wall deadline")
+            await asyncio.sleep(delay)
             continue
 
         status = int(getattr(response, "status_code", 500))
         if status in retryable and attempt + 1 < max_attempts:
             await _record_provider_response(resolved, request_id, response)
-            raw_retry_after = getattr(response, "headers", {}).get("retry-after")
-            try:
-                retry_after = float(raw_retry_after) if raw_retry_after else 0.0
-            except (TypeError, ValueError):
-                retry_after = 0.0
+            retry_after = _retry_after_seconds(getattr(response, "headers", {}).get("retry-after"))
             await response.aclose()
-            await asyncio.sleep(min(max_backoff, max(0.1, retry_after or 0.5 * (2**attempt))))
+            if not await _provider_admission.retry_allowed(
+                _provider_ids_for_route(resolved), request_id or "retry",
+            ):
+                raise AdmissionTimeout("provider circuit opened during retry")
+            ceiling = min(max_backoff, retry_after or 0.5 * (2**attempt))
+            delay = random.uniform(0.0, max(0.1, ceiling))
+            _, _, wall_seconds = _provider_stream_deadlines(resolved)
+            if time.perf_counter() - started_at + delay >= wall_seconds:
+                raise TimeoutError("provider retry budget exceeded request wall deadline")
+            await asyncio.sleep(delay)
             continue
         await _record_provider_response(resolved, request_id, response)
         return response
 
     raise RuntimeError("provider request exhausted its retry budget") from last_error
+
+
+def _retry_after_seconds(value: object) -> float | None:
+    """Parse both RFC 7231 delta-seconds and HTTP-date Retry-After values."""
+    if value is None:
+        return None
+    raw = str(value).strip()
+    try:
+        seconds = float(raw)
+        return max(0.0, seconds)
+    except ValueError:
+        pass
+    try:
+        date = parsedate_to_datetime(raw)
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=timezone.utc)
+        return max(0.0, date.timestamp() - time.time())
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _usage_totals(payload: dict[str, Any]) -> dict[str, int] | None:
@@ -677,6 +767,12 @@ def _record_endpoint_usage(
     """Persist sanitized token/cache metrics for a logical model endpoint."""
     if not resolved.provider_id or not resolved.model_id or not resolved.endpoint_id:
         return
+    if payload.get("usage_complete") is False:
+        LOGGER.debug(
+            "ignoring incomplete stream usage model=%s endpoint=%s",
+            resolved.model_id, resolved.endpoint_id,
+        )
+        return
     totals = _usage_totals(payload)
     if totals is None:
         return
@@ -695,6 +791,14 @@ def _record_endpoint_usage(
             latency_ms=(time.perf_counter() - started_at) * 1000 if started_at else None,
             succeeded=succeeded,
             configuration_hash=resolved.registry_hash or "",
+        )
+        get_state().record_execution_metrics_for_binding(
+            resolved.agent_binding_id,
+            input_tokens=totals["input_tokens"],
+            cache_read_tokens=totals["cache_read_tokens"],
+            cache_write_tokens=totals["cache_write_tokens"],
+            output_tokens=totals["output_tokens"],
+            wall_time_ms=(time.perf_counter() - started_at) * 1000 if started_at else None,
         )
     except Exception:
         LOGGER.exception(
@@ -719,15 +823,12 @@ def _route_with_reported_deployment(
     if not reported:
         return resolved
     reported = str(reported)
-    endpoint_id = next(
-        (
-            candidate
-            for candidate in resolved.allowed_deployments
-            if candidate == reported or candidate in reported or reported.endswith(candidate)
-        ),
-        None,
-    )
+    endpoint_id = reported if reported in set(resolved.allowed_deployments) else None
     if endpoint_id is None:
+        LOGGER.warning(
+            "managed deployment identity is unknown or ambiguous model=%s reported=%s",
+            resolved.model_id, reported,
+        )
         return resolved
     provider_id = resolved.provider_id
     try:
@@ -742,21 +843,34 @@ def _route_with_reported_deployment(
     return replace(resolved, endpoint_id=endpoint_id, provider_id=provider_id)
 
 
-async def _acquire_provider_request(resolved: "ResolvedRoute", request: Any) -> str | None:
+async def _acquire_provider_request(
+    resolved: "ResolvedRoute", request: Any, *, streaming: bool = False,
+) -> str | None:
     provider_ids = _provider_ids_for_route(resolved)
-    if not provider_ids:
+    if not provider_ids and resolved.catalog_generation is None:
         return None
     # Keep the caller's ID for correlation, but always add a unique suffix so
     # a reused/malformed upstream ID can never bypass admission as a duplicate.
     caller_request_id = request.headers.get("x-request-id") or "request"
     request_id = f"{caller_request_id}:{uuid.uuid4().hex}"
     try:
+        from enhanced_router.state import get_state
+        get_state().increment_execution_requests(resolved.agent_binding_id)
+    except Exception:
+        LOGGER.debug("request could not be correlated to an execution", exc_info=True)
+    try:
         if len(provider_ids) > 1:
             await _provider_admission.acquire_request_group(provider_ids, request_id)
-        else:
+        elif provider_ids:
             await _provider_admission.acquire_request(next(iter(provider_ids)), request_id)
     except AdmissionTimeout as exc:
         raise RuntimeError(f"provider request admission timed out: {exc}") from exc
+    if resolved.catalog_generation is not None and _litellm_supervisor is not None:
+        _litellm_supervisor.track_request_started(
+            resolved.catalog_generation,
+            request_id,
+            streaming=streaming,
+        )
     return request_id
 
 
@@ -774,6 +888,10 @@ async def _release_provider_request(
 ) -> None:
     if not request_id or resolved is None:
         return
+    if resolved.catalog_generation is not None and _litellm_supervisor is not None:
+        _litellm_supervisor.track_request_finished(
+            resolved.catalog_generation, request_id,
+        )
     provider_ids = _provider_ids_for_route(resolved)
     if len(provider_ids) > 1:
         await _provider_admission.release_request_group(provider_ids, request_id)
@@ -797,11 +915,7 @@ async def _record_provider_response(
     retry_after: float | None = None
     raw_retry_after = getattr(response, "headers", {}).get("retry-after")
     if raw_retry_after:
-        try:
-            parsed = float(raw_retry_after)
-            retry_after = parsed if parsed > 0 else None
-        except (TypeError, ValueError):
-            retry_after = None
+        retry_after = _retry_after_seconds(raw_retry_after)
     await _provider_admission.record_response(
         provider_id,
         request_id,
@@ -832,13 +946,24 @@ async def proxy_anthropic_passthrough(
     headers["content-type"] = "application/json"
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     is_streaming = bool(payload.get("stream"))
+    resolved = ResolvedRoute(
+        kind=BackendType.ANTHROPIC_PASSTHROUGH,
+        model_id=str(payload.get("model") or "anthropic"),
+    )
+    started_at = time.perf_counter()
+    request_id = request.headers.get("x-request-id") or f"passthrough:{uuid.uuid4().hex}"
 
     client = get_upstream_client()
     try:
-        upstream_request = client.build_request(
-            request.method, url, headers=headers, content=body
+        upstream_response = await _send_with_provider_retry(
+            client,
+            lambda: client.build_request(
+                request.method, url, headers=headers, content=body
+            ),
+            resolved,
+            started_at,
+            request_id,
         )
-        upstream_response = await client.send(upstream_request, stream=True)
     except Exception as exc:
         return JSONResponse(
             status_code=502,
@@ -853,13 +978,29 @@ async def proxy_anthropic_passthrough(
     response_headers = copy_response_headers(upstream_response.headers)
     if is_streaming:
         return StreamingResponse(
-            _stream_upstream(upstream_response),
+            _stream_upstream_with_admission(
+                upstream_response, request_id, resolved, started_at
+            ),
             status_code=upstream_response.status_code,
             headers=response_headers,
         )
 
-    content = await upstream_response.aread()
-    await upstream_response.aclose()
+    try:
+        content = await _read_with_deadline(upstream_response, resolved, started_at)
+    finally:
+        await upstream_response.aclose()
+    try:
+        response_payload = json.loads(content)
+    except (TypeError, ValueError):
+        response_payload = None
+    if isinstance(response_payload, dict):
+        _record_endpoint_usage(
+            resolved,
+            request_id,
+            response_payload,
+            started_at,
+            succeeded=200 <= upstream_response.status_code < 300,
+        )
     from fastapi.responses import Response as FastAPIResponse
 
     return FastAPIResponse(
@@ -908,6 +1049,8 @@ async def proxy_anthropic_passthrough_worker(
     headers["content-type"] = "application/json"
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     is_streaming = bool(payload.get("stream"))
+    started_at = time.perf_counter()
+    request_id = request.headers.get("x-request-id") or f"passthrough:{uuid.uuid4().hex}"
 
     LOGGER.info(
         "anthropic_passthrough_worker role=%s model=%s session=%s agent=%s binding=%s",
@@ -920,10 +1063,15 @@ async def proxy_anthropic_passthrough_worker(
 
     client = get_upstream_client()
     try:
-        upstream_request = client.build_request(
-            request.method, url, headers=headers, content=body
+        upstream_response = await _send_with_provider_retry(
+            client,
+            lambda: client.build_request(
+                request.method, url, headers=headers, content=body
+            ),
+            resolved,
+            started_at,
+            request_id,
         )
-        upstream_response = await client.send(upstream_request, stream=True)
     except Exception as exc:
         LOGGER.warning(
             "anthropic_passthrough_worker error role=%s error=%s",
@@ -942,13 +1090,30 @@ async def proxy_anthropic_passthrough_worker(
     response_headers = copy_response_headers(upstream_response.headers)
     if is_streaming:
         return StreamingResponse(
-            _stream_upstream(upstream_response),
+            _stream_upstream_with_admission(
+                upstream_response, request_id, resolved, started_at
+            ),
             status_code=upstream_response.status_code,
             headers=response_headers,
         )
 
-    content = await upstream_response.aread()
-    await upstream_response.aclose()
+    try:
+        content = await _read_with_deadline(upstream_response, resolved, started_at)
+    finally:
+        await upstream_response.aclose()
+    try:
+        response_payload = json.loads(content)
+    except (TypeError, ValueError):
+        response_payload = None
+    if isinstance(response_payload, dict):
+        usage_route = _route_with_reported_deployment(resolved, upstream_response.headers)
+        _record_endpoint_usage(
+            usage_route,
+            request_id,
+            response_payload,
+            started_at,
+            succeeded=200 <= upstream_response.status_code < 300,
+        )
     from fastapi.responses import Response as FastAPIResponse
 
     return FastAPIResponse(
@@ -1090,7 +1255,9 @@ async def proxy_direct_anthropic(
 
     client = get_upstream_client()
     try:
-        admission_id = await _acquire_provider_request(resolved, request)
+        admission_id = await _acquire_provider_request(
+            resolved, request, streaming=is_streaming,
+        )
     except RuntimeError as exc:
         return JSONResponse(status_code=429, content={"error": {"type": "provider_queue_timeout", "message": str(exc)}})
     try:
@@ -1209,7 +1376,9 @@ async def proxy_litellm_messages(
 
     client = get_upstream_client()
     try:
-        admission_id = await _acquire_provider_request(resolved, request)
+        admission_id = await _acquire_provider_request(
+            resolved, request, streaming=is_streaming,
+        )
     except RuntimeError as exc:
         return JSONResponse(status_code=429, content={"error": {"type": "provider_queue_timeout", "message": str(exc)}})
     try:

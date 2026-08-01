@@ -79,6 +79,32 @@ def main() -> int:
     agent_id = data.get("agent_id")
     agent_type = lookup_agent_type(session_dir, agent_id)
 
+    # Tool budgets are authoritative SQLite counters, not values supplied by
+    # Claude Code.  Correlate the hook event with the active child execution
+    # and increment atomically once per PostToolUse/PostToolUseFailure event.
+    if agent_id and run_id:
+        try:
+            from enhanced_router.state import get_state
+            execution = next(
+                (
+                    item for item in get_state().get_agent_executions(
+                        str(run_id), epoch_id=epoch_id,
+                    )
+                    if item.get("claude_agent_id") == agent_id
+                    and item.get("status") in {"started", "running"}
+                ),
+                None,
+            )
+            if execution is not None:
+                get_state().increment_execution_tool_calls(
+                    str(execution["execution_id"]),
+                    run_id=str(run_id), epoch_id=epoch_id,
+                )
+        except Exception:
+            # Evidence hooks must not make a completed tool call disappear;
+            # the missing counter remains visible to completion diagnostics.
+            pass
+
     cwd = pathlib.Path(str(data.get("cwd", "."))).resolve()
     current_fp = None
     try:

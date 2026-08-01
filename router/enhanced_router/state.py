@@ -44,6 +44,14 @@ _EXECUTION_TRANSITIONS = {
 }
 
 
+def _canonical_actor(actor: str | None) -> str:
+    """Normalize legacy ``<role>-agent`` labels before exact comparison."""
+    value = str(actor or "").strip().lower()
+    if value.endswith("-agent"):
+        return value[:-len("-agent")]
+    return value
+
+
 class RouteConflictError(Exception):
     """Raised when a CAS operation detects a version conflict."""
 
@@ -318,8 +326,15 @@ def _needs_v37_hardening(conn: sqlite3.Connection) -> bool:
             "parent_dirty_patch_hash",
         },
         "execution_changesets": {"parent_canonical_generation"},
-        "runnable_action_claims": {"spawn_call_id", "execution_id"},
-        "agent_executions": {"error_class"},
+        "agent_executions": {
+            "error_class", "schema_valid", "evidence_valid", "accepted_by_controller",
+            "quality_score", "verdict", "confidence",
+        },
+        "workflow_phases": {
+            "execution_kind", "required_actor", "started_by_actor", "started_by_principal",
+            "max_parallelism", "required_successes", "max_attempts", "max_attempts_per_model",
+        },
+        "runnable_action_claims": {"spawn_call_id", "execution_id", "action_kind"},
     }
     for table, columns in required.items():
         present = {
@@ -329,6 +344,8 @@ def _needs_v37_hardening(conn: sqlite3.Connection) -> bool:
             return True
     return conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='integration_journal'"
+    ).fetchone() is None or conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_events'"
     ).fetchone() is None
 
 
@@ -1268,6 +1285,33 @@ def _migrate_v37(conn: sqlite3.Connection) -> None:
         conn, "execution_changesets", "parent_canonical_generation", "INTEGER"
     )
     _add_column_if_missing(conn, "agent_executions", "error_class", "TEXT")
+    for name, declaration in {
+        "schema_valid": "INTEGER",
+        "evidence_valid": "INTEGER",
+        "accepted_by_controller": "INTEGER",
+        "quality_score": "REAL",
+        "verdict": "TEXT",
+        "confidence": "REAL",
+    }.items():
+        _add_column_if_missing(conn, "agent_executions", name, declaration)
+    _add_column_if_missing(
+        conn, "workflow_phases", "execution_kind",
+        "TEXT NOT NULL DEFAULT 'native_agent'",
+    )
+    _add_column_if_missing(conn, "workflow_phases", "required_actor", "TEXT")
+    _add_column_if_missing(conn, "workflow_phases", "started_by_actor", "TEXT")
+    _add_column_if_missing(conn, "workflow_phases", "started_by_principal", "TEXT")
+    for name, declaration in {
+        "max_parallelism": "INTEGER",
+        "required_successes": "INTEGER",
+        "max_attempts": "INTEGER NOT NULL DEFAULT 1",
+        "max_attempts_per_model": "INTEGER",
+    }.items():
+        _add_column_if_missing(conn, "workflow_phases", name, declaration)
+    conn.execute(
+        "UPDATE workflow_phases SET required_actor=actor "
+        "WHERE required_actor IS NULL"
+    )
     conn.execute(
         "UPDATE workspaces SET current_base_sha=COALESCE(current_base_sha, base_sha), "
         "current_dirty_hash=COALESCE(current_dirty_hash, dirty_patch_hash)"
@@ -1294,6 +1338,7 @@ def _migrate_v37(conn: sqlite3.Connection) -> None:
                 role TEXT NOT NULL,
                 native_agent_name TEXT NOT NULL,
                 model_id TEXT NOT NULL,
+                action_kind TEXT NOT NULL DEFAULT 'native_agent',
                 provider_id TEXT,
                 claim_token TEXT NOT NULL UNIQUE,
                 reservation_id TEXT,
@@ -1323,11 +1368,12 @@ def _migrate_v37(conn: sqlite3.Connection) -> None:
         execution_select = "execution_id" if "execution_id" in old_columns else "NULL"
         conn.execute(
             "INSERT INTO runnable_action_claims "
-            "(action_id, run_id, epoch_id, phase_id, role, native_agent_name, model_id, "
+            "(action_id, run_id, epoch_id, phase_id, role, native_agent_name, model_id, action_kind, "
             "provider_id, claim_token, reservation_id, intent_id, status, created_at, "
             "claimed_at, consumed_at, expires_at, claude_agent_id, spawn_call_id, execution_id) "
             "SELECT action_id, run_id, epoch_id, phase_id, role, native_agent_name, model_id, "
-            "provider_id, claim_token, reservation_id, intent_id, status, created_at, "
+            "CASE WHEN action_id LIKE 'integration:%' THEN 'controller_integration' "
+            "ELSE 'native_agent' END, provider_id, claim_token, reservation_id, intent_id, status, created_at, "
             "claimed_at, consumed_at, expires_at, claude_agent_id, "
             f"{extra_select}, {execution_select} FROM runnable_action_claims_v37_old"
         )
@@ -1348,6 +1394,20 @@ def _migrate_v37(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_integration_journal_pending
             ON integration_journal(status, created_at);
+
+        CREATE TABLE IF NOT EXISTS execution_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            execution_id TEXT NOT NULL REFERENCES agent_executions(execution_id),
+            run_id TEXT NOT NULL REFERENCES runs(run_id),
+            epoch_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            UNIQUE(execution_id, seq)
+        );
+        CREATE INDEX IF NOT EXISTS idx_execution_events_scope
+            ON execution_events(run_id, epoch_id, execution_id, seq);
     """)
 
 
@@ -1695,24 +1755,53 @@ class RouteState:
                 })
             actions.append(action)
         for phase in self.get_ready_phases(run_id, epoch_id) + self.get_active_phases(run_id, epoch_id):
-            if phase.get("actor"):
+            if phase.get("required_actor") or phase.get("actor"):
                 continue
             allowed_roles = json.loads(phase.get("allowed_roles_json") or "[]")
             executions = self.get_agent_executions(
                 run_id, epoch_id=epoch_id, phase_id=phase["phase_id"]
             )
-            if len(executions) >= int(phase.get("max_fanout") or 1):
+            active_count = sum(
+                item.get("status") in {"started", "running", "streaming", "verifying"}
+                for item in executions
+            )
+            max_parallelism = int(
+                phase.get("max_parallelism") or phase.get("max_fanout") or 1
+            )
+            max_attempts = int(
+                phase.get("max_attempts") or phase.get("max_fanout") or 1
+            )
+            max_attempts_per_model = phase.get("max_attempts_per_model")
+            fallback_policy = str(phase.get("fallback_policy") or "").strip().lower()
+            if active_count >= max_parallelism or len(executions) >= max_attempts:
+                continue
+            if executions and any(item.get("status") in {"failed", "timeout", "cancelled"}
+                                  for item in executions) and not fallback_policy:
                 continue
             for role in allowed_roles:
                 route = self.get_role_route(run_id, epoch_id, role)
                 if not route:
                     continue
                 model_id = str(route["model_id"])
+                if max_attempts_per_model is not None:
+                    model_attempts = sum(
+                        item.get("model_id") == model_id for item in executions
+                    )
+                    if model_attempts >= int(max_attempts_per_model):
+                        continue
                 model = registry.get_model(model_id)
                 provider_id = model.provider_id
                 provider = registry.providers.get(provider_id) if provider_id else None
-                if provider_id is not None and provider and not self.provider_agent_capacity_available(
-                    provider_id, provider.limits.max_active_agents
+                execution_kind = str(phase.get("execution_kind") or "native_agent")
+                if execution_kind not in {"native_agent", "sidecar_call"}:
+                    continue
+                if (
+                    execution_kind == "native_agent"
+                    and provider_id is not None
+                    and provider
+                    and not self.provider_agent_capacity_available(
+                        provider_id, provider.limits.max_active_agents
+                    )
                 ):
                     continue
                 native_name = next(
@@ -1722,6 +1811,8 @@ class RouteState:
                     ),
                     f"brigade-{role}",
                 )
+                if execution_kind == "sidecar_call":
+                    native_name = f"sidecar-{role}"
                 action_id = (
                     f"action:{run_id}:{epoch_id}:{phase['phase_id']}:{role}:{len(executions)}"
                 )
@@ -1730,7 +1821,7 @@ class RouteState:
                     continue
                 action = {
                     "action_id": action_id,
-                    "action_kind": "native_agent",
+                    "action_kind": execution_kind,
                     "phase_id": phase["phase_id"],
                     "role": role,
                     "native_agent_name": native_name,
@@ -1843,28 +1934,33 @@ class RouteState:
                     "a native action with the same name and role is already awaiting "
                     f"lifecycle attachment: {pending[0]}"
                 )
+            action_kind = str(action.get("action_kind") or "native_agent")
             values = (
                 action_id, run_id, epoch_id, action["phase_id"], action["role"],
-                action["native_agent_name"], action["model_id"], provider_id,
+                action["native_agent_name"], action["model_id"], action_kind, provider_id,
                 claim_token, reservation_id if reservation is not None else None,
-            intent_id if action.get("action_kind") == "native_agent" else None,
-            "claimed", _utcnow(), _utcnow(), expires_at,
+                intent_id if action_kind == "native_agent" else None,
+                "claimed", _utcnow(), _utcnow(), expires_at,
             )
             if existing is None:
                 conn.execute(
                     "INSERT INTO runnable_action_claims "
-                    "(action_id, run_id, epoch_id, phase_id, role, native_agent_name, model_id, "
+                    "(action_id, run_id, epoch_id, phase_id, role, native_agent_name, model_id, action_kind, "
                     "provider_id, claim_token, reservation_id, intent_id, status, created_at, "
-                    "claimed_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "claimed_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     values,
                 )
             else:
                 conn.execute(
                     "UPDATE runnable_action_claims SET run_id=?, epoch_id=?, phase_id=?, role=?, "
-                    "native_agent_name=?, model_id=?, provider_id=?, claim_token=?, "
+                    "native_agent_name=?, model_id=?, action_kind=?, provider_id=?, claim_token=?, "
                     "reservation_id=?, intent_id=?, status='claimed', claimed_at=?, "
-                    "expires_at=?, consumed_at=NULL, claude_agent_id=NULL WHERE action_id=?",
-                    (*values[1:11], values[13], values[14], action_id),
+                    "expires_at=?, consumed_at=NULL, claude_agent_id=NULL, execution_id=NULL WHERE action_id=?",
+                    (run_id, epoch_id, action["phase_id"], action["role"],
+                     action["native_agent_name"], action["model_id"], action_kind, provider_id,
+                     claim_token, reservation_id if reservation is not None else None,
+                     intent_id if action_kind == "native_agent" else None,
+                     values[14], values[15], action_id),
                 )
             policy_json = json.dumps(
                 {"action_id": action_id, "claim_token": claim_token},
@@ -1932,6 +2028,240 @@ class RouteState:
                 (action_id,),
             ).fetchone()
             return dict(result) if result is not None else None
+        finally:
+            conn.close()
+
+    def start_sidecar_execution(
+        self,
+        *,
+        run_id: str,
+        epoch_id: str,
+        action_id: str,
+        claim_token: str,
+        execution_id: str,
+        packet: dict,
+    ) -> dict:
+        """Atomically consume a sidecar claim and create its execution.
+
+        Sidecars have no Claude Code child process.  They therefore use a
+        synthetic agent identity, while retaining the same claim-to-execution
+        correlation used by native workers.
+        """
+        encoded_packet = json.dumps(packet, separators=(",", ":"), ensure_ascii=False)
+        if len(encoded_packet.encode("utf-8")) > 64_000:
+            raise WorkflowStateError("sidecar packet exceeds the 64 KiB bound")
+        sidecar_agent_id = f"sidecar:{execution_id}"
+        conn = self._new_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            claim = conn.execute(
+                "SELECT * FROM runnable_action_claims WHERE action_id=? AND run_id=? "
+                "AND epoch_id=? AND action_kind='sidecar_call' AND claim_token=? "
+                "AND status='claimed' AND expires_at >= ?",
+                (action_id, run_id, epoch_id, claim_token, _utcnow()),
+            ).fetchone()
+            if claim is None:
+                raise WorkflowStateError("sidecar claim is missing, expired, or already consumed")
+            phase = conn.execute(
+                "SELECT status, allowed_roles_json, max_fanout, provider_requirements_json, "
+                "max_parallelism, max_attempts "
+                "FROM workflow_phases WHERE run_id=? AND epoch_id=? AND phase_id=?",
+                (run_id, epoch_id, claim["phase_id"]),
+            ).fetchone()
+            if phase is None or phase[0] != "active":
+                raise WorkflowStateError("sidecar action phase is not active")
+            allowed_roles = json.loads(phase[1] or "[]")
+            if claim["role"] not in allowed_roles:
+                raise WorkflowStateError("sidecar role is not allowed in its phase")
+            if claim["provider_id"] not in json.loads(phase[3] or "[]") and json.loads(phase[3] or "[]"):
+                raise WorkflowStateError("sidecar provider is not permitted by its phase")
+            active_count = conn.execute(
+                "SELECT COUNT(*) FROM agent_executions WHERE run_id=? AND epoch_id=? "
+                "AND phase_id=? AND status NOT IN ('completed','failed','timeout','cancelled')",
+                (run_id, epoch_id, claim["phase_id"]),
+            ).fetchone()[0]
+            attempt_count = conn.execute(
+                "SELECT COUNT(*) FROM agent_executions WHERE run_id=? AND epoch_id=? "
+                "AND phase_id=?",
+                (run_id, epoch_id, claim["phase_id"]),
+            ).fetchone()[0]
+            if int(active_count) >= int(phase[4] or phase[2] or 1):
+                raise WorkflowStateError("sidecar action exceeds phase parallelism")
+            if int(attempt_count) >= int(phase[5] or phase[2] or 1):
+                raise WorkflowStateError("sidecar action exceeds phase attempt budget")
+            existing = conn.execute(
+                "SELECT * FROM agent_executions WHERE execution_id=?", (execution_id,)
+            ).fetchone()
+            if existing is not None:
+                if existing["run_id"] != run_id or existing["epoch_id"] != epoch_id:
+                    raise WorkflowStateError("execution ID is owned by another run")
+                conn.rollback()
+                return dict(existing)
+            now = _utcnow()
+            conn.execute(
+                "INSERT INTO agent_executions "
+                "(execution_id, run_id, epoch_id, claude_agent_id, role, model_id, phase_id, "
+                "status, actor_kind, execution_kind, provider_id, independence_key) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'started', 'sidecar', 'sidecar_call', ?, ?)",
+                (
+                    execution_id, run_id, epoch_id, sidecar_agent_id, claim["role"],
+                    claim["model_id"], claim["phase_id"], claim["provider_id"],
+                    hashlib.sha256(
+                        f"sidecar:{claim['model_id']}:{claim['role']}:{claim['phase_id']}".encode()
+                    ).hexdigest(),
+                ),
+            )
+            updated = conn.execute(
+                "UPDATE runnable_action_claims SET status='consumed', consumed_at=?, "
+                "claude_agent_id=?, execution_id=? WHERE action_id=? AND status='claimed'",
+                (now, sidecar_agent_id, execution_id, action_id),
+            )
+            if updated.rowcount != 1:
+                raise WorkflowStateError("sidecar claim changed during execution start")
+            conn.execute(
+                "INSERT INTO execution_events "
+                "(execution_id, run_id, epoch_id, seq, event_type, payload_json, created_at) "
+                "VALUES (?, ?, ?, 1, 'started', ?, ?)",
+                (execution_id, run_id, epoch_id, encoded_packet, now),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM agent_executions WHERE execution_id=?", (execution_id,)
+            ).fetchone()
+            assert row is not None
+            return dict(row)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def append_execution_event(
+        self,
+        run_id: str,
+        epoch_id: str,
+        execution_id: str,
+        event_type: str,
+        payload: dict | None = None,
+    ) -> dict:
+        """Append an ordered, scoped execution event."""
+        payload_json = json.dumps(payload or {}, separators=(",", ":"), ensure_ascii=False)
+        if len(payload_json.encode("utf-8")) > 64_000:
+            raise ValueError("execution event payload exceeds the 64 KiB bound")
+        conn = self._new_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            owned = conn.execute(
+                "SELECT 1 FROM agent_executions WHERE execution_id=? AND run_id=? AND epoch_id=?",
+                (execution_id, run_id, epoch_id),
+            ).fetchone()
+            if owned is None:
+                raise WorkflowStateError("execution is not owned by the requested run and epoch")
+            seq = int(conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM execution_events WHERE execution_id=?",
+                (execution_id,),
+            ).fetchone()[0])
+            now = _utcnow()
+            conn.execute(
+                "INSERT INTO execution_events "
+                "(execution_id, run_id, epoch_id, seq, event_type, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (execution_id, run_id, epoch_id, seq, event_type, payload_json, now),
+            )
+            conn.commit()
+            return {
+                "execution_id": execution_id, "run_id": run_id, "epoch_id": epoch_id,
+                "seq": seq, "event_type": event_type, "payload": payload or {},
+                "created_at": now,
+            }
+        finally:
+            conn.close()
+
+    def prepare_sidecar_retry(self, execution_id: str) -> dict:
+        """Create one bounded retry claim from a failed sidecar execution."""
+        conn = self._new_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            execution = conn.execute(
+                "SELECT * FROM agent_executions WHERE execution_id=?", (execution_id,)
+            ).fetchone()
+            if execution is None:
+                raise WorkflowStateError("sidecar execution was not found")
+            if execution["execution_kind"] != "sidecar_call":
+                raise WorkflowStateError("only sidecar executions can be retried")
+            if execution["status"] not in {"failed", "timeout", "cancelled"}:
+                raise WorkflowStateError("sidecar execution is not in a retryable terminal state")
+            claim = conn.execute(
+                "SELECT * FROM runnable_action_claims WHERE execution_id=? "
+                "AND action_kind='sidecar_call' ORDER BY claimed_at DESC LIMIT 1",
+                (execution_id,),
+            ).fetchone()
+            if claim is None:
+                raise WorkflowStateError("sidecar execution has no originating claim")
+            prior_retries = conn.execute(
+                "SELECT COUNT(*) FROM runnable_action_claims WHERE action_id LIKE ?",
+                (f"{claim['action_id']}:retry:%",),
+            ).fetchone()[0]
+            if int(prior_retries) >= 2:
+                raise WorkflowStateError("sidecar retry budget exhausted")
+            event = conn.execute(
+                "SELECT payload_json FROM execution_events WHERE execution_id=? AND seq=1",
+                (execution_id,),
+            ).fetchone()
+            if event is None:
+                raise WorkflowStateError("sidecar input packet is unavailable for retry")
+            packet = json.loads(str(event[0]))
+            retry_action_id = f"{claim['action_id']}:retry:{secrets.token_hex(4)}"
+            retry_token = secrets.token_urlsafe(24)
+            now = _utcnow()
+            expires = (datetime.now(timezone.utc) + timedelta(seconds=90)).isoformat()
+            conn.execute(
+                "INSERT INTO runnable_action_claims "
+                "(action_id, run_id, epoch_id, phase_id, role, native_agent_name, model_id, "
+                "action_kind, provider_id, claim_token, status, created_at, claimed_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'sidecar_call', ?, ?, 'claimed', ?, ?, ?)",
+                (retry_action_id, execution["run_id"], execution["epoch_id"], execution["phase_id"],
+                 execution["role"], claim["native_agent_name"], execution["model_id"],
+                 execution["provider_id"], retry_token, now, now, expires),
+            )
+            conn.commit()
+            return {
+                "run_id": execution["run_id"], "epoch_id": execution["epoch_id"],
+                "action_id": retry_action_id, "claim_token": retry_token, "packet": packet,
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_execution_events(
+        self,
+        run_id: str,
+        epoch_id: str,
+        execution_id: str,
+        *,
+        after_seq: int = 0,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Read execution events only within the requested run and epoch."""
+        limit = max(1, min(int(limit), 500))
+        conn = self._new_conn()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM execution_events WHERE execution_id=? AND run_id=? "
+                "AND epoch_id=? AND seq>? ORDER BY seq LIMIT ?",
+                (execution_id, run_id, epoch_id, max(0, int(after_seq)), limit),
+            ).fetchall()
+            result: list[dict] = []
+            for row in rows:
+                item = dict(row)
+                try:
+                    item["payload"] = json.loads(item.pop("payload_json"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    item["payload"] = {"malformed": True}
+                result.append(item)
+            return result
         finally:
             conn.close()
 
@@ -2084,7 +2414,8 @@ class RouteState:
 
             if phase_id is not None:
                 phase = conn.execute(
-                    "SELECT status, allowed_roles_json, actor, max_fanout "
+                    "SELECT status, allowed_roles_json, required_actor, max_fanout, "
+                    "max_parallelism, max_attempts "
                     "FROM workflow_phases WHERE run_id=? AND epoch_id=? AND phase_id=?",
                     (run_id, epoch_id, phase_id),
                 ).fetchone()
@@ -2093,13 +2424,21 @@ class RouteState:
                 allowed_roles = json.loads(phase[1] or "[]")
                 if role not in allowed_roles and not (role == "controller" and phase[2] == "controller"):
                     raise WorkflowStateError("native action role is not allowed in its phase")
-                count = conn.execute(
+                active_count = conn.execute(
+                    "SELECT COUNT(*) FROM agent_executions "
+                    "WHERE run_id=? AND epoch_id=? AND phase_id=? "
+                    "AND status NOT IN ('completed','failed','timeout','cancelled')",
+                    (run_id, epoch_id, phase_id),
+                ).fetchone()[0]
+                attempt_count = conn.execute(
                     "SELECT COUNT(*) FROM agent_executions "
                     "WHERE run_id=? AND epoch_id=? AND phase_id=?",
                     (run_id, epoch_id, phase_id),
                 ).fetchone()[0]
-                if int(count) >= int(phase[3] or 1):
-                    raise WorkflowStateError("native action exceeds phase fanout")
+                if int(active_count) >= int(phase[4] or phase[3] or 1):
+                    raise WorkflowStateError("native action exceeds phase parallelism")
+                if int(attempt_count) >= int(phase[5] or phase[3] or 1):
+                    raise WorkflowStateError("native action exceeds phase attempt budget")
 
             if binding_id is None:
                 existing_binding = self._select_agent_binding(
@@ -2126,6 +2465,17 @@ class RouteState:
                 if provider_id is not None and binding[6] is not None and provider_id != binding[6]:
                     raise WorkflowStateError("native execution provider does not match its binding")
 
+            independence_key = hashlib.sha256(
+                json.dumps({
+                    "model_id": model_id,
+                    "provider_id": provider_id,
+                    "role": role,
+                    "phase_id": phase_id,
+                    "parent_execution_id": None,
+                    "workspace_id": workspace_id,
+                }, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+
             if workspace_id is not None:
                 workspace = conn.execute(
                     "SELECT kind, status, owner_execution_id FROM workspaces WHERE workspace_id=?",
@@ -2144,12 +2494,12 @@ class RouteState:
             conn.execute(
                 "INSERT INTO agent_executions "
                 "(execution_id, run_id, epoch_id, claude_agent_id, role, model_id, phase_id, "
-                "binding_id, status, actor_kind, execution_kind, provider_id, workspace_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'started', ?, ?, ?, ?)",
+                "binding_id, status, actor_kind, execution_kind, provider_id, workspace_id, independence_key) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'started', ?, ?, ?, ?, ?)",
                 (
                     execution_id, run_id, epoch_id, claude_agent_id, role, model_id,
                     phase_id, binding_id, actor_kind, execution_kind, provider_id,
-                    workspace_id,
+                    workspace_id, independence_key,
                 ),
             )
             claim_update = conn.execute(
@@ -2841,6 +3191,11 @@ class RouteState:
                     "result_schema": p.result_schema,
                     "quality_quorum": p.quality_quorum,
                     "fallback_policy": p.fallback_policy,
+                    "execution_kind": p.execution_kind,
+                    "max_parallelism": p.max_parallelism,
+                    "required_successes": p.required_successes,
+                    "max_attempts": p.max_attempts,
+                    "max_attempts_per_model": p.max_attempts_per_model,
                 }
                 for p in spec.phases
             ]
@@ -2854,10 +3209,19 @@ class RouteState:
                        allowed_roles_json, dependencies_json, condition_json, parallel_group,
                        specification_hash, ordinal, distinct_agent_from_json, max_duration_seconds,
                        turn_budget, provider_requirements_json, min_fanout, max_fanout, result_schema,
-                       quality_quorum, fallback_policy)
-                       VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       quality_quorum, fallback_policy, execution_kind, required_actor,
+                       max_parallelism, required_successes, max_attempts, max_attempts_per_model)
+                       VALUES (
+                           ?, ?, ?, ?,
+                           ?, ?, ?, ?,
+                           ?, ?, ?, ?,
+                           ?, ?, ?, ?,
+                           ?, ?, ?, ?,
+                           ?, ?, ?, ?,
+                           ?, ?, ?, ?
+                       )""",
                     (
-                        run_id, epoch_id, phase["id"],
+                        run_id, epoch_id, phase["id"], "pending",
                         phase.get("actor", ""),
                         1 if phase.get("required", True) else 0,
                         1 if phase.get("mutation", False) else 0,
@@ -2871,6 +3235,9 @@ class RouteState:
                         json.dumps(phase.get("provider_requirements", [])), phase.get("min_fanout", 1),
                         phase.get("max_fanout", 1), phase.get("result_schema"),
                         phase.get("quality_quorum", 1), phase.get("fallback_policy"),
+                        phase.get("execution_kind", "native_agent"), phase.get("actor", ""),
+                        phase.get("max_parallelism"), phase.get("required_successes"),
+                        phase.get("max_attempts") or phase.get("max_fanout", 1), phase.get("max_attempts_per_model"),
                     ),
                 )
 
@@ -4360,6 +4727,25 @@ class RouteState:
         finally:
             conn.close()
 
+    def fail_litellm_generation_executions(self, generation: int) -> int:
+        """Fail active executions pinned to a generation that was force-drained."""
+        conn = self._new_conn()
+        try:
+            now = _utcnow()
+            cursor = conn.execute(
+                "UPDATE agent_executions SET status='failed', completed_at=?, "
+                "updated_at=?, error_class='generation_drain_timeout', "
+                "error='LiteLLM generation was force-drained while active' "
+                "WHERE status IN ('started','running') AND binding_id IN ("
+                "SELECT binding_id FROM agent_bindings WHERE catalog_generation=?"
+                ")",
+                (now, now, generation),
+            )
+            conn.commit()
+            return int(cursor.rowcount)
+        finally:
+            conn.close()
+
     # ---- CAS route updates -------------------------------------------
 
     def set_role_route_cas(
@@ -5332,10 +5718,19 @@ class RouteState:
                        allowed_roles_json, dependencies_json, condition_json, parallel_group,
                         specification_hash, ordinal, distinct_agent_from_json, max_duration_seconds,
                         turn_budget, provider_requirements_json, min_fanout, max_fanout, result_schema,
-                        quality_quorum, fallback_policy)
-                       VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        quality_quorum, fallback_policy, execution_kind, required_actor,
+                        max_parallelism, required_successes, max_attempts, max_attempts_per_model)
+                       VALUES (
+                           ?, ?, ?, ?,
+                           ?, ?, ?, ?,
+                           ?, ?, ?, ?,
+                           ?, ?, ?, ?,
+                           ?, ?, ?, ?,
+                           ?, ?, ?, ?,
+                           ?, ?, ?, ?
+                       )""",
                     (
-                        run_id, epoch_id, phase["id"],
+                        run_id, epoch_id, phase["id"], "pending",
                         phase.get("actor", ""),
                         1 if phase.get("required", True) else 0,
                         1 if phase.get("mutation", False) else 0,
@@ -5349,6 +5744,9 @@ class RouteState:
                         json.dumps(phase.get("provider_requirements", [])), phase.get("min_fanout", 1),
                         phase.get("max_fanout", 1), phase.get("result_schema"),
                         phase.get("quality_quorum", 1), phase.get("fallback_policy"),
+                        phase.get("execution_kind", "native_agent"), phase.get("actor", ""),
+                        phase.get("max_parallelism"), phase.get("required_successes"),
+                        phase.get("max_attempts") or phase.get("max_fanout", 1), phase.get("max_attempts_per_model"),
                     ),
                 )
             conn.commit()
@@ -5481,27 +5879,57 @@ class RouteState:
         if phase is None or phase.get("status") != "active":
             return phase
         executions = self.get_agent_executions(run_id, epoch_id=epoch_id, phase_id=phase_id)
-        if not executions or any(item.get("status") in {"started", "running"} for item in executions):
+        if not executions or any(
+            item.get("status") in {"started", "running", "streaming", "verifying"}
+            for item in executions
+        ):
             return phase
-        failed = [item for item in executions if item.get("status") != "completed"]
-        if failed:
+        completed = [item for item in executions if item.get("status") == "completed"]
+        if phase.get("result_schema"):
+            successful = [
+                item for item in completed
+                if item.get("schema_valid") is True
+                and item.get("evidence_valid") is not False
+                and item.get("accepted_by_controller") is not False
+            ]
+        else:
+            successful = [
+                item for item in completed
+                if item.get("evidence_valid") is not False
+                and item.get("accepted_by_controller") is not False
+            ]
+        required_successes = int(
+            phase.get("required_successes")
+            or max(int(phase.get("min_fanout") or 1), int(phase.get("quality_quorum") or 1))
+        )
+        if len(successful) >= required_successes:
             return self.complete_phase(
                 run_id, epoch_id, phase_id,
-                error=f"execution failure: {failed[0].get('execution_id')}",
+                result_evidence=json.dumps({
+                    "execution_ids": [item["execution_id"] for item in executions],
+                    "completed": len(completed),
+                    "successful": len(successful),
+                }, separators=(",", ":")),
             )
-        minimum = max(int(phase.get("min_fanout") or 1), int(phase.get("quality_quorum") or 1))
-        if len(executions) < minimum:
+
+        failed = [item for item in executions if item.get("status") != "completed"]
+        max_attempts = int(phase.get("max_attempts") or phase.get("max_fanout") or 1)
+        fallback_policy = str(phase.get("fallback_policy") or "").strip()
+        if fallback_policy and len(executions) < max_attempts:
+            # Keep the phase active so the scheduler can materialize the next
+            # retry/fallback action.  Failure evidence remains in the ledger.
             return phase
-        return self.complete_phase(
-            run_id, epoch_id, phase_id,
-            result_evidence=json.dumps({
-                "execution_ids": [item["execution_id"] for item in executions],
-                "completed": len(executions),
-            }, separators=(",", ":")),
-        )
+        if failed or len(executions) >= max_attempts:
+            first_failure = failed[0] if failed else executions[-1]
+            return self.complete_phase(
+                run_id, epoch_id, phase_id,
+                error=f"execution failure: {first_failure.get('execution_id')}",
+            )
+        return phase
 
     def start_phase(
         self, run_id: str, epoch_id: str, phase_id: str, actor: str = "",
+        principal: str = "",
     ) -> dict:
         """Start a phase: set status='active', record started_at.
 
@@ -5513,7 +5941,8 @@ class RouteState:
         try:
             # Check phase exists and is pending
             row = conn.execute(
-                "SELECT id, status, dependencies_json, actor, mutating FROM workflow_phases WHERE run_id=? AND epoch_id=? AND phase_id=?",
+                "SELECT id, status, dependencies_json, required_actor, mutating "
+                "FROM workflow_phases WHERE run_id=? AND epoch_id=? AND phase_id=?",
                 (run_id, epoch_id, phase_id),
             ).fetchone()
             if row is None:
@@ -5522,9 +5951,10 @@ class RouteState:
                 raise WorkflowPhaseStateError(
                     f"Phase '{phase_id}' is {row[1]}, cannot start (must be 'pending')"
                 )
-            if row[3] and actor and row[3] not in actor and actor != row[3]:
+            required_actor = str(row[3] or "")
+            if required_actor and _canonical_actor(actor) != _canonical_actor(required_actor):
                 raise WorkflowPhaseStateError(
-                    f"Phase '{phase_id}' requires actor '{row[3]}', got '{actor}'"
+                    f"Phase '{phase_id}' requires actor '{required_actor}', got '{actor}'"
                 )
             if row[4]:
                 active_mutation = conn.execute(
@@ -5556,9 +5986,10 @@ class RouteState:
 
             now = _utcnow()
             conn.execute(
-                "UPDATE workflow_phases SET status='active', started_at=?, actor=? "
+                "UPDATE workflow_phases SET status='active', started_at=?, actor=?, "
+                "started_by_actor=?, started_by_principal=? "
                 "WHERE run_id=? AND epoch_id=? AND phase_id=?",
-                (now, actor, run_id, epoch_id, phase_id),
+                (now, actor, actor, principal or None, run_id, epoch_id, phase_id),
             )
             conn.commit()
             phases = self.get_workflow_phases(run_id, epoch_id)
@@ -5592,7 +6023,7 @@ class RouteState:
             phase_row = conn.execute(
                 "SELECT allowed_roles_json, min_fanout, max_fanout, quality_quorum, "
                 "started_at, distinct_agent_from_json, max_duration_seconds, result_schema, "
-                "turn_budget FROM workflow_phases "
+                "turn_budget, max_attempts FROM workflow_phases "
                 "WHERE run_id=? AND epoch_id=? AND phase_id=?", (run_id, epoch_id, phase_id)
             ).fetchone()
             if phase_row is None:
@@ -5632,7 +6063,8 @@ class RouteState:
                         f"Phase '{phase_id}' result_evidence is missing: {', '.join(missing)}"
                     )
             executions = conn.execute(
-                "SELECT claude_agent_id, independence_key, status, tool_call_count "
+                "SELECT claude_agent_id, independence_key, status, tool_call_count, "
+                "schema_valid, evidence_valid, accepted_by_controller, quality_score "
                 "FROM agent_executions "
                 "WHERE run_id=? AND epoch_id=? AND phase_id=?", (run_id, epoch_id, phase_id)
             ).fetchall()
@@ -5644,26 +6076,42 @@ class RouteState:
                     )
             if new_status == "completed" and executions:
                 completed = [item for item in executions if item[2] == "completed"]
+                if phase_row[7]:
+                    quality_eligible = [
+                        item for item in completed
+                        if item[4] == 1 and item[5] != 0 and item[6] != 0
+                    ]
+                else:
+                    quality_eligible = [
+                        item for item in completed
+                        if item[5] != 0 and item[6] != 0
+                    ]
                 min_fanout = int(phase_row[1] or 1)
                 max_fanout = int(phase_row[2] or 1)
                 quorum = int(phase_row[3] or 1)
-                if len(executions) > max_fanout:
+                max_attempts = int(phase_row[9] or max_fanout)
+                if len(executions) > max_attempts:
                     raise WorkflowPhaseStateError(
-                        f"Phase '{phase_id}' exceeded max fanout {max_fanout}"
+                        f"Phase '{phase_id}' exceeded max attempts {max_attempts}"
                     )
-                if len(completed) < min_fanout or len(completed) < quorum:
+                if len(completed) < min_fanout or len(quality_eligible) < quorum:
                     raise WorkflowPhaseStateError(
-                        f"Phase '{phase_id}' requires {max(min_fanout, quorum)} completed execution(s)"
+                        f"Phase '{phase_id}' requires {max(min_fanout, quorum)} quality-valid execution(s)"
                     )
                 distinct_refs = json.loads(phase_row[5] or "[]")
                 if distinct_refs:
                     prior = conn.execute(
-                        "SELECT claude_agent_id FROM agent_executions WHERE run_id=? AND epoch_id=? "
+                        "SELECT claude_agent_id, independence_key FROM agent_executions WHERE run_id=? AND epoch_id=? "
                         "AND phase_id IN (%s)" % ",".join("?" * len(distinct_refs)),
                         [run_id, epoch_id, *distinct_refs],
                     ).fetchall()
-                    prior_ids = {item[0] for item in prior}
-                    if any(item[0] in prior_ids for item in completed):
+                    prior_keys = {item[1] for item in prior if item[1]}
+                    prior_ids = {item[0] for item in prior if not item[1]}
+                    if any(
+                        (item[1] and item[1] in prior_keys)
+                        or (not item[1] and item[0] in prior_ids)
+                        for item in completed
+                    ):
                         raise WorkflowPhaseStateError(
                             f"Phase '{phase_id}' violates distinct_agent_from"
                         )
@@ -5811,6 +6259,7 @@ class RouteState:
                 "result_schema": p.result_schema,
                 "quality_quorum": p.quality_quorum,
                 "fallback_policy": p.fallback_policy,
+                "execution_kind": p.execution_kind,
             }
             for p in spec.phases
         ]
@@ -6001,11 +6450,23 @@ class RouteState:
                 ):
                     raise ValueError("agent execution configuration does not match its binding")
 
+            if independence_key is None:
+                independence_key = hashlib.sha256(
+                    json.dumps({
+                        "model_id": model_id,
+                        "provider_id": provider_id,
+                        "endpoint_id": endpoint_id,
+                        "role": role,
+                        "phase_id": phase_id,
+                        "parent_execution_id": parent_execution_id,
+                    }, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+
             if phase_id is not None:
                 phase = conn.execute(
-                    "SELECT status, actor, allowed_roles_json, max_fanout, "
+                    "SELECT status, required_actor, allowed_roles_json, max_fanout, "
                     "distinct_agent_from_json, provider_requirements_json, "
-                    "max_duration_seconds, turn_budget "
+                    "max_duration_seconds, turn_budget, max_parallelism, max_attempts "
                     "FROM workflow_phases WHERE run_id=? AND epoch_id=? AND phase_id=?",
                     (run_id, epoch_id, phase_id),
                 ).fetchone()
@@ -6045,15 +6506,23 @@ class RouteState:
                     raise ValueError(
                         f"workflow phase {phase_id!r} requires actor {actor!r}"
                     )
-                execution_count = conn.execute(
+                active_count = conn.execute(
+                    "SELECT COUNT(*) FROM agent_executions "
+                    "WHERE run_id=? AND epoch_id=? AND phase_id=? "
+                    "AND status NOT IN ('completed','failed','timeout','cancelled')",
+                    (run_id, epoch_id, phase_id),
+                ).fetchone()[0]
+                attempt_count = conn.execute(
                     "SELECT COUNT(*) FROM agent_executions "
                     "WHERE run_id=? AND epoch_id=? AND phase_id=?",
                     (run_id, epoch_id, phase_id),
                 ).fetchone()[0]
-                if int(execution_count) >= int(phase[3] or 1):
+                if int(active_count) >= int(phase[8] or phase[3] or 1):
                     raise ValueError(
-                        f"workflow phase {phase_id!r} exceeded max fanout {phase[3]}"
+                        f"workflow phase {phase_id!r} exceeded max fanout/parallelism"
                     )
+                if int(attempt_count) >= int(phase[9] or phase[3] or 1):
+                    raise ValueError(f"workflow phase {phase_id!r} exceeded max attempts")
                 if phase[7] is not None:
                     used_turns = conn.execute(
                         "SELECT COALESCE(SUM(tool_call_count), 0) FROM agent_executions "
@@ -6068,11 +6537,15 @@ class RouteState:
                 if distinct_refs:
                     placeholders = ",".join("?" for _ in distinct_refs)
                     prior = conn.execute(
-                        "SELECT claude_agent_id FROM agent_executions "
+                        "SELECT claude_agent_id, independence_key FROM agent_executions "
                         f"WHERE run_id=? AND epoch_id=? AND phase_id IN ({placeholders})",
                         [run_id, epoch_id, *distinct_refs],
                     ).fetchall()
-                    if any(row[0] == claude_agent_id for row in prior):
+                    if any(
+                        (independence_key and row[1] == independence_key)
+                        or (not row[1] and row[0] == claude_agent_id)
+                        for row in prior
+                    ):
                         raise ValueError(
                             f"agent {claude_agent_id!r} violates distinct_agent_from "
                             f"for workflow phase {phase_id!r}"
@@ -6140,6 +6613,12 @@ class RouteState:
         ttft_ms: float | None = None,
         wall_time_ms: float | None = None,
         error_class: str | None = None,
+        schema_valid: bool | None = None,
+        evidence_valid: bool | None = None,
+        accepted_by_controller: bool | None = None,
+        quality_score: float | None = None,
+        verdict: str | None = None,
+        confidence: float | None = None,
     ) -> dict | None:
         """Update an agent execution while enforcing lifecycle transitions.
 
@@ -6200,6 +6679,11 @@ class RouteState:
                 ("cache_read_tokens", cache_read_tokens), ("cache_write_tokens", cache_write_tokens),
                 ("output_tokens", output_tokens), ("ttft_ms", ttft_ms),
                 ("wall_time_ms", wall_time_ms), ("error_class", error_class),
+                ("schema_valid", None if schema_valid is None else int(schema_valid)),
+                ("evidence_valid", None if evidence_valid is None else int(evidence_valid)),
+                ("accepted_by_controller", None if accepted_by_controller is None else int(accepted_by_controller)),
+                ("quality_score", quality_score), ("verdict", verdict),
+                ("confidence", confidence),
             ):
                 if value is not None:
                     sets.append(f"{column} = ?")
@@ -6211,6 +6695,122 @@ class RouteState:
             )
             conn.commit()
             return self.get_agent_execution(execution_id)
+        finally:
+            conn.close()
+
+    def increment_execution_tool_calls(
+        self, execution_id: str, *, run_id: str | None = None,
+        epoch_id: str | None = None, delta: int = 1,
+    ) -> dict | None:
+        """Atomically increment tool calls; caller counters are not trusted."""
+        if delta < 1:
+            raise ValueError("tool-call increment must be positive")
+        conn = self._new_conn()
+        try:
+            clauses = ["execution_id=?"]
+            params: list[object] = [execution_id]
+            if run_id is not None:
+                clauses.append("run_id=?")
+                params.append(run_id)
+            if epoch_id is not None:
+                clauses.append("epoch_id=?")
+                params.append(epoch_id)
+            conn.execute(
+                "UPDATE agent_executions SET tool_call_count=COALESCE(tool_call_count, 0)+?, "
+                "updated_at=datetime('now') WHERE " + " AND ".join(clauses),
+                [delta, *params],
+            )
+            conn.commit()
+            return self.get_agent_execution(execution_id)
+        finally:
+            conn.close()
+
+    def increment_execution_requests(self, binding_id: int | None) -> dict | None:
+        """Correlate an admitted model request with its execution ledger row."""
+        if binding_id is None:
+            return None
+        conn = self._new_conn()
+        try:
+            conn.execute(
+                "UPDATE agent_executions SET request_count=COALESCE(request_count, 0)+1, "
+                "updated_at=datetime('now') WHERE binding_id=?",
+                (binding_id,),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM agent_executions WHERE binding_id=? "
+                "ORDER BY started_at DESC LIMIT 1", (binding_id,)
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def record_execution_metrics_for_binding(
+        self,
+        binding_id: int | None,
+        *,
+        input_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        output_tokens: int = 0,
+        ttft_ms: float | None = None,
+        wall_time_ms: float | None = None,
+    ) -> dict | None:
+        """Merge non-sensitive request metrics into the bound execution."""
+        if binding_id is None:
+            return None
+        conn = self._new_conn()
+        try:
+            conn.execute(
+                "UPDATE agent_executions SET input_tokens=COALESCE(input_tokens, 0)+?, "
+                "cache_read_tokens=COALESCE(cache_read_tokens, 0)+?, "
+                "cache_write_tokens=COALESCE(cache_write_tokens, 0)+?, "
+                "output_tokens=COALESCE(output_tokens, 0)+?, "
+                "ttft_ms=COALESCE(ttft_ms, ?), wall_time_ms=COALESCE(?, wall_time_ms), "
+                "updated_at=datetime('now') WHERE binding_id=?",
+                (input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
+                 ttft_ms, wall_time_ms, binding_id),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM agent_executions WHERE binding_id=? "
+                "ORDER BY started_at DESC LIMIT 1", (binding_id,)
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def record_execution_failure_for_binding(
+        self, binding_id: int | None, *, error_class: str, error: str,
+    ) -> dict | None:
+        """Persist a transport failure against the active bound execution."""
+        if binding_id is None:
+            return None
+        conn = self._new_conn()
+        try:
+            row = conn.execute(
+                "SELECT execution_id, run_id, epoch_id FROM agent_executions "
+                "WHERE binding_id=? AND status IN ('started','running') "
+                "ORDER BY started_at DESC LIMIT 1", (binding_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            now = _utcnow()
+            conn.execute(
+                "UPDATE agent_executions SET status='failed', completed_at=?, error=?, "
+                "error_class=?, updated_at=? WHERE execution_id=? AND status IN ('started','running')",
+                (now, error[:500], error_class, now, row[0]),
+            )
+            conn.commit()
+            result = self.get_agent_execution(str(row[0]))
+            try:
+                self.append_execution_event(
+                    str(row[1]), str(row[2]), str(row[0]), "failed",
+                    {"error_class": error_class, "reason": error[:500]},
+                )
+            except Exception:
+                logger.debug("failed to append transport failure event", exc_info=True)
+            return result
         finally:
             conn.close()
 
