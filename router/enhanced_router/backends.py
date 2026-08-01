@@ -726,7 +726,6 @@ async def post_openai_compatible_json(
     request_id: str,
     extra_headers: dict[str, str] | None = None,
     timeout_seconds: float | None = None,
-    priority: bool = False,
 ) -> dict[str, Any]:
     """Send one bounded non-streaming OpenAI-compatible request.
 
@@ -757,7 +756,7 @@ async def post_openai_compatible_json(
         "POST", f"{route.api_base}/chat/completions", headers=headers, content=body,
     )
     started_at = time.perf_counter()
-    admission_id = await _acquire_provider_request(route, request, streaming=False, priority=priority)
+    admission_id = await _acquire_provider_request(route, request, streaming=False)
     if admission_id is None:
         raise RuntimeError("OpenAI-compatible request admission did not return a request ID")
     client = get_upstream_client()
@@ -948,7 +947,7 @@ def _route_with_reported_deployment(
 
 
 async def _acquire_provider_request(
-    resolved: "ResolvedRoute", request: Any, *, streaming: bool = False, priority: bool = False,
+    resolved: "ResolvedRoute", request: Any, *, streaming: bool = False,
 ) -> str | None:
     provider_ids = _provider_ids_for_route(resolved)
     if not provider_ids and resolved.catalog_generation is None:
@@ -964,14 +963,9 @@ async def _acquire_provider_request(
         LOGGER.debug("request could not be correlated to an execution", exc_info=True)
     try:
         if len(provider_ids) > 1:
-            # Managed provider groups don't support priority admission --
-            # fastpath (the only current priority caller) never resolves to
-            # a multi-provider group.
             await _provider_admission.acquire_request_group(provider_ids, request_id)
         elif provider_ids:
-            await _provider_admission.acquire_request(
-                next(iter(provider_ids)), request_id, priority=priority,
-            )
+            await _provider_admission.acquire_request(next(iter(provider_ids)), request_id)
     except AdmissionTimeout as exc:
         raise RuntimeError(f"provider request admission timed out: {exc}") from exc
     if resolved.catalog_generation is not None and _litellm_supervisor is not None:

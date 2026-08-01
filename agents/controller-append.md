@@ -26,18 +26,6 @@ Your ownership:
   red candidate by retrying/discarding it. The control plane rejects an
   unclaimed integration action even when a controller binding exists.
   DiffusionGemma's merge advice is evidence only and never an authorization.
-- Before spawning the first specialist for a role, inspect any returned
-  `controller_route_review` action. It means DiffusionGemma's fastpath
-  produced a completed, unexpired routing proposal for this epoch. Claim it,
-  then call `get_route_proposal` for the full parsed proposal, and call
-  `accept_route_proposal` (optionally with `apply_routes=true`) or
-  `reject_route_proposal` before spawning any role the proposal names. Do not
-  wait for a proposal beyond its `expires_at` -- it will no longer be
-  claimable once expired, and `get_runnable_actions` simply stops returning
-  it. Never accept a proposal targeting a role that already has an active
-  binding; the accept operation will refuse it, but do not attempt it in the
-  first place. DiffusionGemma never applies routes itself and its confidence
-  score is not a substitute for this review -- you decide.
 - Review the actual stable diff after implementation.
 - Adjudicate adversarial findings; do not forward noise as accepted work.
 - Perform or evaluate final deterministic verification.
@@ -50,8 +38,6 @@ Mutation policy:
 - Only one mutator may operate at a time. Invoke mutating agents in the foreground and wait for completion.
 - A shadow-worktree candidate marked yellow or red is unresolved work, not a
   completed specialist result. Do not claim completion while one remains.
-- A pending `controller_route_review` action is also unresolved work. Accept
-  or reject it before claiming completion; do not let it expire unaddressed.
 
 Native delegation contract:
 - Subagents do not inherit your conversation. Every Agent prompt must include all relevant paths, errors, decisions, constraints, and evidence requirements.

@@ -23,92 +23,26 @@ from ledger_io import append_jsonl  # noqa: E402
 
 def _fastpath_route(packet: dict) -> dict | None:
     """Ask the optional loopback fastpath without blocking task intake."""
-    return _fastpath_route_request(packet, asynchronous=True, timeout_seconds=0.35)
-
-
-def _fastpath_route_wait(packet: dict, *, timeout_seconds: float) -> dict | None:
-    """Ask the fastpath and wait up to *timeout_seconds* for a real result.
-
-    A "very small relevance budget" for the two-stage task-start flow: the
-    router keeps running the inference call to completion in the background
-    regardless of whether this HTTP call is still waiting, so a timeout here
-    just means materialization goes ahead with deterministic defaults --
-    the proposal still completes and becomes reviewable later (Phase 1's
-    controller_route_review action) for any role that's still unbound.
-    """
-    return _fastpath_route_request(packet, asynchronous=False, timeout_seconds=timeout_seconds)
-
-
-def _fastpath_route_request(packet: dict, *, asynchronous: bool, timeout_seconds: float) -> dict | None:
     import urllib.error
     import urllib.request
 
     base = os.environ.get("BRIGADE_ROUTER_URL", "http://127.0.0.1:8787").rstrip("/")
-    headers = {
-        "Content-Type": "application/json",
-        "X-Enhanced-Token": os.environ.get("ENHANCED_ROUTER_TOKEN", ""),
-    }
-    if asynchronous:
-        headers["X-Brigade-Fastpath-Async"] = "1"
     request = urllib.request.Request(
         f"{base}/internal/fastpath/route",
         data=json.dumps(packet, separators=(",", ":")).encode("utf-8"),
-        headers=headers,
+        headers={
+            "Content-Type": "application/json",
+            "X-Enhanced-Token": os.environ.get("ENHANCED_ROUTER_TOKEN", ""),
+            "X-Brigade-Fastpath-Async": "1",
+        },
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        with urllib.request.urlopen(request, timeout=0.35) as response:
             payload = json.loads(response.read(128_000).decode("utf-8"))
         return payload if isinstance(payload, dict) else None
     except (urllib.error.URLError, TimeoutError, ValueError, OSError):
         return None
-
-
-# How long a fresh task's materialization waits for DiffusionGemma before
-# falling back to deterministic profile defaults. Deliberately much shorter
-# than fastpath.yaml's full inference timeout_seconds (5s default) -- this
-# runs synchronously in a hook on every new task, so it must stay small
-# enough not to make ordinary interactive latency noticeably worse; a
-# proposal that misses this window is still fully usable afterward via the
-# controller_route_review runnable action for any role still unbound.
-_ROUTE_MATERIALIZATION_BUDGET_SECONDS = 0.9
-
-
-def _route_overrides_from_fastpath_result(
-    fastpath: dict | None,
-) -> tuple[dict[str, str], str | None, bool]:
-    """Parse a fastpath route response into materialize_task_epoch's
-    route_overrides, plus (proposal_id, proposal_applied) for the hook's own
-    additionalContext/disposition bookkeeping.
-
-    Only a validation_status of "accepted_for_controller_review" is ever
-    trusted for overrides -- the router already ran FastpathPolicyValidator
-    against the registry (candidate-bounded, enabled, role-allowed,
-    write-certified) before returning that status, so nothing here needs to
-    re-validate the model/endpoint shape, only extract it defensively in
-    case of a malformed/unexpected response.
-    """
-    route_overrides: dict[str, str] = {}
-    proposal_id: str | None = None
-    if not fastpath:
-        return route_overrides, proposal_id, False
-
-    status = fastpath.get("validation_status")
-    if status == "accepted_for_controller_review":
-        proposal_id = str(fastpath.get("proposal_id") or "") or None
-        routes = fastpath.get("routes")
-        if isinstance(routes, dict):
-            for role, target in routes.items():
-                if isinstance(target, dict) and isinstance(target.get("model"), str):
-                    route_overrides[role] = target["model"]
-        return route_overrides, proposal_id, bool(route_overrides)
-
-    if status == "queued":
-        # Still running server-side; missed this window -- not applied, but
-        # still worth surfacing proposal_id so it's discoverable later.
-        proposal_id = str(fastpath.get("proposal_id") or "") or None
-
-    return route_overrides, proposal_id, False
 
 
 def main() -> int:
@@ -176,15 +110,7 @@ def main() -> int:
             or os.environ.get("CLAUDE_BRIGADE_PROFILE")
             or "hybrid"
         )
-        # Two-stage task start: plan (pure, pre-generates epoch_id) -> wait a
-        # small bounded budget for DiffusionGemma -> materialize once, using
-        # a validated accepted proposal if one arrived in time or
-        # deterministic profile defaults otherwise. A proposal that misses
-        # the window keeps running server-side and surfaces later via the
-        # controller_route_review runnable action for any role still
-        # unbound -- it is never discarded, only too late to shape the
-        # *initial* materialization.
-        plan = state.prepare_task_plan(
+        contract = state.begin_task(
             run_id=run_id,
             session_id=session,
             cwd=str(cwd),
@@ -201,35 +127,7 @@ def main() -> int:
                 "proposal_id": None,
             },
         )
-        proposal_request_id = f"proposal_{uuid.uuid4().hex}"
-        fastpath = _fastpath_route_wait({
-            "intake_id": intake_id,
-            "run_id": run_id,
-            "epoch_id": plan["epoch_id"],
-            "proposal_id": proposal_request_id,
-            "task": prompt[:8_000],
-            "repository": {
-                "languages": features.languages,
-                "likely_files": features.explicit_files,
-                "subsystems": features.subsystems,
-                "estimated_context_tokens": features.estimated_context_tokens,
-            },
-            "deterministic_minimum_tier": minimum_tier,
-            "risk_signals": features.risk_signals,
-            "required_capabilities": features.required_capabilities,
-        }, timeout_seconds=_ROUTE_MATERIALIZATION_BUDGET_SECONDS)
-
-        route_overrides, proposal_id, proposal_applied = _route_overrides_from_fastpath_result(fastpath)
-        contract = state.materialize_task_epoch(plan, route_overrides=route_overrides)
         epoch_id = contract["epoch_id"]
-        if proposal_applied and proposal_id:
-            # Already resolved by materialization -- close the loop so it
-            # doesn't also surface as a pending controller_route_review
-            # action for a decision that's already been made.
-            state.set_route_proposal_disposition(
-                proposal_id, run_id, "accepted",
-                reason="auto-applied at task materialization", epoch_id=epoch_id,
-            )
         session_dir.mkdir(parents=True, exist_ok=True)
         epoch_file.write_text(epoch_id, encoding="utf-8")
         if current_fp:
@@ -242,29 +140,29 @@ def main() -> int:
             "baseline_fingerprint": current_fp,
             "source": "user_prompt_submit",
         })
-    else:
-        epoch_id = str(active.get("epoch_id"))
-        proposal_request_id = f"proposal_{uuid.uuid4().hex}"
-        fastpath = _fastpath_route({
-            "intake_id": intake_id,
-            "run_id": run_id,
-            "epoch_id": epoch_id,
-            "proposal_id": proposal_request_id,
-            "task": prompt[:8_000],
-            "repository": {
-                "languages": features.languages,
-                "likely_files": features.explicit_files,
-                "subsystems": features.subsystems,
-                "estimated_context_tokens": features.estimated_context_tokens,
-            },
-            "deterministic_minimum_tier": minimum_tier,
-            "risk_signals": features.risk_signals,
-            "required_capabilities": features.required_capabilities,
-        })
-        proposal_id = None
-        proposal_applied = False
-        if fastpath and fastpath.get("validation_status") == "queued":
-            proposal_id = str(fastpath.get("proposal_id") or "") or None
+
+    active = state.get_active_epoch(run_id)
+    epoch_id = str(active.get("epoch_id")) if active else ""
+    proposal_request_id = f"proposal_{uuid.uuid4().hex}"
+    fastpath = _fastpath_route({
+        "intake_id": intake_id,
+        "run_id": run_id,
+        "epoch_id": epoch_id,
+        "proposal_id": proposal_request_id,
+        "task": prompt[:8_000],
+        "repository": {
+            "languages": features.languages,
+            "likely_files": features.explicit_files,
+            "subsystems": features.subsystems,
+            "estimated_context_tokens": features.estimated_context_tokens,
+        },
+        "deterministic_minimum_tier": minimum_tier,
+        "risk_signals": features.risk_signals,
+        "required_capabilities": features.required_capabilities,
+    })
+    proposal_id = None
+    if fastpath and fastpath.get("validation_status") == "queued":
+        proposal_id = str(fastpath.get("proposal_id") or "") or None
 
     context = {
         "intake_id": intake_id,
@@ -272,7 +170,7 @@ def main() -> int:
         "signals": features.risk_signals,
         "likely_files": features.explicit_files,
         "proposal_id": proposal_id,
-        "controller_disposition_required": bool(proposal_id) and not proposal_applied,
+        "controller_disposition_required": bool(proposal_id),
     }
     print(json.dumps({
         "hookSpecificOutput": {

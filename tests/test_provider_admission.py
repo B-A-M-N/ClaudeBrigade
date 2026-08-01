@@ -24,47 +24,6 @@ async def test_provider_agent_admission_is_fifo() -> None:
 
 
 @pytest.mark.asyncio
-async def test_priority_request_admitted_ahead_of_earlier_normal_requests() -> None:
-    """Priority only reorders who's next among callers already forced to
-    queue -- it never lets a priority caller exceed the provider's existing
-    concurrency cap, and never affects callers that don't ask for it."""
-    manager = ProviderAdmissionManager({"freeinference": ProviderLimits(max_inflight_requests=1)})
-    await manager.acquire_request("freeinference", "held")
-    order: list[str] = []
-
-    async def waiter(name: str, priority: bool) -> None:
-        await manager.acquire_request("freeinference", name, priority=priority)
-        order.append(name)
-
-    normal_1 = asyncio.create_task(waiter("normal-1", False))
-    await asyncio.sleep(0)
-    normal_2 = asyncio.create_task(waiter("normal-2", False))
-    await asyncio.sleep(0)
-    priority_1 = asyncio.create_task(waiter("priority-1", True))
-    await asyncio.sleep(0)
-    assert manager.snapshot("freeinference")["queued_requests"] == 3
-
-    await manager.release_request("held")
-    await asyncio.wait_for(priority_1, 1)
-    await manager.release_request("priority-1")
-    await asyncio.wait_for(normal_1, 1)
-    await manager.release_request("normal-1")
-    await asyncio.wait_for(normal_2, 1)
-
-    assert order == ["priority-1", "normal-1", "normal-2"]
-
-
-@pytest.mark.asyncio
-async def test_priority_request_admitted_immediately_when_capacity_is_free() -> None:
-    """Priority doesn't grant extra capacity -- when nothing is queued it
-    behaves exactly like a normal request."""
-    manager = ProviderAdmissionManager({"freeinference": ProviderLimits(max_inflight_requests=2)})
-    await manager.acquire_request("freeinference", "priority-1", priority=True)
-    assert manager.snapshot("freeinference")["active_requests"] == 1
-    assert manager.snapshot("freeinference")["queued_requests"] == 0
-
-
-@pytest.mark.asyncio
 async def test_cancelled_request_releases_queue_entry() -> None:
     manager = ProviderAdmissionManager({"freeinference": ProviderLimits(max_inflight_requests=1)})
     await manager.acquire_request("freeinference", "first")

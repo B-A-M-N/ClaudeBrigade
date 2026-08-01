@@ -247,31 +247,8 @@ def _fastpath_merge_advice(
         },
         method="POST",
     )
-    # A fail/escalate decision here actually reclassifies an otherwise green
-    # changeset to yellow (controller review), so this has to genuinely wait
-    # long enough to get a real answer -- 0.35s against a 5s configured
-    # inference budget meant this call almost always timed out before
-    # DiffusionGemma could respond, so the green path was integrated without
-    # any advisory input in practice. Wait as long as the router itself will
-    # (config.timeout_seconds) plus a small transport margin, not a fixed
-    # guess disconnected from the actual configured budget.
-    timeout_seconds = 0.35
     try:
-        from enhanced_router.registry import get_registry
-        from enhanced_router.state import get_state
-
-        registry = get_registry()
-        sidecar_profile_id = None
-        run_row = get_state().get_run(run_id)
-        if run_row:
-            sidecar_profile_id = run_row.get("sidecar_profile_id")
-        config = registry.resolve_fastpath(sidecar_profile_id)
-        if config is not None:
-            timeout_seconds = float(config.timeout_seconds) + 0.5
-    except Exception:
-        pass
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        with urllib.request.urlopen(request, timeout=0.35) as response:
             payload = json.loads(response.read(16_384).decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, ValueError, OSError):
         return None

@@ -277,34 +277,17 @@ mutations without that lease.
 DiffusionGemma is a router-owned, read-only advisory sidecar for bounded route
 recommendations and quick verification. It is not a standard worker, cannot
 select uncertified endpoints, cannot lower a deterministic tier, cannot waive
-review, and cannot mark findings resolved. It never emits a bare model string:
-the router builds a candidate set per role from `ModelRegistry.recommend()`
-(role-match, tool support, context, live health) and DiffusionGemma selects a
-`candidate_id` from that set; `FastpathPolicyValidator` resolves the model/
-endpoint from the offered candidate itself, never from anything the model
-claims.
+review, and cannot mark findings resolved.
 
 Fastpath failures bypass to deterministic/controller routing. Fastpath PASS is
 advisory and never satisfies a mandatory adversarial phase. Any mutation after
-verification invalidates the verification evidence. A route proposal has a
-real `queued -> running -> completed/failed/expired` lifecycle bound to its
-originating run/epoch and CAS-guarded against being applied to a different
-(later) epoch of the same run or dispositioned twice. `UserPromptSubmit`
-plans a fresh task (`prepare_task_plan`, which pre-generates the epoch_id),
-waits a small bounded relevance budget for a proposal, and materializes the
-epoch once (`materialize_task_epoch`) using an accepted proposal's routes for
-still-unbound roles if one arrived in time, deterministic profile defaults
-otherwise. A proposal that misses the window keeps running server-side and
-surfaces afterward as a `controller_route_review` runnable action for any
-role that's still unbound; it can never replace a role that's already bound.
-Route requests get priority within the provider's existing concurrency cap
-(queue reordering only, never extra capacity) since they block that
-materialization wait. The fastpath request protocol remains specialized
-OpenAI-compatible JSON, but its job lifecycle is a persisted `sidecar_call`
-execution with cancellation and status visibility, and a bypassed/malformed
-result is recorded honestly (not as a synthetic success) so bypass rate is
-visible in the same execution ledger everything else uses. It must not be
-treated as a native worker or as completion evidence.
+verification invalidates the verification evidence. The current fastpath hook
+has a short relevance wait and receives a queued job receipt; the router owns
+the detached bounded call and persists the proposal against its intake. The
+fastpath request protocol remains specialized OpenAI-compatible JSON, but its
+job lifecycle is a persisted `sidecar_call` execution with cancellation and
+status visibility. It must not be treated as a native worker or as completion
+evidence.
 
 ## Credential and protocol rules
 
@@ -395,18 +378,6 @@ Implemented in the current working tree:
 - controller-only route-proposal disposition operations; DiffusionGemma
   recommendations remain advisory until the active main controller explicitly
   accepts or rejects them;
-- a real route-proposal lifecycle (`reserve/mark_running/complete/fail`,
-  epoch-scoped, CAS-guarded disposition) surfaced through
-  `controller_route_review` runnable actions, two-stage task start
-  (`prepare_task_plan` / `materialize_task_epoch`) that can apply an accepted
-  proposal's routes to the initial materialization for roles still unbound,
-  router-built recommendation-sourced route candidates DiffusionGemma
-  selects by `candidate_id` rather than inventing a model string, honest
-  bypass/malformed-result accounting in the execution ledger, a real
-  configured-timeout wait (not a fixed 0.35s guess) before a merge-advice
-  decision can reclassify a green shadow candidate, admission priority for
-  fastpath route calls within the provider's existing concurrency cap, and
-  aggregate route-proposal outcome telemetry (`get_route_proposal_outcomes`);
 - local FreeInference/LiteLLM integration kit with dynamic model sync.
 
 Remaining work before a production-quality proving ground:
@@ -435,25 +406,6 @@ Remaining work before a production-quality proving ground:
    further admission once it's exceeded -- the closest existing field,
    `turn_budget` on a workflow phase, is stored but similarly unenforced
    anywhere today.
-8. `workflow_tier`, `parallel_groups`, and `fanout` remain unread fields on
-   `FastpathRouteProposal` -- a route proposal can only ever affect model
-   selection for still-unbound roles, never the workflow tier or the
-   phase-graph's parallelism, which stays entirely deterministic.
-9. A retried/recovered detached fastpath job (`_recover_detached_job`)
-   re-resolves the current configuration, endpoint, and model rather than
-   replaying the exact snapshot the original attempt used -- a config
-   reload between the original attempt and its retry means the retry can
-   target a different model/endpoint/timeout than what actually failed.
-10. `FastpathConfigSpec` still shares one `timeout_seconds`/`max_output_tokens`
-    between route and verify (the verify-side merge-advice hook now waits
-    the real configured budget instead of a fixed 0.35s guess, which was
-    the load-bearing half of this gap, but route and verify still can't be
-    tuned independently for DiffusionGemma's small route canvas vs a wider
-    verify context).
-11. Route-proposal outcome telemetry (`get_route_proposal_outcomes`) reports
-    completion/disposition rates but there's no shadow-mode A/B harness that
-    records what a proposal would have selected without applying it, to
-    build confidence in route influence before trusting it further.
 
 This status is intentionally not a release claim. The repository should be
 considered an active proving-ground implementation until the remaining list
