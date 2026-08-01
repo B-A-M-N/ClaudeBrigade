@@ -678,3 +678,45 @@ def test_finish_controller_action_is_idempotent_against_double_completion(
 
     claim = _claim_row(state, ctx["action_id"])
     assert claim["status"] == "completed"
+
+
+def test_worker_cannot_self_report_tool_call_count_or_total_tokens(
+    state: RouteState, monkeypatch,
+):
+    """tool_call_count gates each phase's turn budget and is maintained
+    authoritatively by the router's own PreToolUse hook (increment_execution_tool_calls);
+    total_tokens is likewise recorded from real provider responses
+    (record_execution_metrics_for_binding). Neither must be settable through
+    the worker-reachable update_agent_execution MCP tool -- a self-reported
+    value would let a worker understate its own usage and bypass the budget.
+    """
+    import inspect
+
+    from enhanced_router import mcp_control
+
+    sig = inspect.signature(mcp_control.update_agent_execution)
+    assert "tool_call_count" not in sig.parameters
+    assert "total_tokens" not in sig.parameters
+
+    state.create_run("r1", session_id="controller-session")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    state.create_agent_execution(
+        execution_id="exec-1", run_id="r1", epoch_id="ep-1",
+        claude_agent_id="agent-1", role="recon", model_id="model-a",
+    )
+    monkeypatch.setattr(mcp_control, "get_state", lambda: state)
+    mcp_control.set_current_principal(mcp_control.McpPrincipal(
+        principal_kind="worker",
+        run_id="r1",
+        agent_id="agent-1",
+        execution_id="exec-1",
+        allowed_capabilities=frozenset({"report_worker_result"}),
+        authenticated=True,
+    ))
+    try:
+        result = asyncio.run(mcp_control.update_agent_execution(
+            "r1", "ep-1", "exec-1", status="completed",
+        ))
+        assert result["status"] == "completed"
+    finally:
+        mcp_control.set_current_principal(None)

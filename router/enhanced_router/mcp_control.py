@@ -1556,13 +1556,21 @@ async def update_agent_execution(
     result_summary: str | None = None,
     output_hash: str | None = None,
     error: str | None = None,
-    tool_call_count: int | None = None,
-    total_tokens: int | None = None,
 ) -> dict[str, Any]:
     """Update an agent execution with completion data.
 
     Valid statuses: started, running, completed, failed, timeout, cancelled.
     When status is completed/failed/timeout/cancelled, completed_at is set.
+
+    ``tool_call_count`` and ``total_tokens`` are deliberately not settable
+    here. ``tool_call_count`` gates each workflow phase's turn budget
+    (create_agent_execution sums it across a phase's executions), and the
+    router's own PreToolUse hook already maintains it authoritatively via
+    increment_execution_tool_calls -- a self-reported value here would let a
+    worker understate its own usage and bypass that budget. Real per-request
+    token usage is likewise recorded authoritatively from provider responses
+    via record_execution_metrics_for_binding; nothing in the router itself
+    relies on a self-reported cumulative total.
     """
     state: RouteState = get_state()
     authorization_error = _require_capability(
@@ -1588,8 +1596,6 @@ async def update_agent_execution(
             result_summary=result_summary,
             output_hash=output_hash,
             error=error,
-            tool_call_count=tool_call_count,
-            total_tokens=total_tokens,
         )
     except (ValueError, WorkflowStateError) as exc:
         return {"error": str(exc)}
