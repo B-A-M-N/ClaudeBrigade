@@ -185,6 +185,59 @@ def test_bootstrap_loads_freeinference_concurrency_override(tmp_path: Path):
     assert "FREEINFERENCE_MAX_CONCURRENCY" in result.provider_keys
 
 
+def test_bootstrap_accepts_freeinference_kit_endpoint_aliases(tmp_path: Path):
+    from enhanced_router.bootstrap_env import load_providers_env
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    providers = config_dir / "providers.env"
+    providers.write_text(
+        "FREEINFERENCE_API_KEY=key\n"
+        "FREEINFERENCE_OPENAI_BASE=https://freeinference.org/v1\n"
+        "FREEINFERENCE_ANTHROPIC_BASE=https://freeinference.org/anthropic\n",
+        encoding="utf-8",
+    )
+    providers.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+    result = load_providers_env(config_dir)
+
+    assert result.provider_env["FREEINFERENCE_OPENAI_BASE"] == "https://freeinference.org/v1"
+    assert result.provider_env["FREEINFERENCE_ANTHROPIC_BASE"] == "https://freeinference.org/anthropic"
+
+
+def test_bootstrap_accepts_legacy_provider_catalog_settings(tmp_path: Path):
+    from enhanced_router.bootstrap_env import load_providers_env
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    providers = config_dir / "providers.env"
+    providers.write_text(
+        "OPENROUTER_API_KEY=key\n"
+        "OPENROUTER_API_BASE=https://openrouter.ai/api/v1\n"
+        "NVIDIA_API_KEY=key\n"
+        "NVIDIA_API_BASE=https://integrate.api.nvidia.com/v1\n"
+        "FREEMODEL_CC_API_KEY=key\n"
+        "FREEMODEL_CC_API_BASE=https://api.freemodel.dev/v1\n"
+        "MODELSCOPE_API_KEY=key\n"
+        "MODELSCOPE_API_BASE=https://api-inference.modelscope.cn/v1\n"
+        "UNOROUTER_API_KEY=key\n"
+        "UNOROUTER_API_BASE=https://unorouter.ai/v1\n"
+        "LOGFLARE_API_KEY=key\n"
+        "LOGFLARE_API_BASE=https://api.logflare.app\n",
+        encoding="utf-8",
+    )
+    providers.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+    result = load_providers_env(config_dir)
+
+    assert result.provider_env["OPENROUTER_API_BASE"] == "https://openrouter.ai/api/v1"
+    assert result.provider_env["NVIDIA_API_BASE"] == "https://integrate.api.nvidia.com/v1"
+    # Unsupported legacy providers are accepted for migration but are not
+    # exported into the router process until a Brigade provider definition
+    # explicitly consumes them.
+    assert "MODELSCOPE_API_KEY" not in result.provider_env
+
+
 @pytest.mark.parametrize("contents", ["BROKEN\n", "UNSUPPORTED=value\n"])
 def test_bootstrap_rejects_malformed_or_unsupported_provider_assignments(tmp_path: Path, contents: str):
     from enhanced_router.bootstrap_env import load_providers_env

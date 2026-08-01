@@ -28,6 +28,9 @@ diagnostics, and operator-facing shell behavior.
   uses hidden input and the OS credential store by default, may write the
   owner-only `providers.env` fallback through atomic replacement, and must
   never print credential values.
+- `install.sh` offers to invoke `claude-brigade-config` immediately in an
+  interactive terminal. `CLAUDE_BRIGADE_SKIP_CONFIG=1` suppresses that prompt
+  for scripted or headless installs; pasted keys remain hidden at input.
 - Do not add destructive cleanup, reset, stash, commit, or force-merge logic
   to hooks or launcher paths.
 

@@ -58,6 +58,23 @@ def _load_registry(config_dir: Path) -> tuple[ModelRegistry, tuple[str, ...]]:
     os.environ.update(loaded.provider_env)
     registry = ModelRegistry(config_dir)
     registry.load_models()
+    # Preserve older user-owned catalogs while making newly installed
+    # sidecars/fastpath definitions resolvable.  The installer stores the
+    # current bundled catalog as models.yaml.example on upgrades; source
+    # checkouts use the repository config directory instead.  Only the
+    # router-owned compatibility models are overlaid, and user definitions
+    # always remain authoritative.
+    bundled_models = config_dir / "models.yaml.example"
+    if not bundled_models.exists():
+        source_models = Path(__file__).resolve().parents[2] / "config" / "models.yaml"
+        if source_models.exists():
+            bundled_models = source_models
+    if bundled_models.exists() and bundled_models.resolve() != (config_dir / "models.yaml").resolve():
+        bundled = ModelRegistry(bundled_models.parent)
+        bundled.load_models(bundled_models)
+        for model_id, spec in bundled.models.items():
+            if spec.backend == "anthropic-passthrough" or spec.provider_id == "freeinference":
+                registry.models.setdefault(model_id, spec)
     registry.load_profiles()
     registry.load_workflows()
     registry.load_providers()

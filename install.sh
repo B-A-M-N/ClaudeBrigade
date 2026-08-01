@@ -142,8 +142,10 @@ os.chmod(path, 0o600)
 # Only recognized variable names are loaded.
 # FREEINFERENCE_API_KEY=
 # FREEINFERENCE_API_BASE=
+# FREEINFERENCE_OPENAI_BASE=
+# FREEINFERENCE_ANTHROPIC_BASE=
 # FREEINFERENCE_MAX_CONCURRENCY=4
-LONGCAT_API_KEY=replace_me
+# LONGCAT_API_KEY=
 # OPENROUTER_API_KEY=
 # DEEPSEEK_API_KEY=
 # KILO_API_KEY=
@@ -220,8 +222,10 @@ PY
 # Only recognized variable names are loaded.
 # FREEINFERENCE_API_KEY=
 # FREEINFERENCE_API_BASE=
+# FREEINFERENCE_OPENAI_BASE=
+# FREEINFERENCE_ANTHROPIC_BASE=
 # FREEINFERENCE_MAX_CONCURRENCY=4
-LONGCAT_API_KEY=replace_me
+# LONGCAT_API_KEY=
 # OPENROUTER_API_KEY=
 # KILO_API_KEY=
 # CLINE_API_KEY=
@@ -258,7 +262,7 @@ cat <<MSG
 Installed ClaudeBrigade as a separate profile and command.
 
 Next:
-  1. Edit $CONFIG_DIR/providers.env and set your provider keys.
+  1. Run: $BIN_DIR/claude-brigade-config  (paste keys securely)
   2. Run: $BIN_DIR/claude-brigade-login
   3. Run: $BIN_DIR/claude-brigade-doctor
   4. From a git repository, run: $BIN_DIR/claude-brigade
@@ -266,3 +270,14 @@ Next:
 Normal 'claude' and ~/.claude were not modified.
 Make sure \$BIN_DIR is on PATH.
 MSG
+
+# Offer immediate interactive setup after installation.  The prompt is only
+# shown for a real terminal so scripted/headless installs remain usable.
+# Set CLAUDE_BRIGADE_SKIP_CONFIG=1 to suppress it explicitly.
+if [[ -t 0 && -t 1 && "${CLAUDE_BRIGADE_SKIP_CONFIG:-0}" != "1" ]]; then
+  printf '\nConfigure provider keys, sidecars, and inference profiles now? [Y/n] '
+  read -r _configure_now || _configure_now="n"
+  if [[ -z "$_configure_now" || "$_configure_now" =~ ^[Yy]$ ]]; then
+    exec "$BIN_DIR/claude-brigade-config"
+  fi
+fi

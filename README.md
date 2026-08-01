@@ -43,6 +43,11 @@ Use the interactive configuration CLI after installation:
 claude-brigade-config
 ```
 
+The installer offers to launch this menu immediately; answer `n` for a
+headless/scripted install or set `CLAUDE_BRIGADE_SKIP_CONFIG=1`. API keys can
+be pasted into the hidden prompt, and are saved in the OS credential store
+when available.
+
 It keeps the Claude Code controller/native-agent inference profile and the
 bounded sidecar profile independent. You can save, edit, delete, and reuse
 named profiles. Model selection searches the currently loaded catalog, and
