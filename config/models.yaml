@@ -7,7 +7,7 @@ models:
     api_base_env: LONGCAT_API_BASE
     api_key_env: LONGCAT_API_KEY
     auth: {type: bearer, header: Authorization, prefix: "Bearer "}
-    capabilities: {tools: true, mutation: true, reasoning: high, local: false}
+    capabilities: {tools: true, mutation: true, reasoning: high, local: false, controller_eligible: true}
     allowed_roles: [recon, implementer, adversary, repairer]
 
   qwen-local:
@@ -15,7 +15,7 @@ models:
     backend: litellm
     litellm_model: ollama/qwen3-coder-next
     api_base: http://127.0.0.1:11434
-    capabilities: {tools: true, mutation: true, reasoning: medium, local: true}
+    capabilities: {tools: true, mutation: true, reasoning: medium, local: true, controller_eligible: true}
     allowed_roles: [recon, implementer, repairer]
 
   glm-review:
@@ -34,7 +34,7 @@ models:
     litellm_model: nvidia/nemotron-3-ultra
     api_base: https://integrate.api.nvidia.com/v1
     api_key_env: NVIDIA_API_KEY
-    capabilities: {tools: true, mutation: true, reasoning: high, local: false}
+    capabilities: {tools: true, mutation: true, reasoning: high, local: false, controller_eligible: true}
     allowed_roles: [recon, implementer, adversary, repairer]
 
   nvidia-llama-3.1-405b:
@@ -43,7 +43,7 @@ models:
     litellm_model: nvidia/llama-3.1-405b
     api_base: https://integrate.api.nvidia.com/v1
     api_key_env: NVIDIA_API_KEY
-    capabilities: {tools: true, mutation: true, reasoning: high, local: false}
+    capabilities: {tools: true, mutation: true, reasoning: high, local: false, controller_eligible: true}
     allowed_roles: [recon, implementer, adversary, repairer]
 
   nvidia-llama-3.1-70b:
@@ -52,7 +52,7 @@ models:
     litellm_model: nvidia/llama-3.1-70b
     api_base: https://integrate.api.nvidia.com/v1
     api_key_env: NVIDIA_API_KEY
-    capabilities: {tools: true, mutation: true, reasoning: high, local: false}
+    capabilities: {tools: true, mutation: true, reasoning: high, local: false, controller_eligible: true}
     allowed_roles: [recon, implementer, adversary, repairer]
 
   nvidia-llama-3.1-8b:
@@ -61,7 +61,7 @@ models:
     litellm_model: nvidia/llama-3.1-8b
     api_base: https://integrate.api.nvidia.com/v1
     api_key_env: NVIDIA_API_KEY
-    capabilities: {tools: true, mutation: true, reasoning: medium, local: false}
+    capabilities: {tools: true, mutation: true, reasoning: medium, local: false, controller_eligible: true}
     allowed_roles: [recon, implementer, adversary, repairer]
 
   nvidia-mistral-large:
@@ -70,8 +70,20 @@ models:
     litellm_model: nvidia/mistral-large
     api_base: https://integrate.api.nvidia.com/v1
     api_key_env: NVIDIA_API_KEY
-    capabilities: {tools: true, mutation: true, reasoning: high, local: false}
+    capabilities: {tools: true, mutation: true, reasoning: high, local: false, controller_eligible: true}
     allowed_roles: [recon, implementer, adversary, repairer]
+
+  nvidia-nim-free:
+    display_name: Nemotron 3 Nano 30B A3B (NVIDIA NIM Free)
+    catalog_source: bundled
+    availability: public
+    provider_id: nvidia
+    backend: litellm
+    litellm_model: nvidia/nemotron-3-nano-30b-a3b
+    api_base: https://integrate.api.nvidia.com/v1
+    api_key_env: NVIDIA_API_KEY
+    capabilities: {tools: true, mutation: false, reasoning: high, local: false, controller_eligible: true, openai_chat_completions: true, tool_calls: true, cost_class: free, read_tool_certified: true, write_tool_certified: false}
+    allowed_roles: [recon, adversary]
 
   # OpenCode Zen (OpenAI-compatible free and paid catalog)
   opencode-zen-sonnet:
@@ -81,7 +93,7 @@ models:
     litellm_model: openai/claude-sonnet-4-5
     api_base: https://opencode.ai/zen/v1
     api_key_env: OPENCODE_API_KEY
-    capabilities: {tools: true, mutation: true, reasoning: high, local: false}
+    capabilities: {tools: true, mutation: true, reasoning: high, local: false, controller_eligible: true}
     allowed_roles: [recon, implementer, adversary, repairer]
 
   opencode-zen-opus:
@@ -91,7 +103,7 @@ models:
     litellm_model: openai/claude-opus-4-5
     api_base: https://opencode.ai/zen/v1
     api_key_env: OPENCODE_API_KEY
-    capabilities: {tools: true, mutation: true, reasoning: high, local: false}
+    capabilities: {tools: true, mutation: true, reasoning: high, local: false, controller_eligible: true}
     allowed_roles: [recon, implementer, adversary, repairer]
 
   opencode-zen-haiku:
@@ -101,8 +113,20 @@ models:
     litellm_model: openai/claude-haiku-4-5
     api_base: https://opencode.ai/zen/v1
     api_key_env: OPENCODE_API_KEY
-    capabilities: {tools: true, mutation: true, reasoning: medium, local: false}
+    capabilities: {tools: true, mutation: true, reasoning: medium, local: false, controller_eligible: true}
     allowed_roles: [recon, implementer, adversary, repairer]
+
+  opencode-zen-free:
+    display_name: Nemotron 3 Ultra Free (OpenCode Zen)
+    catalog_source: bundled
+    availability: public
+    provider_id: opencode-zen
+    backend: litellm
+    litellm_model: openai/nemotron-3-ultra-free
+    api_base: https://opencode.ai/zen/v1
+    api_key_env: OPENCODE_API_KEY
+    capabilities: {tools: true, mutation: false, reasoning: high, local: false, controller_eligible: true, openai_chat_completions: true, tool_calls: true, cost_class: free, read_tool_certified: true, write_tool_certified: false}
+    allowed_roles: [recon, adversary]
 
   # OpenCode Go
   opencode-go-sonnet:
@@ -112,7 +136,7 @@ models:
     litellm_model: openai/kimi-k2.7-code
     api_base: https://opencode.ai/zen/go/v1
     api_key_env: OPENCODEGO_API_KEY
-    capabilities: {tools: true, mutation: true, reasoning: high, local: false}
+    capabilities: {tools: true, mutation: true, reasoning: high, local: false, controller_eligible: true}
     allowed_roles: [recon, implementer, adversary, repairer]
 
   opencode-go-opus:
@@ -122,7 +146,7 @@ models:
     litellm_model: openai/glm-5.2
     api_base: https://opencode.ai/zen/go/v1
     api_key_env: OPENCODEGO_API_KEY
-    capabilities: {tools: true, mutation: true, reasoning: high, local: false}
+    capabilities: {tools: true, mutation: true, reasoning: high, local: false, controller_eligible: true}
     allowed_roles: [recon, implementer, adversary, repairer]
 
   # Kilocode (free models only via gateway)
@@ -134,7 +158,7 @@ models:
     litellm_model: qwen/qwen3-coder
     api_base: https://api.kilo.ai/api/gateway
     api_key_env: KILO_API_KEY
-    capabilities: {tools: true, mutation: true, reasoning: medium, local: false}
+    capabilities: {tools: true, mutation: true, reasoning: medium, local: false, controller_eligible: true}
     allowed_roles: [recon, implementer, repairer]
 
   ling-3.0-flash:
@@ -161,14 +185,38 @@ models:
         availability: public
         certified: false
 
+  openrouter-free:
+    display_name: OpenRouter Free Model Router
+    catalog_source: bundled
+    availability: public
+    provider_id: openrouter
+    backend: litellm
+    litellm_model: openai/openrouter/free
+    api_base: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    capabilities: {tools: true, mutation: false, reasoning: medium, local: false, controller_eligible: true, openai_chat_completions: true, tool_calls: true, cost_class: free, read_tool_certified: true, write_tool_certified: false}
+    allowed_roles: [recon, adversary]
+
   kilocode-deepseek-v3:
     display_name: DeepSeek V3 (Kilocode Free)
     backend: litellm
     litellm_model: deepseek/deepseek-chat
     api_base: https://api.kilo.ai/api/gateway
     api_key_env: KILO_API_KEY
-    capabilities: {tools: true, mutation: true, reasoning: high, local: false}
+    capabilities: {tools: true, mutation: true, reasoning: high, local: false, controller_eligible: true}
     allowed_roles: [recon, implementer, adversary, repairer]
+
+  kilocode-auto-free:
+    display_name: Kilo Auto Free
+    catalog_source: bundled
+    availability: public
+    provider_id: kilocode
+    backend: litellm
+    litellm_model: openai/kilo-auto/free
+    api_base: https://api.kilo.ai/api/gateway
+    api_key_env: KILO_API_KEY
+    capabilities: {tools: true, mutation: false, reasoning: medium, local: false, controller_eligible: true, openai_chat_completions: true, tool_calls: true, cost_class: free, read_tool_certified: true, write_tool_certified: false}
+    allowed_roles: [recon, adversary]
 
   kilocode-llama-3.1-8b:
     display_name: Llama 3.1 8B (Kilocode Free)
@@ -176,7 +224,7 @@ models:
     litellm_model: meta-llama/llama-3.1-8b-instruct
     api_base: https://api.kilo.ai/api/gateway
     api_key_env: KILO_API_KEY
-    capabilities: {tools: true, mutation: true, reasoning: medium, local: false}
+    capabilities: {tools: true, mutation: true, reasoning: medium, local: false, controller_eligible: true}
     allowed_roles: [recon, implementer, adversary, repairer]
 
   kilocode-mistral-nemo:
@@ -185,7 +233,7 @@ models:
     litellm_model: mistralai/mistral-nemo
     api_base: https://api.kilo.ai/api/gateway
     api_key_env: KILO_API_KEY
-    capabilities: {tools: true, mutation: true, reasoning: medium, local: false}
+    capabilities: {tools: true, mutation: true, reasoning: medium, local: false, controller_eligible: true}
     allowed_roles: [recon, implementer, adversary, repairer]
 
   # Logical FreeInference models. Endpoint selection defaults to the

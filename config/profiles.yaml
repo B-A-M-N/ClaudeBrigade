@@ -1,5 +1,6 @@
 profiles:
   freeinference:
+    controller_model: glm-5.1
     recon: qwen3.6-35b
     implementer: kimi-k2.7-code
     adversary: glm-5.1
@@ -32,43 +33,57 @@ profiles:
         public_model_alias: anthropic-brigade-fi-glm-fast-repairer
 
   longcat:
+    controller_model: longcat-2
     recon: longcat-2
     implementer: longcat-2
     adversary: longcat-2
     repairer: longcat-2
 
   local-first:
+    controller_model: qwen-local
     recon: qwen-local
     implementer: qwen-local
     adversary: glm-5.1
     repairer: qwen-local
 
   hybrid:
+    controller_model: glm-5.1
     recon: qwen-local
     implementer: glm-5.1
     adversary: glm-5.1
     repairer: glm-5-turbo
 
   nvidia-nim:
+    controller_model: nvidia-nim-free
     recon: nvidia-nemotron-3-ultra
     implementer: nvidia-nemotron-3-ultra
     adversary: nvidia-llama-3.1-405b
     repairer: nvidia-llama-3.1-70b
 
   opencode-zen:
+    controller_model: opencode-zen-free
     recon: opencode-zen-sonnet
     implementer: opencode-zen-sonnet
     adversary: opencode-zen-opus
     repairer: opencode-zen-haiku
 
   opencode-go:
+    controller_model: opencode-go-sonnet
     recon: opencode-go-sonnet
     implementer: opencode-go-sonnet
     adversary: opencode-go-opus
     repairer: opencode-go-sonnet
 
   kilocode-free:
+    controller_model: kilocode-auto-free
     recon: kilocode-deepseek-v3
     implementer: ling-3.0-flash
     adversary: kilocode-mistral-nemo
     repairer: kilocode-llama-3.1-8b
+
+  openrouter-free:
+    controller_model: openrouter-free
+    recon: glm-5.1
+    implementer: glm-5.1
+    adversary: glm-5.1
+    repairer: glm-5-turbo

@@ -123,6 +123,28 @@ class TestModelRegistryLoad:
 
 
 class TestModelRegistryLookup:
+    def test_bundled_free_controller_profiles(self):
+        repo_config = pathlib.Path(__file__).resolve().parents[1] / "config"
+        registry = ModelRegistry(repo_config)
+        registry.load_models()
+        registry.load_profiles()
+        registry.load_workflows()
+        registry.load_providers()
+        registry.load_fastpath()
+        registry.load_sidecars()
+        registry._validate_cross_refs()
+
+        expected = {
+            "nvidia-nim": "nvidia-nim-free",
+            "opencode-zen": "opencode-zen-free",
+            "kilocode-free": "kilocode-auto-free",
+            "openrouter-free": "openrouter-free",
+        }
+        for profile_id, model_id in expected.items():
+            profile = registry.get_profile(profile_id)
+            assert profile.controller_model == model_id
+            assert registry.get_model(model_id).capabilities.cost_class == "free"
+
     def test_specialist_manifest_is_registry_backed(self):
         repo_config = pathlib.Path(__file__).resolve().parents[1] / "config"
         registry = ModelRegistry(repo_config)
