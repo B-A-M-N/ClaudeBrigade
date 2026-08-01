@@ -538,6 +538,76 @@ def test_failed_yellow_integration_terminalizes_claim_and_reexposes_candidate(
         mcp_control.set_current_run_id(None)
 
 
+def test_failed_integration_creates_accepted_finding(
+    state: RouteState, tmp_path: Path, monkeypatch,
+):
+    from enhanced_router import mcp_control
+    from enhanced_router.shadow_worktree import ShadowWorktreeManager
+
+    ctx = _setup_integration_candidate(state, tmp_path)
+
+    def _boom(self, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(ShadowWorktreeManager, "integrate_green", _boom)
+    monkeypatch.setattr(mcp_control, "get_state", lambda: state)
+    mcp_control.set_current_run_id("r1")
+    try:
+        asyncio.run(mcp_control.integrate_shadow_changeset(
+            "r1", "ep-1", ctx["changeset_id"], controller_approval=True,
+        ))
+        findings = state.get_findings("r1", epoch_id="ep-1")
+        finding = next(
+            f for f in findings if f["finding_id"] == f"shadow-conflict-{ctx['candidate_id']}"
+        )
+        assert finding["disposition"] == "accepted"
+        assert finding["category"] == "shadow_integration_conflict"
+        assert "boom" in finding["description"]
+
+        # Confirmed the actual gate mechanism sees it too.
+        open_accepted = state.get_open_accepted_findings("r1", "ep-1")
+        assert any(f["finding_id"] == finding["finding_id"] for f in open_accepted)
+    finally:
+        mcp_control.set_current_run_id(None)
+
+
+def test_resolve_shadow_candidate_discard_resolves_the_finding(
+    state: RouteState, tmp_path: Path, monkeypatch,
+):
+    from enhanced_router import mcp_control
+    from enhanced_router.shadow_worktree import ShadowWorktreeManager
+
+    ctx = _setup_integration_candidate(state, tmp_path)
+
+    def _boom(self, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(ShadowWorktreeManager, "integrate_green", _boom)
+    monkeypatch.setattr(mcp_control, "get_state", lambda: state)
+    mcp_control.set_current_run_id("r1")
+    try:
+        asyncio.run(mcp_control.integrate_shadow_changeset(
+            "r1", "ep-1", ctx["changeset_id"], controller_approval=True,
+        ))
+        finding_id = f"shadow-conflict-{ctx['candidate_id']}"
+        assert state.get_open_accepted_findings("r1", "ep-1")  # sanity: it's open
+
+        # Re-claim the action the way a real controller would after the
+        # first attempt terminalized it, then discard the red candidate.
+        state.claim_runnable_action("r1", "ep-1", ctx["action_id"])
+        result = asyncio.run(mcp_control.resolve_shadow_candidate(
+            "r1", "ep-1", ctx["changeset_id"], "discard", "not usable",
+        ))
+        assert result["resolved"] is True
+
+        finding = state.get_finding(finding_id)
+        assert finding is not None
+        assert finding["verification_status"] == "irrelevant"
+        assert state.get_open_accepted_findings("r1", "ep-1") == []
+    finally:
+        mcp_control.set_current_run_id(None)
+
+
 def test_missing_active_main_workspace_still_terminalizes_claim(
     state: RouteState, tmp_path: Path, monkeypatch,
 ):

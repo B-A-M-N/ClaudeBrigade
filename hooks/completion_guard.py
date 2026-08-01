@@ -62,12 +62,14 @@ def block_with_retry_guard(reason: str, session_dir: pathlib.Path, stop_hook_act
                 "Requiring explicit failure acknowledgment.",
                 current_retries,
             )
-            sys.stderr.write(
-                f"ERROR: Maximum stop_hook retries exceeded ({reason}).\n"
-                f"The assistant must acknowledge failure with 'Enhanced-Completion: failed' "
-                f"before the session can exit.\n"
+            escape_reason = (
+                f"{reason} (retried {current_retries} times). To end this epoch without "
+                "completing it, respond with the exact line 'Enhanced-Completion: failed' "
+                "and nothing else claiming success -- that is the only way to exit once "
+                "retries are exhausted."
             )
-            block(reason)
+            sys.stderr.write(f"ERROR: Maximum stop_hook retries exceeded ({reason}).\n")
+            block(escape_reason)
             return 0
 
     block(reason)

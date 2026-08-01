@@ -735,7 +735,8 @@ async def reload_catalog(
 
     from enhanced_router.litellm_config import generate_litellm_config
 
-    config_text = generate_litellm_config(registry.models, referenced_ids=registry.referenced_model_ids())
+    referenced_ids = registry.referenced_model_ids_for_active_runs(state)
+    config_text = generate_litellm_config(registry.models, referenced_ids=referenced_ids)
 
     try:
         result = await _litellm_supervisor_instance.reload(
@@ -743,6 +744,7 @@ async def reload_catalog(
             models=registry.models,
             config_text=config_text,
             reason=reason or "mcp-reload",
+            referenced_ids=referenced_ids,
         )
         if result.get("changed"):
             return {
@@ -1129,7 +1131,7 @@ async def integrate_shadow_changeset(
         if workspace is None or run is None or not run.get("cwd"):
             return {"integrated": False, "error": "canonical workspace state is unavailable"}
 
-        from enhanced_router.shadow_worktree import Changeset, ShadowWorktreeManager
+        from enhanced_router.shadow_worktree import Changeset, ShadowWorktreeManager, escalate_red_candidate
 
         try:
             validation = json.loads(str(changeset_record.get("result_json") or "{}"))
@@ -1172,6 +1174,11 @@ async def integrate_shadow_changeset(
         except Exception as exc:
             state.mark_integration_candidate(
                 changeset_id, disposition="red", validation={"preflight_error": str(exc)},
+            )
+            escalate_red_candidate(
+                state, run_id=run_id, epoch_id=epoch_id,
+                candidate_id=str(candidate["candidate_id"]), changeset_id=changeset_id,
+                reason=str(exc), evidence={"preflight_error": str(exc)},
             )
             return {"integrated": False, "error": str(exc), "conflict": True}
     finally:
@@ -1221,6 +1228,7 @@ async def resolve_shadow_candidate(
     if action_error:
         return {"resolved": False, "error": action_error}
     integration_action_id = f"integration:{candidate['candidate_id']}"
+    was_red = str(candidate.get("disposition")) == "red"
     resolution_outcome = "failed"
     try:
         if decision == "retry":
@@ -1228,6 +1236,8 @@ async def resolve_shadow_candidate(
                 changeset_id, disposition="pending",
                 validation={"controller_decision": "retry", "reason": reason},
             )
+            if was_red:
+                _resolve_red_candidate_finding(state, str(candidate["candidate_id"]), reason)
             resolution_outcome = "completed"
             return {
                 "resolved": True, "status": "pending",
@@ -1237,6 +1247,8 @@ async def resolve_shadow_candidate(
             changeset_id, disposition="resolved",
             validation={"controller_decision": "discard", "reason": reason},
         )
+        if was_red:
+            _resolve_red_candidate_finding(state, str(candidate["candidate_id"]), reason)
         changeset = state.get_changeset(changeset_id)
         if changeset:
             state.mark_changeset_rejected(changeset_id)
@@ -1767,6 +1779,22 @@ def _consume_controller_integration_action(
             "get_runnable_actions and claim_runnable_action first"
         )
     return None
+
+
+def _resolve_red_candidate_finding(state: RouteState, candidate_id: str, reason: str) -> None:
+    """Close out the finding escalate_red_candidate opened for this candidate.
+
+    Called from resolve_shadow_candidate once the controller has actually
+    handled a red candidate (discard or retry) -- a no-op if no finding was
+    ever created for it (resolve_finding on an unknown finding_id just
+    returns None, it doesn't raise).
+    """
+    state.resolve_finding(
+        f"shadow-conflict-{candidate_id}", "irrelevant",
+        resolution_evidence_json=json.dumps(
+            {"controller_resolution": reason}, sort_keys=True,
+        ),
+    )
 
 
 def set_current_run_id(run_id: str | None) -> None:

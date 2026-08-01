@@ -54,8 +54,7 @@ async def test_sidecar_completes_and_persists_events(tmp_path: Path, monkeypatch
         run_id="r1", epoch_id="ep-1", action_id=claim["action_id"],
         claim_token=claim["claim_token"], packet={"task": "review"},
     )
-    await asyncio.sleep(0.02)
-    final = state.get_agent_execution(execution["execution_id"])
+    final = await executor.wait(execution["execution_id"])
     assert final is not None
     assert final["status"] == "completed"
     assert final["result_json"] == '{"verdict":"pass"}'
@@ -84,11 +83,13 @@ async def test_sidecar_retry_uses_bounded_original_packet(tmp_path: Path, monkey
         run_id="r1", epoch_id="ep-1", action_id=claim["action_id"],
         claim_token=claim["claim_token"], packet={"task": "retry-me"},
     )
-    await asyncio.sleep(0.02)
-    assert state.get_agent_execution(first["execution_id"])["status"] == "failed"
+    first_final = await executor.wait(first["execution_id"])
+    assert first_final is not None
+    assert first_final["status"] == "failed"
     second = await executor.retry(first["execution_id"])
-    await asyncio.sleep(0.02)
-    assert state.get_agent_execution(second["execution_id"])["status"] == "completed"
+    second_final = await executor.wait(second["execution_id"])
+    assert second_final is not None
+    assert second_final["status"] == "completed"
     await executor.shutdown()
 
 

@@ -97,6 +97,38 @@ def _safe_relative(root: Path, value: str) -> Path:
     return path
 
 
+def escalate_red_candidate(
+    state: object, *, run_id: str, epoch_id: str, candidate_id: str,
+    changeset_id: str, reason: str, evidence: dict,
+) -> None:
+    """Record a red integration candidate as an accepted finding.
+
+    A red disposition (invalid patch, unauthorized files, or a failed
+    integration preflight) is an objectively-detected problem, not something
+    that needs human adjudication of whether it's "real" -- so this creates
+    the finding directly as already-accepted rather than leaving it pending.
+    This is what makes red candidates visible to evaluate_condition's
+    accepted_findings gate instead of only living in the integration_candidates
+    table, which nothing but a proactive get_integration_candidates poll ever
+    surfaces. The finding_id is deterministic from candidate_id so
+    resolve_shadow_candidate can resolve the same finding it escalated here.
+    """
+    finding_id = f"shadow-conflict-{candidate_id}"
+    state.create_finding(  # type: ignore[attr-defined]
+        finding_id, run_id, epoch_id,
+        f"Shadow-workspace integration candidate for changeset {changeset_id!r} "
+        f"is red: {reason}",
+        severity="high",
+        category="shadow_integration_conflict",
+        evidence_json=json.dumps(evidence, sort_keys=True),
+    )
+    state.adjudicate_finding(  # type: ignore[attr-defined]
+        finding_id, "accepted",
+        reason="auto-accepted: shadow integration classified red",
+        dispositioned_by="shadow_worktree",
+    )
+
+
 class ShadowWorktreeManager:
     """Manage shadow worktrees for one canonical Git repository."""
 
@@ -466,8 +498,9 @@ class ShadowWorktreeManager:
         payload = {"overlaps": overlaps, "changed_files": sorted(current)}
         validation = dict(changeset.validation)
         validation["overlap_free"] = not overlaps
+        candidate_id = f"candidate-{uuid.uuid4().hex}"
         state.create_integration_candidate(  # type: ignore[attr-defined]
-            candidate_id=f"candidate-{uuid.uuid4().hex}",
+            candidate_id=candidate_id,
             run_id=run_id,
             epoch_id=epoch_id,
             changeset_id=changeset.changeset_id,
@@ -475,6 +508,13 @@ class ShadowWorktreeManager:
             validation=validation,
             disposition=disposition,
         )
+        if disposition == "red":
+            escalate_red_candidate(
+                state, run_id=run_id, epoch_id=epoch_id, candidate_id=candidate_id,
+                changeset_id=changeset.changeset_id,
+                reason=validation.get("reason") or "changeset failed preflight validation",
+                evidence={"overlap": payload, "validation": validation},
+            )
         return {"disposition": disposition, "overlap": payload, "validation": validation}
 
     def integrate_green(
