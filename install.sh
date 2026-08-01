@@ -56,6 +56,17 @@ cp -R "$SOURCE_DIR/router" "$APP_DIR/router"
 cp "$SOURCE_DIR/requirements.txt" "$APP_DIR/requirements.txt"
 cp "$SOURCE_DIR/pyproject.toml" "$APP_DIR/pyproject.toml"
 
+# Bundle the repo's default config/ alongside the installed code. This is
+# NOT the operator's live config (that stays in $CONFIG_DIR and is never
+# overwritten below) -- registry.py's get_registry() reads this bundled copy
+# to backfill FreeInference/passthrough models an older, customized
+# operator models.yaml predates (e.g. fastpath.yaml/sidecars.yaml referencing
+# a model added to the repo defaults after the operator's config was last
+# hand-edited). Without this directory present, that fallback silently finds
+# nothing and registry validation fails outright instead of backfilling.
+rm -rf "$APP_DIR/config"
+cp -R "$SOURCE_DIR/config" "$APP_DIR/config"
+
 # Copy settings to profile directory
 cp "$SOURCE_DIR/settings.json" "$PROFILE_DIR/settings.json"
 

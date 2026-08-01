@@ -198,7 +198,7 @@ def _choose_model(
             if query in item[0].lower() or query in item[1].lower()
         ]
         if not filtered:
-            print("No matching models. Try another search.")
+            print(f"No matches for '{query}'. Press Enter with nothing typed to list all {len(options)} options.")
             continue
         default = next(
             (index for index, item in enumerate(filtered, 1) if item[0] == default_id),
@@ -245,19 +245,210 @@ def _model_choices(
     role: str | None = None,
     controller: bool = False,
 ) -> list[tuple[str, str]]:
+    """List selectable models for a role (or the controller).
+
+    A freshly-discovered model (see registry.apply_discovered_catalog) starts
+    with an empty ``allowed_roles`` set, and ``capabilities.controller_eligible
+    = False``, by design -- discovery never grants roles or controller
+    eligibility on its own. Without special-casing that here, such a model
+    could never be searched or selected for ANY role or as the controller:
+    the filters below would always exclude it, and nothing else ever grants
+    it. Treat "not yet decided" as offerable; picking it is what grants the
+    role or controller eligibility (see configure_inference /
+    _grant_controller_eligible). Once a model has been explicitly restricted
+    to a non-empty set of roles, that restriction is still enforced normally.
+    """
     choices: list[tuple[str, str]] = []
-    source = registry.controller_models() if controller else registry.models.items()
-    for model_id, model in sorted(source, key=lambda item: item[0]):
+    for model_id, model in sorted(registry.models.items(), key=lambda item: item[0]):
         if not model.enabled or model.backend == "anthropic-passthrough" and not controller:
             continue
-        if role is not None and role not in model.allowed_roles:
-            continue
+        ungranted = False
+        if controller:
+            if not model.capabilities.controller_eligible:
+                ungranted = True
+        elif role is not None:
+            if model.allowed_roles:
+                if role not in model.allowed_roles:
+                    continue
+            else:
+                ungranted = True
         provider, backend, key_env, configured = _model_provider(registry, model_id)
         if not configured:
             continue
         label = f"{model.display_name}; {backend}; provider={provider}; key={key_env}"
+        if ungranted:
+            suffix = "controller eligibility" if controller else "the role"
+            label += f"; UNCERTIFIED -- selecting this grants it {suffix}"
         choices.append((model_id, label))
     return choices
+
+
+def _grant_discovered_role(config_dir: Path, registry: ModelRegistry, model_id: str, role: str) -> None:
+    """Grant *role* to a discovered model that has no roles assigned yet.
+
+    Persisted into discovered_models.yaml (the same file
+    Registry._persist_discovered_catalog writes) so the grant survives a
+    future `refresh` re-running discovery -- that function preserves any
+    existing allowed_roles/capabilities it finds there rather than
+    overwriting them. Also updates the in-memory registry so the rest of
+    the current wizard session sees the grant immediately.
+    """
+    path = config_dir / "discovered_models.yaml"
+    raw = _read_yaml(path)
+    models = raw.setdefault("models", {})
+    entry = models.get(model_id)
+    if not isinstance(entry, dict):
+        return
+    roles = list(entry.get("allowed_roles") or [])
+    if role not in roles:
+        roles.append(role)
+    entry["allowed_roles"] = roles
+    if role in {"implementer", "repairer"}:
+        caps = dict(entry.get("capabilities") or {})
+        caps["mutation"] = True
+        entry["capabilities"] = caps
+    _write_yaml(path, raw)
+
+    spec = registry.models.get(model_id)
+    if spec is not None:
+        updates: dict[str, Any] = {"allowed_roles": spec.allowed_roles | {role}}
+        if role in {"implementer", "repairer"}:
+            updates["capabilities"] = spec.capabilities.model_copy(update={"mutation": True})
+        registry.models[model_id] = spec.model_copy(update=updates)
+
+
+def _grant_controller_eligible(config_dir: Path, registry: ModelRegistry, model_id: str) -> None:
+    """Grant controller eligibility to a model that isn't certified for it.
+
+    Same persistence pattern as _grant_discovered_role: written into
+    discovered_models.yaml so it survives a future `refresh`, and reflected
+    in-memory immediately. The launcher (bin/claude-brigade) independently
+    re-checks `capabilities.controller_eligible or backend ==
+    "anthropic-passthrough"` before it will actually launch with this model
+    as the controller, so this grant is what makes that check pass -- without
+    it, a model picked here would be rejected at launch time with "is not
+    controller-compatible" even though the wizard let you select it.
+    """
+    path = config_dir / "discovered_models.yaml"
+    raw = _read_yaml(path)
+    models = raw.setdefault("models", {})
+    entry = models.get(model_id)
+    if isinstance(entry, dict):
+        caps = dict(entry.get("capabilities") or {})
+        caps["controller_eligible"] = True
+        entry["capabilities"] = caps
+        _write_yaml(path, raw)
+
+    spec = registry.models.get(model_id)
+    if spec is not None:
+        registry.models[model_id] = spec.model_copy(
+            update={"capabilities": spec.capabilities.model_copy(update={"controller_eligible": True})}
+        )
+
+
+def _target_label(role: str | None, controller: bool) -> str:
+    return "controller" if controller else str(role)
+
+
+def _record_certification(config_dir: Path, model_id: str, target: str, probe_record: dict[str, Any]) -> None:
+    """Persist probe evidence to model_certifications.yaml.
+
+    This is an evidence record, not an authority grant by itself -- the
+    caller only reaches the actual allowed_roles/controller_eligible grant
+    when probe_record['status'] == 'certified'.
+    """
+    path = config_dir / "model_certifications.yaml"
+    raw = _read_yaml(path)
+    certifications = raw.setdefault("certifications", {})
+    per_model = certifications.setdefault(model_id, {})
+    per_model[target] = probe_record
+    _write_yaml(path, raw)
+
+
+def _record_override(config_dir: Path, model_id: str, target: str, reason: str) -> None:
+    """Persist an explicit, unverified operator decision to model_overrides.yaml.
+
+    Distinct from model_certifications.yaml on purpose: this is a decision
+    the operator made without passing evidence, not a claim that the model
+    was tested and works.
+    """
+    path = config_dir / "model_overrides.yaml"
+    raw = _read_yaml(path)
+    overrides = raw.setdefault("overrides", {})
+    per_model = overrides.setdefault(model_id, {})
+    per_model[target] = {
+        "reason": reason,
+        "granted_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+    }
+    _write_yaml(path, raw)
+
+
+def _apply_grant(config_dir: Path, registry: ModelRegistry, model_id: str, *, role: str | None, controller: bool) -> None:
+    if controller:
+        _grant_controller_eligible(config_dir, registry, model_id)
+    elif role is not None:
+        _grant_discovered_role(config_dir, registry, model_id, role)
+
+
+def _confirm_and_grant(
+    config_dir: Path, registry: ModelRegistry, model_id: str, *, role: str | None = None, controller: bool = False,
+) -> bool:
+    """Gate an uncertified model behind an explicit test-or-override choice.
+
+    Returns True if the model is now usable for this target (already was,
+    just got certified, or was explicitly overridden). Returns False if the
+    operator backed out, so the caller should let them pick a different
+    model instead of silently proceeding.
+
+    Selecting a model from the list must never by itself grant it anything
+    -- that was the bug in the original _grant_* wiring, which treated
+    "the user typed this model's number" as equivalent to "this model is
+    certified for this role."
+    """
+    target = _target_label(role, controller)
+    spec = registry.get_model(model_id)
+    already_ok = spec.capabilities.controller_eligible if controller else (role in spec.allowed_roles if role else True)
+    if already_ok:
+        return True
+
+    print(
+        f"\n'{model_id}' is unverified for {target}. Discovery never grants roles or "
+        "controller eligibility on its own -- pick how to proceed:"
+    )
+    print("  t) Run a compatibility test now (one real API call, uses your credentials)")
+    print("  o) Override without testing (explicit, at your own risk)")
+    print("  <anything else>) Cancel and pick a different model")
+    choice = input("Choice: ").strip().lower()
+
+    if choice == "t":
+        from enhanced_router.model_probe import probe_model
+
+        print(f"Probing '{model_id}' for {target} compatibility...")
+        result = probe_model(model_id, spec, config_dir=str(config_dir))
+        _record_certification(config_dir, model_id, target, result.to_record())
+        if result.passed:
+            print(f"Passed: {model_id} demonstrated tool-call support for {target}.")
+            _apply_grant(config_dir, registry, model_id, role=role, controller=controller)
+            return True
+        print(f"Failed: {result.error or 'no tool call observed'}.")
+        if input("Override and use it anyway despite the failed test? [y/N]: ").strip().lower() != "y":
+            return False
+        choice = "o"
+
+    if choice == "o":
+        reason = _prompt("Reason for overriding without certification", "operator decision")
+        confirm = input(
+            f"Type OVERRIDE to confirm using an unverified model for {target} "
+            "(it may fail unpredictably, including mid-mutation): "
+        ).strip()
+        if confirm != "OVERRIDE":
+            print("Not confirmed; cancelled.")
+            return False
+        _record_override(config_dir, model_id, target, reason)
+        _apply_grant(config_dir, registry, model_id, role=role, controller=controller)
+        return True
+
+    return False
 
 
 def _profile_model(profile: dict[str, Any], role: str) -> tuple[str, str, list[str]]:
@@ -271,35 +462,51 @@ def _profile_model(profile: dict[str, Any], role: str) -> tuple[str, str, list[s
     return str(raw), "auto", []
 
 
-def configure_inference(config_dir: Path, registry: ModelRegistry) -> None:
+def configure_inference(config_dir: Path, registry: ModelRegistry) -> str:
     raw = _read_yaml(config_dir / "profiles.yaml")
     profiles = raw.setdefault("profiles", {})
     if not isinstance(profiles, dict):
         profiles = {}
         raw["profiles"] = profiles
     existing = sorted(str(item) for item in profiles)
-    profile_id = _prompt("Saved inference profile ID", existing[0] if existing else "my-profile")
+    print(
+        "\nA profile is a named, reusable set of controller + role model "
+        "assignments -- the actual model choices come next, right after this."
+    )
+    if existing:
+        print(f"Existing profiles: {', '.join(existing)}")
+        print("Press Enter to edit one of those, or type a new name to create a separate saved setup.")
+    else:
+        print("No profiles saved yet -- name this one (letters, numbers, '.', '_', '-').")
+    profile_id = _prompt("Profile name", existing[0] if existing else "my-profile")
     if not _NAME_RE.fullmatch(profile_id):
         raise ValueError("profile IDs may contain letters, numbers, '.', '_' and '-'")
     current = dict(profiles.get(profile_id) or {})
-    print("\nSelect the models ClaudeBrigade's controller and native roles should use.")
+    print("\n=== Main models: controller + recon/implementer/adversary/repairer ===")
+    print("For each, type part of a name to search, or press Enter to list everything.")
     controller_default = str(current.get("controller_model") or "")
     controller_choices = _model_choices(registry, controller=True)
     if controller_choices:
-        controller_model = _choose_model(
-            "Controller model", controller_choices,
-            controller_default,
-        )
+        while True:
+            controller_model = _choose_model(
+                "Controller model", controller_choices,
+                controller_default,
+            )
+            if _confirm_and_grant(config_dir, registry, controller_model, controller=True):
+                break
         current["controller_model"] = controller_model
     for role in _ROLES:
         choices = _model_choices(registry, role=role)
         if not choices:
             raise RuntimeError(f"No credential-backed model is available for role '{role}'.")
         previous, previous_endpoint, previous_fallbacks = _profile_model(current, role)
-        selected = _choose_model(
-            f"{role} model", choices,
-            previous,
-        )
+        while True:
+            selected = _choose_model(
+                f"{role} model", choices,
+                previous,
+            )
+            if _confirm_and_grant(config_dir, registry, selected, role=role):
+                break
         model = registry.get_model(selected)
         endpoints = [("auto", "registry endpoint selection")]
         endpoints.extend((endpoint_id, f"configured {endpoint.backend} endpoint") for endpoint_id, endpoint in sorted(model.endpoints.items()))
@@ -319,6 +526,13 @@ def configure_inference(config_dir: Path, registry: ModelRegistry) -> None:
             raise ValueError(
                 f"fallback model(s) unavailable for role '{role}': {', '.join(unknown_fallbacks)}"
             )
+        confirmed_fallbacks = []
+        for fallback_id in fallback_models:
+            if _confirm_and_grant(config_dir, registry, fallback_id, role=role):
+                confirmed_fallbacks.append(fallback_id)
+            else:
+                print(f"Dropping '{fallback_id}' from {role} fallbacks (not confirmed).")
+        fallback_models = confirmed_fallbacks
         if endpoint == "auto" and not fallback_models:
             current[role] = selected
         else:
@@ -331,9 +545,59 @@ def configure_inference(config_dir: Path, registry: ModelRegistry) -> None:
     _write_yaml(config_dir / "profiles.yaml", raw)
     print(f"Saved inference profile '{profile_id}' to {config_dir / 'profiles.yaml'}.")
     print(f"Use it with: claude-brigade --brigade-profile {profile_id}")
+    return profile_id
+
+
+def configure_fastpath(config_dir: Path, registry: ModelRegistry) -> None:
+    """Configure the always-on fastpath coprocessor (fastpath.yaml).
+
+    This is distinct from sidecars.yaml: the fastpath model runs
+    automatically on every request via /internal/fastpath/route and
+    /internal/fastpath/verify. A sidecars.yaml entry, by contrast, does
+    nothing until a workflow phase explicitly opts in with
+    `execution_kind: sidecar_call` and `sidecar: <id>`.
+    """
+    print("\n=== Sidecar & fastpath models: coprocessor ===")
+    raw = _read_yaml(config_dir / "fastpath.yaml")
+    fastpath = raw.setdefault("fastpath", {})
+    if not isinstance(fastpath, dict):
+        fastpath = {}
+        raw["fastpath"] = fastpath
+    # registry._validate_cross_refs() rejects a write-tool-certified fastpath
+    # model outright ("fastpath model cannot be write-tool certified") -- but
+    # only at the NEXT registry load. Without filtering here, the wizard
+    # would happily save a choice that crashes the very next launch, the
+    # same failure mode this whole session has been chasing.
+    choices = [
+        item for item in _model_choices(registry)
+        if not registry.get_model(item[0]).capabilities.write_tool_certified
+    ]
+    if not choices:
+        raise RuntimeError("No enabled credential-backed model is available for the fastpath coprocessor.")
+    previous_model = str(fastpath.get("model_id") or "")
+    model_id = _choose_model("Fastpath coprocessor model", choices, previous_model)
+    model = registry.get_model(model_id)
+    endpoints = [("auto", "registry endpoint selection")]
+    endpoints.extend((endpoint_id, f"configured {endpoint.backend} endpoint") for endpoint_id, endpoint in sorted(model.endpoints.items()))
+    endpoint = _choose(
+        f"Fastpath endpoint for {model_id}", endpoints,
+        next((i for i, item in enumerate(endpoints, 1) if item[0] == fastpath.get("endpoint", "auto")), 1),
+    )
+    fastpath["model_id"] = model_id
+    fastpath["endpoint"] = endpoint
+    fastpath.setdefault("enabled", True)
+    fastpath.setdefault("modes", ["route", "verify"])
+    # FastpathConfigSpec.timeout_seconds caps at 30 (gt=0, le=30) -- the
+    # schema is the source of truth, not a second hardcoded bound here.
+    fastpath["timeout_seconds"] = _prompt_float(
+        "Fastpath timeout seconds", float(fastpath.get("timeout_seconds", 5)), 1, 30,
+    )
+    _write_yaml(config_dir / "fastpath.yaml", raw)
+    print(f"Saved fastpath coprocessor config to {config_dir / 'fastpath.yaml'}.")
 
 
 def configure_sidecar(config_dir: Path, registry: ModelRegistry) -> None:
+    print("\n=== Sidecar & fastpath models: named sidecar (dormant until a workflow phase references it) ===")
     raw = _read_yaml(config_dir / "sidecars.yaml")
     sidecars = raw.setdefault("sidecars", {})
     if not isinstance(sidecars, dict):
@@ -529,60 +793,86 @@ def show_saved(config_dir: Path, provider_keys: tuple[str, ...]) -> None:
             names = slot_names(key, config_dir)
             if names:
                 print(f"  {key} slots: {', '.join(names)}")
-    for kind, filename, key in (("sidecar", "sidecars.yaml", "sidecars"), ("inference profile", "profiles.yaml", "profiles")):
-        entries = _read_yaml(config_dir / filename).get(key) or {}
-        print(f"\nSaved {kind}s:")
-        for entry_id, value in sorted(entries.items()):
-            if kind == "sidecar":
-                print(f"  {entry_id}: model={value.get('model_id')} mode={value.get('mode', 'structured')} enabled={value.get('enabled', True)}")
+    print("\nMain models -- controller + recon/implementer/adversary/repairer")
+    profiles = _read_yaml(config_dir / "profiles.yaml").get("profiles") or {}
+    for profile_id, value in sorted(profiles.items()):
+        print(f"  {profile_id}:")
+        print(f"    controller: {value.get('controller_model', 'Claude/default')}")
+        for role in _ROLES:
+            role_value = value.get(role)
+            if isinstance(role_value, dict):
+                model = role_value.get("model", "(unset)")
+                fallbacks = role_value.get("fallback_models") or []
+                suffix = f" (fallbacks: {', '.join(fallbacks)})" if fallbacks else ""
             else:
-                print(f"  {entry_id}: controller={value.get('controller_model', 'Claude/default')}")
-        if not entries:
-            print("  (none)")
+                model = role_value or "(unset)"
+                suffix = ""
+            print(f"    {role}: {model}{suffix}")
+    if not profiles:
+        print("  (none)")
+
+    print("\nSidecar & fastpath models -- coprocessor + workflow-triggered specialists")
+    fastpath = _read_yaml(config_dir / "fastpath.yaml").get("fastpath") or {}
+    if fastpath:
+        print(f"  fastpath coprocessor: model={fastpath.get('model_id', '(unset)')} enabled={fastpath.get('enabled', True)} modes={fastpath.get('modes', [])}")
+    else:
+        print("  fastpath coprocessor: (not configured)")
+    sidecars = _read_yaml(config_dir / "sidecars.yaml").get("sidecars") or {}
+    for sidecar_id, value in sorted(sidecars.items()):
+        print(f"  sidecar '{sidecar_id}': model={value.get('model_id')} mode={value.get('mode', 'structured')} enabled={value.get('enabled', True)} (dormant unless a workflow phase references it)")
+    if not sidecars:
+        print("  named sidecars: (none)")
 
 
 def menu(config_dir: Path) -> int:
     registry, provider_keys = _load_registry(config_dir)
     while True:
         print("\nClaudeBrigade saved configuration")
-        print("  1. Add/edit provider API key")
-        print("  2. Import already-loaded environment keys")
-        print("  3. Create/edit sidecar")
-        print("  4. Create/edit inference profile")
+        print("\nMain models -- controller + recon/implementer/adversary/repairer")
+        print("  1. Create/edit inference profile (models, endpoints, fallbacks)")
+        print("  2. Delete inference profile")
+        print("\nSidecar & fastpath models -- coprocessor + workflow-triggered specialists")
+        print("  3. Configure fastpath coprocessor (always-on route/verify model)")
+        print("  4. Create/edit sidecar (dormant until a workflow phase references it)")
         print("  5. Delete sidecar")
-        print("  6. Delete inference profile")
-        print("  7. Refresh provider model catalogs")
-        print("  8. Show saved configurations")
+        print("\nProviders & credentials")
+        print("  6. Add/edit provider API key")
+        print("  7. Import already-loaded environment keys")
+        print("  8. Refresh provider model catalogs")
+        print("\n  9. Show saved configuration")
         print("  q. Quit")
         choice = input("Choose: ").strip().lower()
         try:
             if choice == "1":
-                configure_keys(config_dir, registry)
+                configure_inference(config_dir, registry)
                 registry, provider_keys = _load_registry(config_dir)
             elif choice == "2":
-                import_environment_credentials(config_dir, registry)
+                _delete_saved(config_dir, kind="inference profile")
                 registry, provider_keys = _load_registry(config_dir)
             elif choice == "3":
-                configure_sidecar(config_dir, registry)
+                configure_fastpath(config_dir, registry)
                 registry, provider_keys = _load_registry(config_dir)
             elif choice == "4":
-                configure_inference(config_dir, registry)
+                configure_sidecar(config_dir, registry)
                 registry, provider_keys = _load_registry(config_dir)
             elif choice == "5":
                 _delete_saved(config_dir, kind="sidecar")
                 registry, provider_keys = _load_registry(config_dir)
             elif choice == "6":
-                _delete_saved(config_dir, kind="inference profile")
+                configure_keys(config_dir, registry)
                 registry, provider_keys = _load_registry(config_dir)
             elif choice == "7":
-                refresh_catalogs(registry)
+                import_environment_credentials(config_dir, registry)
                 registry, provider_keys = _load_registry(config_dir)
             elif choice == "8":
+                refresh_catalogs(registry)
+                registry, provider_keys = _load_registry(config_dir)
+            elif choice == "9":
                 show_saved(config_dir, provider_keys)
             elif choice in {"q", "quit", "exit"}:
                 return 0
             else:
-                print("Choose 1-8 or q.")
+                print("Choose 1-9 or q.")
         except (EOFError, KeyboardInterrupt):
             print()
             return 0
@@ -592,7 +882,7 @@ def menu(config_dir: Path) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Interactively manage saved ClaudeBrigade inference and sidecar configuration")
-    parser.add_argument("command", nargs="?", choices=("menu", "keys", "import-env", "refresh", "sidecar", "inference", "show"), default="menu")
+    parser.add_argument("command", nargs="?", choices=("menu", "keys", "import-env", "refresh", "sidecar", "inference", "fastpath", "show"), default="menu")
     parser.add_argument("--config-dir", help="BRIGADE_CONFIG_DIR override")
     args = parser.parse_args(argv)
     config_dir = _config_dir(args.config_dir)
@@ -610,6 +900,8 @@ def main(argv: list[str] | None = None) -> int:
             configure_sidecar(config_dir, registry)
         elif args.command == "inference":
             configure_inference(config_dir, registry)
+        elif args.command == "fastpath":
+            configure_fastpath(config_dir, registry)
         else:
             show_saved(config_dir, provider_keys)
     except (EOFError, KeyboardInterrupt):

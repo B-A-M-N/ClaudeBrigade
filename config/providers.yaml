@@ -160,6 +160,7 @@ providers:
     discovery:
       type: openai-models
       url: https://router.requesty.ai/v1/models
+      free_only: true
     limits:
       max_concurrency: 2
       max_queued_agents: 4

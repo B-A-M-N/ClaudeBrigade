@@ -26,6 +26,8 @@ from enhanced_router.config_models import ModelSpec
 
 def generate_litellm_config(
     models: dict[str, ModelSpec],
+    *,
+    referenced_ids: set[str] | None = None,
 ) -> str:
     """Generate a LiteLLM proxy YAML configuration string.
 
@@ -33,6 +35,14 @@ def generate_litellm_config(
     ----------
     models :
         Registry model definitions (already validated and loaded).
+    referenced_ids :
+        When given, discovered-catalog models (``catalog_source ==
+        "discovered"``) not in this set are skipped -- provider discovery can
+        add hundreds of models, and registering all of them with the LiteLLM
+        child process needlessly costs minutes of startup time for models
+        nothing has ever been assigned to use. Bundled/operator models are
+        always included regardless of this filter. ``None`` (the default)
+        includes everything, matching prior behavior.
 
     Returns
     -------
@@ -48,6 +58,12 @@ def generate_litellm_config(
 
     for model_id, spec in sorted(models.items()):
         if not spec.enabled:
+            continue
+        if (
+            referenced_ids is not None
+            and spec.catalog_source == "discovered"
+            and model_id not in referenced_ids
+        ):
             continue
 
         endpoint_specs = spec.endpoints or {"default": spec}

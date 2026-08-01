@@ -98,22 +98,34 @@ def _find_free_port(start: int = 18000) -> int:
 async def _health_probe(
     port: int,
     *,
+    api_key: str | None = None,
     timeout: float = 5.0,
     retries: int = 30,
     interval: float = 0.2,
 ) -> bool:
     """Probe a LiteLLM child's ``/health`` endpoint.
 
+    LiteLLM's proxy runs its ``user_api_key_auth`` dependency on ``/health``
+    the same as any other route, so an unauthenticated probe hits the
+    "no api key passed in" branch of its auth error handler -- which in turn
+    unconditionally imports the optional ``prisma`` package to classify the
+    error, and raises ``ModuleNotFoundError`` when it isn't installed. That
+    turns what should be a clean 401 into a 500, masking a merely-missing
+    header as a child-startup failure. Sending the configured master key
+    avoids that branch entirely.
+
     Returns ``True`` if the child responds with HTTP 200 within the retry
     budget.  ``False`` if all retries are exhausted.
     """
     import httpx
 
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
         for attempt in range(retries):
             try:
                 resp = await client.get(
                     f"http://127.0.0.1:{port}/health",
+                    headers=headers,
                 )
                 if resp.status_code == 200:
                     return True
@@ -329,7 +341,7 @@ class LiteLLMSupervisor:
         )
 
         # Health probe
-        healthy = await _health_probe(port)
+        healthy = await _health_probe(port, api_key=self._litellm_key)
         if not healthy:
             self._state.update_litellm_deployment(dep_id, status="failed")
             # Clean up the process tracking entry

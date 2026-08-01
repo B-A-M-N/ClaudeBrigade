@@ -480,6 +480,13 @@ class ModelRegistry:
             provider = self._providers.get(provider_id)
             api_base = provider.endpoints.get(endpoint_id) if provider else None
             api_key_env = provider.api_key_env if provider else None
+            # A prior session may have explicitly granted this model a role
+            # (see config_cli.configure_inference's discovered-model grant
+            # path). Re-discovery must not silently revoke that -- only the
+            # catalog-sourced metadata (context/output limits, display name)
+            # should refresh here.
+            previous = models.get(model_id) or {}
+            previous_caps = previous.get("capabilities") or {}
             models[model_id] = {
                 "display_name": str(getattr(entry, "display_name", None) or model_id),
                 "catalog_source": "discovered",
@@ -490,16 +497,16 @@ class ModelRegistry:
                 "api_key_env": api_key_env,
                 "provider_id": provider_id,
                 "capabilities": {
-                    "tools": False,
-                    "mutation": False,
-                    "read_tool_certified": False,
-                    "write_tool_certified": False,
+                    "tools": bool(previous_caps.get("tools", False)),
+                    "mutation": bool(previous_caps.get("mutation", False)),
+                    "read_tool_certified": bool(previous_caps.get("read_tool_certified", False)),
+                    "write_tool_certified": bool(previous_caps.get("write_tool_certified", False)),
                     "context_tokens": getattr(entry, "context_tokens", None),
                     "max_output_tokens": getattr(entry, "max_output_tokens", None),
                     "openai_chat_completions": True,
                     "streaming": True,
                 },
-                "allowed_roles": [],
+                "allowed_roles": list(previous.get("allowed_roles") or []),
                 "endpoints": {
                     endpoint_id: {
                         "backend": "litellm",
@@ -743,6 +750,38 @@ class ModelRegistry:
             for model_id, spec in sorted(self._models.items())
             if spec.enabled and spec.capabilities.controller_eligible
         ]
+
+    def referenced_model_ids(self) -> set[str]:
+        """Return every model_id actually assigned somewhere (profile/sidecar/fastpath).
+
+        Provider discovery can add hundreds of models to the registry, but
+        only a handful are ever actually assigned to a role, the controller,
+        a sidecar, or fastpath. Registering all of them with the LiteLLM
+        child process anyway means minutes of unnecessary model
+        registration at every child startup for models nothing will ever
+        call. This is used to filter the LiteLLM config down to what's
+        actually in use; it is not a general-purpose "is this model good"
+        check, so callers that want the full catalog (e.g. tests) simply
+        don't apply it.
+        """
+        ids: set[str] = set()
+        for profile in self._profiles.values():
+            if profile.controller_model:
+                ids.add(profile.controller_model)
+            for role in ("recon", "implementer", "adversary", "repairer"):
+                target = getattr(profile, role)
+                if isinstance(target, str):
+                    ids.add(target)
+                else:
+                    ids.add(target.model)
+                    ids.update(target.fallback_models)
+            for specialist in profile.specialists.values():
+                ids.add(specialist.model)
+        for sidecar in self._sidecars.values():
+            ids.add(sidecar.model_id)
+        if self._fastpath is not None:
+            ids.add(self._fastpath.model_id)
+        return ids
 
     def get_profile(self, profile_id: str) -> ProfileSpec:
         """Return the ``ProfileSpec`` for *profile_id* or raise."""

@@ -58,6 +58,41 @@ def test_create_run_idempotent(state: RouteState):
     assert r2["claude_session_id"] == "s1"  # first value wins
 
 
+def test_create_run_accepts_launch_selection(state: RouteState):
+    result = state.create_run(
+        "run-sel", inference_profile_id="local-build", sidecar_profile_id="cheap-review",
+        launch_preset_id="local-build-cheap-review",
+    )
+    assert result["inference_profile_id"] == "local-build"
+    assert result["sidecar_profile_id"] == "cheap-review"
+    assert result["launch_preset_id"] == "local-build-cheap-review"
+    row = state.get_run("run-sel")
+    assert row is not None
+    assert row["inference_profile_id"] == "local-build"
+
+
+def test_set_run_selection_overwrites_after_creation(state: RouteState):
+    """The launcher pre-registers a run before the wizard runs, then updates
+    the selection once config selection is final -- this must overwrite the
+    earlier (absent) value, unlike create_run's COALESCE-guarded insert.
+    """
+    state.create_run("run-late-select")
+    assert state.get_run("run-late-select")["inference_profile_id"] is None  # type: ignore[index]
+
+    updated = state.set_run_selection("run-late-select", inference_profile_id="cloud-build")
+    assert updated is not None
+    assert updated["inference_profile_id"] == "cloud-build"
+
+    again = state.set_run_selection("run-late-select", sidecar_profile_id="deep-review")
+    assert again is not None
+    assert again["inference_profile_id"] == "cloud-build"  # untouched field preserved
+    assert again["sidecar_profile_id"] == "deep-review"
+
+
+def test_set_run_selection_unknown_run_returns_none(state: RouteState):
+    assert state.set_run_selection("no-such-run", inference_profile_id="x") is None
+
+
 # ================================================================== Epoch lifecycle
 # ==================================================================
 
@@ -972,7 +1007,7 @@ def test_v29_to_current_adds_binding_and_group_columns(tmp_path: Path):
         assert "configuration_hash" in columns
         assert "routing_mode" in columns
         assert "deployment_group" in columns
-        assert version == 36
+        assert version == 38
     finally:
         conn.close()
 

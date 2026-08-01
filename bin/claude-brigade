@@ -338,6 +338,192 @@ sys.exit(0)
 PY
 }
 
+# ---------------------------------------------------------------------------
+# Controller selection and conflicting CLI flags
+# ---------------------------------------------------------------------------
+
+# --model is deliberately passed through: Claude Code's active main model is
+# the controller. --controller-model is a Brigade-friendly spelling that is
+# translated to the same Claude Code flag.
+CLAUDE_ARGS=()
+CONTROLLER_MODEL=""
+BRIGADE_PROFILE="${CLAUDE_BRIGADE_PROFILE:-}"
+while [ "$#" -gt 0 ]; do
+  argument="$1"
+  case "$argument" in
+    --controller-model=*)
+      CONTROLLER_MODEL="${argument#*=}"
+      ;;
+    --controller-model)
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "--controller-model requires a model ID" >&2
+        exit 2
+      fi
+      CONTROLLER_MODEL="$1"
+      ;;
+    --brigade-profile=*)
+      BRIGADE_PROFILE="${argument#*=}"
+      ;;
+    --brigade-profile)
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "--brigade-profile requires a saved profile ID" >&2
+        exit 2
+      fi
+      BRIGADE_PROFILE="$1"
+      ;;
+    --model=*)
+      requested_model="${argument#*=}"
+      CLAUDE_ARGS+=("--model" "$requested_model")
+      ;;
+    --model)
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "--model requires a model ID" >&2
+        exit 2
+      fi
+      requested_model="$1"
+      CLAUDE_ARGS+=("--model" "$requested_model")
+      ;;
+    --agent|--agent=*|--agents|--agents=*|--fallback-model|--fallback-model=*|--system-prompt|--system-prompt=*|--system-prompt-file|--system-prompt-file=*|--append-system-prompt-file|--append-system-prompt-file=*|--settings|--settings=*|--setting-sources|--setting-sources=*|--permission-mode|--permission-mode=*|--dangerously-skip-permissions|--allow-dangerously-skip-permissions)
+      echo "claude-brigade owns $argument to preserve the agent and system contract." >&2
+      echo "Use --model or --controller-model to select the active controller." >&2
+      exit 2
+      ;;
+    *)
+      CLAUDE_ARGS+=("$argument")
+      ;;
+  esac
+  shift
+done
+
+# ---------------------------------------------------------------------------
+# Startup choice: default launch, or configure own inference
+#
+# Plain `claude-brigade` (no --model / --controller-model / --brigade-profile)
+# stops here and asks once, up front, before anything else happens.
+# Answering "default" launches exactly like before -- no catalog refresh, no
+# further prompts. Answering "configure" refreshes live catalogs for every
+# credential-backed discovery provider (OpenRouter, Kilo Code, NVIDIA,
+# Requesty, FreeTheAI, FreeModel, ...), then walks through the full
+# controller + recon/implementer/adversary/repairer + fallback-chain wizard
+# (the same one `claude-brigade-config inference` runs, with search built
+# in), then optionally the fastpath sidecar models too. The result is saved
+# as a named profile and used for this launch.
+# ---------------------------------------------------------------------------
+
+if [ -z "$CONTROLLER_MODEL" ] && [ -z "${requested_model:-}" ] && [ -z "$BRIGADE_PROFILE" ] && [ -t 0 ]; then
+  echo "Start with:" >&2
+  echo "  1) Default -- Claude Code + FreeInference sidecar as configured" >&2
+  echo "  2) Configure your own controller/role models, fallbacks, and sidecar" >&2
+  printf 'Choice [1]: ' >&2
+  read -r _startup_choice || _startup_choice=""
+  if [ "$_startup_choice" = "2" ]; then
+    _wizard_profile_file="$(mktemp)"
+    _wizard_script_file="$(mktemp --suffix=.py)"
+    cat > "$_wizard_script_file" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+from enhanced_router.config_cli import _load_registry, configure_fastpath, configure_inference, refresh_catalogs
+
+out_path = Path(sys.argv[1])
+config_dir = Path(os.environ["BRIGADE_CONFIG_DIR"])
+
+registry, _ = _load_registry(config_dir)
+print("Refreshing live model catalogs for credential-backed providers...\n")
+refresh_catalogs(registry)
+print()
+
+# Reload so newly discovered models are selectable in the wizard below.
+registry, _ = _load_registry(config_dir)
+try:
+    profile_id = configure_inference(config_dir, registry)
+    print()
+    if input("Configure the fastpath coprocessor model too (the always-on route/verify model, e.g. DiffusionGemma)? [y/N]: ").strip().lower() == "y":
+        registry, _ = _load_registry(config_dir)
+        configure_fastpath(config_dir, registry)
+        print()
+except (EOFError, KeyboardInterrupt):
+    print()
+    sys.exit(0)
+out_path.write_text(profile_id)
+PY
+    # Run from a real file, not `python - <<heredoc`: piping the script's
+    # own source through stdin leaves nothing on stdin for the wizard's
+    # input() calls to read -- they hit EOF immediately, which silently
+    # aborted the whole wizard (caught by the except EOFError below) and
+    # fell straight through to launching Claude Code with no prompts at all.
+    BRIGADE_CONFIG_DIR="$CONFIG_DIR" PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" \
+      "$_wizard_script_file" "$_wizard_profile_file" < /dev/tty || true
+    rm -f "$_wizard_script_file"
+    if [ -s "$_wizard_profile_file" ]; then
+      BRIGADE_PROFILE="$(cat "$_wizard_profile_file")"
+    fi
+    rm -f "$_wizard_profile_file"
+  fi
+fi
+
+if [ -n "$BRIGADE_PROFILE" ]; then
+  export CLAUDE_BRIGADE_PROFILE="$BRIGADE_PROFILE"
+  # The env var only reaches this process tree; the run row is what a
+  # shared router daemon actually consults (hooks/user_prompt_submit.py
+  # reads state.get_run(run_id) first, falling back to this env var only
+  # for a run that was never given an explicit selection).
+  BRIGADE_CONFIG_DIR="$CONFIG_DIR" PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" - "$RUN_ID" "$BRIGADE_PROFILE" <<'PY' 2>/dev/null || true
+import sys
+from enhanced_router.state import get_state
+get_state().set_run_selection(sys.argv[1], inference_profile_id=sys.argv[2])
+PY
+fi
+
+if [ -n "$CONTROLLER_MODEL" ]; then
+  CLAUDE_ARGS+=(--model "$CONTROLLER_MODEL")
+  requested_model="$CONTROLLER_MODEL"
+fi
+
+if [ -z "${requested_model:-}" ] && [ -n "$BRIGADE_PROFILE" ]; then
+  profile_controller="$(BRIGADE_CONFIG_DIR="$CONFIG_DIR" PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" - "$BRIGADE_PROFILE" <<'PY'
+import sys
+from enhanced_router.registry import get_registry
+
+profile_id = sys.argv[1]
+profile = get_registry().get_profile(profile_id)
+print(profile.controller_model or "")
+PY
+)" || {
+    echo "Unable to load saved Brigade profile '$BRIGADE_PROFILE'." >&2
+    exit 2
+  }
+  if [ -n "$profile_controller" ]; then
+    CLAUDE_ARGS+=(--model "$profile_controller")
+    requested_model="$profile_controller"
+  fi
+fi
+
+if [ -n "${requested_model:-}" ]; then
+  if ! PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" - "$requested_model" <<'PY'
+import sys
+from enhanced_router.registry import get_registry
+
+model_id = sys.argv[1]
+registry = get_registry()
+try:
+    spec = registry.get_model(model_id)
+except KeyError as exc:
+    raise SystemExit(f"controller model '{model_id}' is not present in the active registry") from exc
+if not spec.enabled:
+    raise SystemExit(f"controller model '{model_id}' is disabled")
+if not (spec.capabilities.controller_eligible or spec.backend == "anthropic-passthrough"):
+    raise SystemExit(f"controller model '{model_id}' is not controller-compatible")
+PY
+  then
+    exit 2
+  fi
+fi
+
 acquire_lock
 
 health_url="http://127.0.0.1:${PORT}/healthz"
@@ -382,9 +568,9 @@ if [[ -n "$HEALTHZ_RESPONSE" ]]; then
       PYTHONPATH="$APP_DIR/router" \
       "$APP_DIR/venv/bin/python" -m uvicorn enhanced_router.app:app \
         --host 127.0.0.1 --port "$PORT" --no-access-log \
-        >"$CACHE_DIR/router.log" 2>&1 &
+        >"$CACHE_DIR/router.log" 2>&1 200>&- &
     echo $! >"$CACHE_DIR/router.pid"
-    for _ in {1..50}; do
+    for _ in {1..300}; do
       if curl -fsS -H "X-Enhanced-Token: $ROUTER_TOKEN" "$health_url" > /dev/null 2>&1; then
         break
       fi
@@ -417,9 +603,9 @@ else
     PYTHONPATH="$APP_DIR/router" \
     "$APP_DIR/venv/bin/python" -m uvicorn enhanced_router.app:app \
       --host 127.0.0.1 --port "$PORT" --no-access-log \
-      >"$CACHE_DIR/router.log" 2>&1 &
+      >"$CACHE_DIR/router.log" 2>&1 200>&- &
   echo $! >"$CACHE_DIR/router.pid"
-  for _ in {1..50}; do
+  for _ in {1..300}; do
     if curl -fsS -H "X-Enhanced-Token: $ROUTER_TOKEN" "$health_url" > /dev/null 2>&1; then
       break
     fi
@@ -515,114 +701,6 @@ export ANTHROPIC_CUSTOM_HEADERS="$(
     "$RUN_ID"
 )"
 
-# ---------------------------------------------------------------------------
-# Controller selection and conflicting CLI flags
-# ---------------------------------------------------------------------------
-
-# --model is deliberately passed through: Claude Code's active main model is
-# the controller. --controller-model is a Brigade-friendly spelling that is
-# translated to the same Claude Code flag.
-CLAUDE_ARGS=()
-CONTROLLER_MODEL=""
-BRIGADE_PROFILE="${CLAUDE_BRIGADE_PROFILE:-}"
-while [ "$#" -gt 0 ]; do
-  argument="$1"
-  case "$argument" in
-    --controller-model=*)
-      CONTROLLER_MODEL="${argument#*=}"
-      ;;
-    --controller-model)
-      shift
-      if [ "$#" -eq 0 ]; then
-        echo "--controller-model requires a model ID" >&2
-        exit 2
-      fi
-      CONTROLLER_MODEL="$1"
-      ;;
-    --brigade-profile=*)
-      BRIGADE_PROFILE="${argument#*=}"
-      ;;
-    --brigade-profile)
-      shift
-      if [ "$#" -eq 0 ]; then
-        echo "--brigade-profile requires a saved profile ID" >&2
-        exit 2
-      fi
-      BRIGADE_PROFILE="$1"
-      ;;
-    --model=*)
-      requested_model="${argument#*=}"
-      CLAUDE_ARGS+=("--model" "$requested_model")
-      ;;
-    --model)
-      shift
-      if [ "$#" -eq 0 ]; then
-        echo "--model requires a model ID" >&2
-        exit 2
-      fi
-      requested_model="$1"
-      CLAUDE_ARGS+=("--model" "$requested_model")
-      ;;
-    --agent|--agent=*|--agents|--agents=*|--fallback-model|--fallback-model=*|--system-prompt|--system-prompt=*|--system-prompt-file|--system-prompt-file=*|--append-system-prompt-file|--append-system-prompt-file=*|--settings|--settings=*|--setting-sources|--setting-sources=*|--permission-mode|--permission-mode=*|--dangerously-skip-permissions|--allow-dangerously-skip-permissions)
-      echo "claude-brigade owns $argument to preserve the agent and system contract." >&2
-      echo "Use --model or --controller-model to select the active controller." >&2
-      exit 2
-      ;;
-    *)
-      CLAUDE_ARGS+=("$argument")
-      ;;
-  esac
-  shift
-done
-
-if [ -n "$BRIGADE_PROFILE" ]; then
-  export CLAUDE_BRIGADE_PROFILE="$BRIGADE_PROFILE"
-fi
-
-if [ -n "$CONTROLLER_MODEL" ]; then
-  CLAUDE_ARGS+=(--model "$CONTROLLER_MODEL")
-  requested_model="$CONTROLLER_MODEL"
-fi
-
-if [ -z "${requested_model:-}" ] && [ -n "$BRIGADE_PROFILE" ]; then
-  profile_controller="$(BRIGADE_CONFIG_DIR="$CONFIG_DIR" PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" - "$BRIGADE_PROFILE" <<'PY'
-import sys
-from enhanced_router.registry import get_registry
-
-profile_id = sys.argv[1]
-profile = get_registry().get_profile(profile_id)
-print(profile.controller_model or "")
-PY
-)" || {
-    echo "Unable to load saved Brigade profile '$BRIGADE_PROFILE'." >&2
-    exit 2
-  }
-  if [ -n "$profile_controller" ]; then
-    CLAUDE_ARGS+=(--model "$profile_controller")
-    requested_model="$profile_controller"
-  fi
-fi
-
-if [ -n "${requested_model:-}" ]; then
-  if ! PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" - "$requested_model" <<'PY'
-import sys
-from enhanced_router.registry import get_registry
-
-model_id = sys.argv[1]
-registry = get_registry()
-try:
-    spec = registry.get_model(model_id)
-except KeyError as exc:
-    raise SystemExit(f"controller model '{model_id}' is not present in the active registry") from exc
-if not spec.enabled:
-    raise SystemExit(f"controller model '{model_id}' is disabled")
-if not (spec.capabilities.controller_eligible or spec.backend == "anthropic-passthrough"):
-    raise SystemExit(f"controller model '{model_id}' is not controller-compatible")
-PY
-  then
-    exit 2
-  fi
-fi
 
 # ---------------------------------------------------------------------------
 # Agents JSON

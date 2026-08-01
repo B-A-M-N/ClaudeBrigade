@@ -735,7 +735,7 @@ async def reload_catalog(
 
     from enhanced_router.litellm_config import generate_litellm_config
 
-    config_text = generate_litellm_config(registry.models)
+    config_text = generate_litellm_config(registry.models, referenced_ids=registry.referenced_model_ids())
 
     try:
         result = await _litellm_supervisor_instance.reload(

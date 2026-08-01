@@ -72,7 +72,7 @@ async def _init_litellm_supervisor(app: FastAPI) -> None:
     try:
         registry = get_registry()
         reg_hash = registry.registry_hash()
-        config_text = generate_litellm_config(registry.models)
+        config_text = generate_litellm_config(registry.models, referenced_ids=registry.referenced_model_ids())
 
         if registry.models and any(
             s.has_litellm_endpoint() and s.enabled

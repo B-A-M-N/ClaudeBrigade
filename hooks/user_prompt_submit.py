@@ -97,7 +97,19 @@ def main() -> int:
 
     active = state.get_active_epoch(run_id)
     if active is None:
-        profile_id = os.environ.get("BRIGADE_DEFAULT_PROFILE", "hybrid")
+        # The run row is the authoritative source: a shared router daemon can
+        # serve multiple concurrent runs, each launched with its own
+        # selection, and CLAUDE_BRIGADE_PROFILE only reaches the single
+        # process tree that inherited it from whichever launcher invocation
+        # started this particular session. The env var remains a fallback
+        # for a run that was never given an explicit selection (e.g. created
+        # directly rather than through the launcher's wizard).
+        run_row = state.get_run(run_id)
+        profile_id = (
+            (run_row.get("inference_profile_id") if run_row else None)
+            or os.environ.get("CLAUDE_BRIGADE_PROFILE")
+            or "hybrid"
+        )
         contract = state.begin_task(
             run_id=run_id,
             session_id=session,

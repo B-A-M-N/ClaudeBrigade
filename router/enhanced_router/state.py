@@ -315,6 +315,9 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA user_version = 36")
     if current < 37 and _needs_v37_hardening(conn):
         _migrate_v37(conn)
+    if current < 38:
+        _migrate_v38(conn)
+        conn.execute("PRAGMA user_version = 38")
 
 
 def _needs_v37_hardening(conn: sqlite3.Connection) -> bool:
@@ -1272,6 +1275,21 @@ def _migrate_v36(conn: sqlite3.Connection) -> None:
     """Persist all provider candidates for managed deployment groups."""
     _add_column_if_missing(conn, "agent_bindings", "provider_ids_json", "TEXT")
     _add_column_if_missing(conn, "controller_bindings", "provider_ids_json", "TEXT")
+
+
+def _migrate_v38(conn: sqlite3.Connection) -> None:
+    """Persist each run's own launch selection.
+
+    The launcher exported CLAUDE_BRIGADE_PROFILE as a process environment
+    variable, which only reaches the single controller session that inherited
+    it -- a shared router daemon serving multiple concurrent runs has no way
+    to know which profile a given hook invocation's run actually selected.
+    Persisting the selection on the run row itself makes it authoritative and
+    queryable independent of the launching process's environment.
+    """
+    _add_column_if_missing(conn, "runs", "inference_profile_id", "TEXT")
+    _add_column_if_missing(conn, "runs", "sidecar_profile_id", "TEXT")
+    _add_column_if_missing(conn, "runs", "launch_preset_id", "TEXT")
 
 
 def _migrate_v37(conn: sqlite3.Connection) -> None:
@@ -3859,26 +3877,39 @@ class RouteState:
         finally:
             conn.close()
 
+    _RUN_COLUMNS = (
+        "run_id", "claude_session_id", "cwd", "controller_capability_hash",
+        "inference_profile_id", "sidecar_profile_id", "launch_preset_id",
+        "created_at", "closed_at",
+    )
+
     def create_run(
         self,
         run_id: str,
         session_id: str | None = None,
         cwd: str | None = None,
         controller_capability: str | None = None,
+        inference_profile_id: str | None = None,
+        sidecar_profile_id: str | None = None,
+        launch_preset_id: str | None = None,
     ) -> dict:
         """Insert run if not exists (idempotent). Returns run dict."""
         conn = self._new_conn()
         try:
             conn.execute(
                 "INSERT OR IGNORE INTO runs "
-                "(run_id, claude_session_id, cwd, controller_capability_hash, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "(run_id, claude_session_id, cwd, controller_capability_hash, "
+                "inference_profile_id, sidecar_profile_id, launch_preset_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     session_id,
                     cwd,
                     hashlib.sha256(controller_capability.encode("utf-8")).hexdigest()
                     if controller_capability else None,
+                    inference_profile_id,
+                    sidecar_profile_id,
+                    launch_preset_id,
                     _utcnow(),
                 ),
             )
@@ -3897,21 +3928,62 @@ class RouteState:
                     "cwd=COALESCE(cwd, ?) WHERE run_id=?",
                     (session_id, cwd, run_id),
                 )
+            if inference_profile_id is not None or sidecar_profile_id is not None or launch_preset_id is not None:
+                conn.execute(
+                    "UPDATE runs SET "
+                    "inference_profile_id=COALESCE(inference_profile_id, ?), "
+                    "sidecar_profile_id=COALESCE(sidecar_profile_id, ?), "
+                    "launch_preset_id=COALESCE(launch_preset_id, ?) WHERE run_id=?",
+                    (inference_profile_id, sidecar_profile_id, launch_preset_id, run_id),
+                )
             conn.commit()
             row = conn.execute(
-                "SELECT run_id, claude_session_id, cwd, controller_capability_hash, "
-                "created_at, closed_at FROM runs WHERE run_id = ?",
+                f"SELECT {', '.join(self._RUN_COLUMNS)} FROM runs WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
             if row is None:
                 raise RuntimeError(f"Failed to create run {run_id}")
-            return dict(zip(
-                (
-                    "run_id", "claude_session_id", "cwd",
-                    "controller_capability_hash", "created_at", "closed_at",
-                ),
-                row,
-            ))
+            return dict(zip(self._RUN_COLUMNS, row))
+        finally:
+            conn.close()
+
+    def set_run_selection(
+        self,
+        run_id: str,
+        *,
+        inference_profile_id: str | None = None,
+        sidecar_profile_id: str | None = None,
+        launch_preset_id: str | None = None,
+    ) -> dict | None:
+        """Persist this run's launch selection as the authoritative record.
+
+        Unlike create_run's COALESCE-guarded insert (which only fills a value
+        the first time), this always overwrites -- the launcher calls it once
+        config selection is final, so a later call intentionally replaces an
+        earlier default. Only hooks reading get_run() should ever be treated
+        as authoritative for routing; a launcher-exported environment
+        variable only reaches the single process tree that inherited it,
+        which breaks down the moment a router daemon is shared by more than
+        one concurrent run.
+        """
+        conn = self._new_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                "UPDATE runs SET inference_profile_id=COALESCE(?, inference_profile_id), "
+                "sidecar_profile_id=COALESCE(?, sidecar_profile_id), "
+                "launch_preset_id=COALESCE(?, launch_preset_id) WHERE run_id=?",
+                (inference_profile_id, sidecar_profile_id, launch_preset_id, run_id),
+            )
+            if cursor.rowcount == 0:
+                conn.rollback()
+                return None
+            conn.commit()
+            row = conn.execute(
+                f"SELECT {', '.join(self._RUN_COLUMNS)} FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            return dict(zip(self._RUN_COLUMNS, row)) if row is not None else None
         finally:
             conn.close()
 
@@ -3919,19 +3991,12 @@ class RouteState:
         conn = self._new_conn()
         try:
             row = conn.execute(
-                "SELECT run_id, claude_session_id, cwd, controller_capability_hash, "
-                "created_at, closed_at FROM runs WHERE run_id = ?",
+                f"SELECT {', '.join(self._RUN_COLUMNS)} FROM runs WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
             if row is None:
                 return None
-            return dict(zip(
-                (
-                    "run_id", "claude_session_id", "cwd",
-                    "controller_capability_hash", "created_at", "closed_at",
-                ),
-                row,
-            ))
+            return dict(zip(self._RUN_COLUMNS, row))
         finally:
             conn.close()
 
