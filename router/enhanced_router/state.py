@@ -1723,7 +1723,6 @@ class RouteState:
         queued reservation: a denied Claude Code Agent call cannot be replayed
         by SQLite.  The controller asks again after a terminal lifecycle event.
         """
-        from enhanced_router.backends import ROLE_MODEL_BINDINGS
         from enhanced_router.registry import get_registry
 
         self.advance_conditional_phases(run_id, epoch_id)
@@ -1843,12 +1842,10 @@ class RouteState:
                     )
                 ):
                     continue
-                native_name = "controller-direct" if controller_phase else next(
-                    (
-                        name for name, bound_model in ROLE_MODEL_BINDINGS.items()
-                        if bound_model == model_id and name.startswith("brigade-")
-                    ),
-                    f"brigade-{role}",
+                native_name = (
+                    "controller-direct"
+                    if controller_phase
+                    else registry.native_agent_name(model_id, role)
                 )
                 if execution_kind == "sidecar_call" and not controller_phase:
                     native_name = f"sidecar-{role}"

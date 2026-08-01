@@ -132,6 +132,31 @@ def state_and_registry(
     return isolated_state, isolated_registry
 
 
+def _bind_test_controller(
+    state: RouteState,
+    registry: ModelRegistry,
+    run_id: str,
+    session_id: str = "test-session",
+) -> None:
+    """Create the binding required by controller-only MCP mutations."""
+    spec = registry.get_model("test-model")
+    state.bind_or_get_controller(
+        run_id=run_id,
+        client_session_id=session_id,
+        public_model="test-model",
+        registry_model_id="test-model",
+        backend=spec.backend,
+        upstream_model=spec.upstream_model,
+        provider_id=spec.provider_id,
+        api_base=spec.api_base,
+        catalog_generation=None,
+        registry_hash=registry.registry_hash(),
+        certification_id=None,
+        auth_spec_json=None,
+        api_key_env=spec.api_key_env,
+    )
+
+
 # ---------------------------------------------------------------------------
 # E2E: role alias resolution with full binding lifecycle
 # ---------------------------------------------------------------------------
@@ -447,6 +472,7 @@ def test_mcp_set_role_route_creates_route(state_and_registry: tuple):
     # Create run + epoch so MCP functions can find an active epoch
     state.create_run("test-run-1", session_id="test-session", cwd="/tmp")
     state.create_epoch_from_profile("test-run-1", "ep-mcp-1", "normal", "hybrid")
+    _bind_test_controller(state, registry, "test-run-1")
 
     from enhanced_router import mcp_control, registry as registry_mod
 
@@ -542,10 +568,11 @@ def test_mcp_select_profile_changes_all_routes(state_and_registry: tuple):
     # Reload profiles in the fixture's registry
     registry.load_profiles()
 
-    try:
-        state.create_run("test-run-4", session_id="test-session", cwd="/tmp")
-        state.create_epoch_from_profile("test-run-4", "ep-mcp-4", "normal", "hybrid")
+    state.create_run("test-run-4", session_id="test-session", cwd="/tmp")
+    state.create_epoch_from_profile("test-run-4", "ep-mcp-4", "normal", "hybrid")
+    _bind_test_controller(state, registry, "test-run-4")
 
+    try:
         mcp_control.set_current_run_id("test-run-4")
 
         try:
@@ -572,6 +599,7 @@ def test_mcp_record_binding_command_creates_command(state_and_registry: tuple):
 
     state.create_run("test-run-5", session_id="test-session", cwd="/tmp")
     state.create_epoch_from_profile("test-run-5", "ep-mcp-5", "normal", "hybrid")
+    _bind_test_controller(state, registry, "test-run-5")
 
     from enhanced_router import mcp_control
 
@@ -601,6 +629,7 @@ def test_mcp_apply_binding_command_changes_status(state_and_registry: tuple):
 
     state.create_run("test-run-6", session_id="test-session", cwd="/tmp")
     state.create_epoch_from_profile("test-run-6", "ep-mcp-6", "normal", "hybrid")
+    _bind_test_controller(state, registry, "test-run-6")
 
     from enhanced_router import mcp_control
 

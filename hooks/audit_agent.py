@@ -334,7 +334,6 @@ def main() -> int:
         try:
             from enhanced_router.registry import get_registry
             from enhanced_router.state import get_state
-            from enhanced_router.backends import ROLE_MODEL_BINDINGS
             state = get_state()
             epoch = state.get_active_epoch(run_id)
             if epoch is None:
@@ -342,9 +341,10 @@ def main() -> int:
             role = _role(agent_type)
             phase = state.prepare_agent_phase(run_id, epoch["epoch_id"], role, agent_id)
             route = state.get_role_route(run_id, epoch["epoch_id"], role) if role != "controller" else None
-            model_id = ROLE_MODEL_BINDINGS.get(
-                agent_type,
-                str(route.get("model_id")) if route else str(data.get("resolved_model") or "controller"),
+            model_id = (
+                str(route.get("model_id"))
+                if route
+                else str(data.get("resolved_model") or "controller")
             )
             spawn_intent: dict | None = None
             claim = state.get_pending_spawn_claim(  # type: ignore[attr-defined]

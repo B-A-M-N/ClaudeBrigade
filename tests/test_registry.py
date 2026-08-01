@@ -123,6 +123,19 @@ class TestModelRegistryLoad:
 
 
 class TestModelRegistryLookup:
+    def test_specialist_manifest_is_registry_backed(self):
+        repo_config = pathlib.Path(__file__).resolve().parents[1] / "config"
+        registry = ModelRegistry(repo_config)
+        registry.load_models()
+        registry.load_profiles()
+
+        aliases = registry.role_model_aliases()
+        bindings = registry.role_model_bindings()
+
+        assert aliases["anthropic-brigade-fi-qwen-scout"] == "recon"
+        assert bindings["brigade-fi-qwen-scout"] == "qwen3.6-35b"
+        assert registry.native_agent_name("glm-5.1", "adversary") == "brigade-fi-glm-adversary"
+
     def test_get_model(self, valid_registry):
         spec = valid_registry.get_model("model-a")
         assert spec.display_name == "Model A"

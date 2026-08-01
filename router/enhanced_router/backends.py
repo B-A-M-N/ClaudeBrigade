@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from enhanced_router.agent_manifest import GENERIC_ROLE_ALIASES
 from enhanced_router.base import HOP_BY_HOP
 from enhanced_router.config_models import ModelAuthSpec
 
@@ -195,34 +196,12 @@ class ResolvedRoute:
     controller_binding_id: int | None = None
 
 
-# Maps the public-facing model aliases to internal role strings.
-ROLE_MODEL_ALIASES: dict[str, str] = {
-    "anthropic-brigade-recon": "recon",
-    "anthropic-brigade-implementer": "implementer",
-    "anthropic-brigade-adversary": "adversary",
-    "anthropic-brigade-repairer": "repairer",
-    "anthropic-brigade-fi-qwen-scout": "recon",
-    "anthropic-brigade-fi-minimax-architect": "recon",
-    "anthropic-brigade-fi-kimi-implementer": "implementer",
-    "anthropic-brigade-fi-glm-adversary": "adversary",
-    "anthropic-brigade-fi-glm-fast-repairer": "repairer",
-}
-
-ROLE_MODEL_BINDINGS: dict[str, str] = {
-    # Claude Code supplies the agent definition name to lifecycle hooks and
-    # the public model alias to /v1/messages.  Both identify the same pinned
-    # specialist and must resolve identically.
-    "brigade-fi-qwen-scout": "qwen3.6-35b",
-    "brigade-fi-minimax-architect": "minimax-m3",
-    "brigade-fi-kimi-implementer": "kimi-k2.7-code",
-    "brigade-fi-glm-adversary": "glm-5.1",
-    "brigade-fi-glm-fast-repairer": "glm-5-turbo",
-    "anthropic-brigade-fi-qwen-scout": "qwen3.6-35b",
-    "anthropic-brigade-fi-minimax-architect": "minimax-m3",
-    "anthropic-brigade-fi-kimi-implementer": "kimi-k2.7-code",
-    "anthropic-brigade-fi-glm-adversary": "glm-5.1",
-    "anthropic-brigade-fi-glm-fast-repairer": "glm-5-turbo",
-}
+# Compatibility exports for callers that only need the four stable role
+# aliases.  Model-qualified identities are registry-owned; routing and
+# scheduling obtain them from ``ModelRegistry.role_model_aliases()`` and
+# ``ModelRegistry.role_model_bindings()``.
+ROLE_MODEL_ALIASES: dict[str, str] = dict(GENERIC_ROLE_ALIASES)
+ROLE_MODEL_BINDINGS: dict[str, str] = {}
 
 
 def parse_request_identity(request: Any) -> RequestIdentity:

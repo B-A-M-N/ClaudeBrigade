@@ -19,7 +19,6 @@ from enhanced_router.backends import (
     ResolvedRoute,
     RequestIdentity,
     ROLE_MODEL_ALIASES,
-    ROLE_MODEL_BINDINGS,
     UnsupportedBackendError,
 )
 from enhanced_router.registry import ModelRegistry
@@ -193,7 +192,19 @@ def resolve_request(
        a. Enforce the configured controller model policy.
        b. Return ANTHROPIC_PASSTHROUGH for standard Claude model IDs.
     """
-    role = ROLE_MODEL_ALIASES.get(public_model)
+    # Lazy imports to avoid circular import at module load time
+    try:
+        from enhanced_router.state import get_state
+        from enhanced_router.registry import get_registry
+    except ImportError:
+        raise HTTPException(
+            status_code=503,
+            detail="enhanced_router package is not available. Ensure it is installed.",
+        )
+
+    registry: ModelRegistry = get_registry()
+    state: RouteState = get_state()
+    role = registry.role_model_aliases().get(public_model, ROLE_MODEL_ALIASES.get(public_model))
 
     # Reject malformed native-agent requests before opening the SQLite state
     # database.  This keeps the identity contract deterministic even when the
@@ -206,19 +217,6 @@ def resolve_request(
                 "x-claude-code-agent-id headers."
             ),
         )
-
-    # Lazy imports to avoid circular import at module load time
-    try:
-        from enhanced_router.state import get_state
-        from enhanced_router.registry import get_registry
-    except ImportError:
-        raise HTTPException(
-            status_code=503,
-            detail="enhanced_router package is not available. Ensure it is installed.",
-        )
-
-    state: RouteState = get_state()
-    registry: ModelRegistry = get_registry()
 
     # ------------------------------------------------------------------
     # 1. Binding-first lookup (P0-1): check for existing binding BEFORE
@@ -290,7 +288,7 @@ def resolve_request(
                 detail=f"No route defined for role '{role}' in epoch {epoch_id}",
             )
 
-        model_id_value = ROLE_MODEL_BINDINGS.get(public_model, route["model_id"])
+        model_id_value = registry.role_model_bindings().get(public_model, route["model_id"])
         if not isinstance(model_id_value, str) or not model_id_value:
             raise HTTPException(status_code=500, detail=f"Role '{role}' has no model binding")
         model_id = model_id_value

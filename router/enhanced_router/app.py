@@ -19,7 +19,6 @@ from enhanced_router.backends import (
     BackendType,
     ResolvedRoute,
     ROLE_MODEL_ALIASES,
-    ROLE_MODEL_BINDINGS,
     parse_request_identity,
     proxy_direct_anthropic as _proxy_direct_anthropic_backend,
     proxy_litellm_messages as _proxy_litellm_messages_backend,
@@ -805,6 +804,8 @@ async def models(request: Request) -> dict[str, Any]:
     from enhanced_router.registry import get_registry
 
     registry = get_registry()
+    role_aliases = registry.role_model_aliases()
+    role_bindings = registry.role_model_bindings()
     entries: list[dict[str, Any]] = [
         {
             "id": model_id,
@@ -829,28 +830,26 @@ async def models(request: Request) -> dict[str, Any]:
     entries.extend(
         {
             "id": alias,
-            "display_name": f"Brigade {role.title()}",
+            "display_name": (
+                f"Brigade {alias.removeprefix('anthropic-brigade-').replace('-', ' ').title()}"
+            ),
             "type": "model",
-            "controller_eligible": False,
-            "status": "healthy",
-        }
-        for alias, role in sorted(ROLE_MODEL_ALIASES.items())
-    )
-    entries.extend(
-        {
-            "id": alias,
-            "display_name": f"Brigade {alias.removeprefix('anthropic-brigade-').replace('-', ' ').title()}",
-            "type": "model",
+            "alias_kind": "role",
+            "role": role,
             "provider": (
-                registry.models[ROLE_MODEL_BINDINGS[alias]].provider_id
-                if ROLE_MODEL_BINDINGS[alias] in registry.models
+                registry.models[role_bindings[alias]].provider_id
+                if alias in role_bindings and role_bindings[alias] in registry.models
                 else None
             ),
             "controller_eligible": False,
-            "status": "healthy",
-            "backing_model": ROLE_MODEL_BINDINGS[alias],
+            "status": "configured",
+            **(
+                {"backing_model": role_bindings[alias]}
+                if alias in role_bindings
+                else {}
+            ),
         }
-        for alias in sorted(ROLE_MODEL_BINDINGS)
+        for alias, role in sorted(role_aliases.items())
     )
     return {"data": entries, "has_more": False}
 
@@ -910,6 +909,8 @@ async def messages(request: Request) -> Response:
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(request: Request) -> Response:
     _require_local(request)
+    from enhanced_router.registry import get_registry
+
     try:
         payload = await request.json()
     except Exception as exc:
@@ -919,7 +920,7 @@ async def count_tokens(request: Request) -> Response:
     model = payload["model"]
 
     # Role aliases — local estimation only
-    if model in ROLE_MODEL_ALIASES:
+    if model in get_registry().role_model_aliases():
         return JSONResponse(
             status_code=404,
             content={

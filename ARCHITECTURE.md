@@ -70,7 +70,10 @@ response metadata and recorded against the request. A group must never hide
 provider identity from usage, health, concurrency, or audit state.
 
 Sidecars such as DiffusionGemma remain endpoint-bound advisory services. They
-do not become Claude Code agents and cannot mutate workflow state.
+do not become Claude Code agents and cannot mutate workflow authority. Bounded
+sidecar actions are nevertheless first-class persisted executions: they use
+the same provider admission, deadlines, retry policy, result validation, and
+execution-event surface as native workers.
 
 ## FreeInference endpoint policy
 
@@ -133,11 +136,12 @@ Provider settings are configurable in `config/providers.yaml` and may be
 overridden through the provider-specific environment variable. FreeInference
 credentials remain process-local.
 
-## Native-agent ownership
+## Execution lanes and native-agent ownership
 
-Every substantive specialist is a visible native Claude Code Agent. The
-router binds, authenticates, routes, meters, and records it; the router does
-not secretly fan out to several models and synthesize a hidden answer.
+Every repository-tool or mutation specialist is a visible native Claude Code
+Agent. Bounded read-only inference may use a visible Brigade sidecar instead.
+The router binds, authenticates, routes, meters, and records both; it does not
+secretly fan out to several models and synthesize a hidden answer.
 
 Model-qualified agents identify their logical assignment, for example:
 
@@ -148,7 +152,24 @@ brigade-fi-glm-adversary
 ```
 
 The native lifecycle hooks create and close authoritative SQLite execution
-records. JSONL is diagnostic evidence only.
+records. JSONL is diagnostic evidence only. The scheduler distinguishes three
+execution kinds:
+
+```text
+native_agent       visible Claude Code Agent with repository tools
+sidecar_call       bounded router-owned structured specialist call
+controller_action  controller-only integration/adjudication operation
+```
+
+Only the first kind is presented as a native Claude Code agent. Sidecars are
+shown explicitly in orchestration status and have no direct filesystem or
+workflow-authority capability.
+
+The registry owns model-qualified native identities. Profile specialist
+entries may declare a `native_agent_name` and `public_model_alias`; the
+launcher projects those entries into the Claude Code `--agents` manifest from
+the stable role definition. Routing, scheduling, hooks, `/v1/models`, and
+status use the same manifest rather than parallel model-name tables.
 
 ## Shadow workspaces and integration
 
@@ -202,9 +223,11 @@ specialist reaches a terminal lifecycle state, the controller asks again. A
 capacity-denied Agent call is rejected without creating a dead queued spawn
 intent.
 
-If automatic deferred spawning is ever required, it needs an external worker
-launcher/ACP executor that owns the replay operation. Native Claude Code
-Agent calls alone cannot provide that behavior.
+Native actions still require cooperative controller spawning because Claude
+Code cannot replay a denied Agent call. Sidecar actions are different: the
+router owns their bounded executor and can invoke, cancel, retry, and recover
+them through persisted execution records. A sidecar must be invoked through
+the claimed action rather than being hidden behind an ordinary model request.
 
 ## Workflow authority
 
@@ -214,10 +237,13 @@ task intake, extracts deterministic risk signals, and may request an advisory
 fastpath proposal. The controller accepts or replaces the proposal before
 mutation.
 
-Workflow phase instances persist their dependencies, actor, roles, fanout,
-quorum, deadlines, turn budget, result schema, and fallback policy. Phase
-transitions read the persisted instance rather than trusting a caller-supplied
-workflow definition.
+Workflow phase instances persist their dependencies, required actor, actual
+starter, roles, execution kind, parallelism, attempt budgets, quorum,
+deadlines, turn budget, result schema, and fallback policy. Phase transitions
+read the persisted instance rather than trusting a caller-supplied workflow
+definition. Execution statuses follow a bounded transition machine, and
+quality quorum counts only schema/evidence-valid results accepted by the
+controller.
 
 Mutation authority is separate from route identity. A mutating execution must
 hold the active workspace mutation lease, and the pre-tool hook rejects
@@ -232,7 +258,9 @@ review, and cannot mark findings resolved.
 
 Fastpath failures bypass to deterministic/controller routing. Fastpath PASS is
 advisory and never satisfies a mandatory adversarial phase. Any mutation after
-verification invalidates the verification evidence.
+verification invalidates the verification evidence. The current fastpath hook
+still has a short relevance wait; moving it fully onto the general sidecar
+executor is a remaining migration item.
 
 ## Credential and protocol rules
 
@@ -243,8 +271,12 @@ verification invalidates the verification evidence.
 - LiteLLM uses explicit provider namespaces such as `openai/model` for generic
   OpenAI-compatible upstreams.
 - LiteLLM generation, configuration hash, and binding policy are immutable
-  evidence. Old generations drain only after their pinned work is released or
-  is explicitly failed and reconciled.
+  evidence. Old generations drain only after their pinned bindings, active
+  requests, and active streams are released or explicitly failed and
+  reconciled.
+- All outbound model backends use shared admission/deadline/retry and stream
+  accounting paths; provider deployment attribution accepts only trusted exact
+  deployment IDs.
 
 ## Current implementation status
 
@@ -266,12 +298,20 @@ Implemented in the current working tree:
   patches, deterministic overlap classification, green preflight/apply, and
   controller-visible yellow/red integration candidates;
 - cooperative `get_runnable_actions` and orchestration-status operations;
+- persisted `native_agent`, `sidecar_call`, and `controller_action` execution
+  kinds, with bounded sidecar invocation, cancellation, retry, result schema
+  validation, and ordered execution events;
 - actor-scoped MCP principals with run/epoch/resource checks, ephemeral
   controller capabilities, and separate worker result capabilities;
 - atomic native claim-to-child attachment with spawn correlation, terminal
   claim outcomes, provider-reservation handoff, and lifecycle reconciliation;
 - fail-closed mutating workspace ownership, canonical-generation advancement,
   and crash-recoverable integration journaling;
+- persisted completion tokens bound to the current workspace fingerprint and
+  route snapshot, fail-closed completion validation, state-backed statusline
+  visibility, and profile readiness reporting;
+- registry-backed model-qualified native-agent manifest generation and
+  dynamic role-alias/model binding projection;
 - read-only agent definitions without Bash, observational Bash allowlisting as
   a fallback guard, and SQLite-backed session-resume marker rehydration;
 - controller-only route-proposal disposition operations; DiffusionGemma
@@ -290,19 +330,19 @@ Remaining work before a production-quality proving ground:
    changeset path, persisted patches, overlap classification, deterministic
    preflight, and controller-action gate are implemented; semantic conflict
    resolution is intentionally not automatic.
-3. Enforce all phase actor, distinct-agent, fanout, quorum, budget, and result
-   schema contracts on every production execution path.
-4. Add a first-class sidecar execution lane and finish endpoint/circuit/cache
-   status consistency in statusline and health.
-5. Finish LiteLLM generation monitoring/drain reconciliation and health/readiness
-   semantics.
-6. Expand the local fixture integration suite for tools, parallel tools,
+3. Move the remaining fastpath hook call onto the general sidecar executor so
+   its model deadline and controller relevance deadline are separate.
+4. Expand the local fixture integration suite for tools, parallel tools,
    tool-result continuation, structured output, cancellation, SSE usage, 401,
    429, 503, and generation pinning.
-7. Run opt-in FreeInference paired endpoint certification and benchmark runs;
+5. Run opt-in FreeInference paired endpoint certification and benchmark runs;
    do not run live inference probes automatically.
-8. Reconcile all documentation, release manifests, installer assets, and
+6. Reconcile all documentation, release manifests, installer assets, and
    generated hashes after source/config work is final.
+7. Split the large `RouteState` implementation into domain repositories only
+   after the current invariants have remained stable through the proving-ground
+   tests. This is intentionally deferred; this pass keeps transactional
+   changes localized and does not attempt a broad state rewrite.
 
 This status is intentionally not a release claim. The repository should be
 considered an active proving-ground implementation until the remaining list

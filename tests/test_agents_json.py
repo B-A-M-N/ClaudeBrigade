@@ -19,6 +19,28 @@ def test_bundle_agents_render_for_native_agents_flag():
     assert isinstance(agents["brigade-recon"]["tools"], list)
 
 
+def test_registry_manifest_can_generate_a_model_qualified_agent(tmp_path):
+    source = Path(__file__).resolve().parents[1] / "agents"
+    for name in ("brigade-recon.md", "brigade-implementer.md", "brigade-adversary.md", "brigade-repairer.md", "controller-direct.md"):
+        (tmp_path / name).write_text((source / name).read_text(encoding="utf-8"), encoding="utf-8")
+
+    class RegistryStub:
+        def specialist_manifest(self):
+            return {
+                "brigade-custom-scout": {
+                    "native_agent_name": "brigade-custom-scout",
+                    "public_model_alias": "anthropic-brigade-custom-scout",
+                    "model_id": "custom-model",
+                    "role": "recon",
+                    "profile_id": "custom",
+                }
+            }
+
+    agents = render_agents(tmp_path, RegistryStub())
+    assert agents["brigade-custom-scout"]["model"] == "anthropic-brigade-custom-scout"
+    assert "custom-model" in agents["brigade-custom-scout"]["description"]
+
+
 def test_controller_append_has_brigade_references():
     """Verify the controller-append.md body references brigade agent names."""
     directory = Path(__file__).resolve().parents[1] / "agents"

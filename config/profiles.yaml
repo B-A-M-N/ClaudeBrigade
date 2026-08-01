@@ -9,6 +9,8 @@ profiles:
         model: qwen3.6-35b
         roles: [recon]
         latency_class: fast
+        native_agent_name: brigade-fi-qwen-scout
+        public_model_alias: anthropic-brigade-fi-qwen-scout
       broad-architect:
         model: minimax-m3
         roles: [recon, adversary]
@@ -16,12 +18,18 @@ profiles:
       coding-implementer:
         model: kimi-k2.7-code
         roles: [implementer]
+        native_agent_name: brigade-fi-kimi-implementer
+        public_model_alias: anthropic-brigade-fi-kimi-implementer
       correctness-reviewer:
         model: glm-5.1
         roles: [adversary]
+        native_agent_name: brigade-fi-glm-adversary
+        public_model_alias: anthropic-brigade-fi-glm-adversary
       fast-repairer:
         model: glm-5-turbo
         roles: [repairer]
+        native_agent_name: brigade-fi-glm-fast-repairer
+        public_model_alias: anthropic-brigade-fi-glm-fast-repairer
 
   longcat:
     recon: longcat-2

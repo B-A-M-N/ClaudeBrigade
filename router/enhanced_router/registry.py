@@ -503,6 +503,26 @@ class ModelRegistry:
             raise KeyError(f"Unknown profile: {profile_id}")
         return spec
 
+    def specialist_manifest(self) -> dict[str, dict[str, str]]:
+        from enhanced_router.agent_manifest import specialist_manifest
+
+        return specialist_manifest(self)
+
+    def role_model_aliases(self) -> dict[str, str]:
+        from enhanced_router.agent_manifest import role_model_aliases
+
+        return role_model_aliases(self)
+
+    def role_model_bindings(self) -> dict[str, str]:
+        from enhanced_router.agent_manifest import role_model_bindings
+
+        return role_model_bindings(self)
+
+    def native_agent_name(self, model_id: str, role: str) -> str:
+        from enhanced_router.agent_manifest import native_agent_name
+
+        return native_agent_name(self, model_id, role)
+
     def profile_readiness(self, profile_id: str) -> dict[str, Any]:
         """Report whether every mandatory role has a configured transport."""
         profile = self.get_profile(profile_id)

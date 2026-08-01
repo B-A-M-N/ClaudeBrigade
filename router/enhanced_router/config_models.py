@@ -326,6 +326,22 @@ class SpecialistSpec(StrictConfigModel):
     latency_class: Literal["fast", "standard", "slow"] = "standard"
     activation: str | None = None
     endpoint: str = "auto"
+    native_agent_name: str | None = None
+    public_model_alias: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_launch_identity(self) -> "SpecialistSpec":
+        if bool(self.native_agent_name) != bool(self.public_model_alias):
+            raise ValueError(
+                "native_agent_name and public_model_alias must be supplied together"
+            )
+        if self.native_agent_name and not self.native_agent_name.startswith("brigade-"):
+            raise ValueError("native_agent_name must use the 'brigade-' namespace")
+        if self.public_model_alias and not self.public_model_alias.startswith("anthropic-brigade-"):
+            raise ValueError(
+                "public_model_alias must use the 'anthropic-brigade-' namespace"
+            )
+        return self
 
 
 ProfileSpec.model_rebuild()

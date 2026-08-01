@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import pathlib
 import sys
+from copy import deepcopy
 from typing import Any
 
 import yaml
@@ -64,7 +65,10 @@ def parse_agent(path: pathlib.Path) -> tuple[str, dict[str, Any]]:
     return name, frontmatter
 
 
-def render_agents(directory: pathlib.Path) -> dict[str, dict[str, Any]]:
+def render_agents(
+    directory: pathlib.Path,
+    registry: Any | None = None,
+) -> dict[str, dict[str, Any]]:
     agents: dict[str, dict[str, Any]] = {}
     paths = sorted(directory.glob("*.md"))
     if not paths:
@@ -93,6 +97,23 @@ def render_agents(directory: pathlib.Path) -> dict[str, dict[str, Any]]:
             raise ValueError(
                 f"Agent '{agent_name}' has model '{actual_model}' but expected '{expected_model}'"
             )
+    if registry is not None:
+        for entry in registry.specialist_manifest().values():
+            native_name = entry["native_agent_name"]
+            if native_name in agents:
+                continue
+            base_name = f"brigade-{entry['role']}"
+            if base_name not in agents:
+                raise ValueError(
+                    f"Cannot generate '{native_name}': missing base agent '{base_name}'"
+                )
+            generated = deepcopy(agents[base_name])
+            generated["description"] = (
+                f"{generated['description']} Backed by {entry['model_id']} from "
+                f"the active {entry['profile_id']} manifest."
+            )
+            generated["model"] = entry["public_model_alias"]
+            agents[native_name] = generated
     return agents
 
 
@@ -101,7 +122,9 @@ def main() -> int:
         print("usage: python -m enhanced_router.agents_json AGENT_DIRECTORY", file=sys.stderr)
         return 2
     try:
-        agents = render_agents(pathlib.Path(sys.argv[1]))
+        from enhanced_router.registry import get_registry
+
+        agents = render_agents(pathlib.Path(sys.argv[1]), get_registry())
     except (OSError, ValueError, yaml.YAMLError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
