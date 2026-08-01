@@ -46,6 +46,7 @@ class SidecarExecutor:
     def __init__(self, state: RouteState) -> None:
         self.state = state
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._detached_jobs: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
 
     async def invoke(
@@ -135,6 +136,30 @@ class SidecarExecutor:
         return execution
 
     async def retry(self, execution_id: str) -> dict[str, Any]:
+        execution = self.state.get_agent_execution(execution_id)
+        if (
+            execution is not None
+            and execution.get("execution_kind") == "sidecar_call"
+            and str(execution.get("phase_id") or "").startswith("fastpath:")
+        ):
+            job = self._detached_jobs.get(execution_id)
+            if job is None:
+                raise WorkflowStateError(
+                    "detached fastpath retry is unavailable after router restart"
+                )
+            retry_id = f"{execution_id}:retry:{uuid.uuid4().hex[:8]}"
+            return await self.invoke_detached(
+                run_id=str(job["run_id"]),
+                epoch_id=str(job["epoch_id"]),
+                execution_id=retry_id,
+                phase_id=str(job["phase_id"]),
+                role=str(job["role"]),
+                model_id=str(job["model_id"]),
+                provider_id=job.get("provider_id"),
+                packet=dict(job["packet"]),
+                timeout_seconds=float(job["timeout_seconds"]),
+                runner=job["runner"],
+            )
         retry = self.state.prepare_sidecar_retry(execution_id)
         return await self.invoke(
             run_id=str(retry["run_id"]),
@@ -169,6 +194,17 @@ class SidecarExecutor:
             provider_id=provider_id,
             packet=packet,
         )
+        self._detached_jobs[execution_id] = {
+            "run_id": run_id,
+            "epoch_id": epoch_id,
+            "phase_id": phase_id,
+            "role": role,
+            "model_id": model_id,
+            "provider_id": provider_id,
+            "packet": dict(packet),
+            "timeout_seconds": timeout_seconds,
+            "runner": runner,
+        }
         task = asyncio.create_task(
             self._run_detached(
                 execution_id=execution_id,
@@ -202,6 +238,7 @@ class SidecarExecutor:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._tasks.clear()
+        self._detached_jobs.clear()
 
     async def _run(
         self,
@@ -314,6 +351,7 @@ class SidecarExecutor:
                 accepted_by_controller=False,
                 quality_score=1.0,
             )
+            self._detached_jobs.pop(execution_id, None)
             self._event(execution_id, completed or execution, "completed", {
                 "result_type": "structured_json",
             })

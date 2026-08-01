@@ -128,3 +128,34 @@ async def test_detached_sidecar_persists_lifecycle_and_is_cancellable(tmp_path: 
         "r1", "ep-1", "fp-test",
     )] == ["started", "cancelled"]
     await executor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_detached_fastpath_failure_can_retry_while_router_is_alive(tmp_path: Path):
+    state = RouteState(tmp_path / "state.db")
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    executor = SidecarExecutor(state)
+    attempts = 0
+
+    async def flaky_runner() -> dict:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary provider failure")
+        return {"decision": "escalate"}
+
+    first = await executor.invoke_detached(
+        run_id="r1", epoch_id="ep-1", execution_id="fp-failure",
+        phase_id="fastpath:verify", role="fastpath", model_id="diffusiongemma",
+        provider_id="freeinference", packet={"verification_id": "v1"},
+        timeout_seconds=30, runner=flaky_runner,
+    )
+    await executor.wait(first["execution_id"])
+    assert state.get_agent_execution(first["execution_id"])["status"] == "failed"
+
+    retry = await executor.retry(first["execution_id"])
+    await executor.wait(retry["execution_id"])
+    assert state.get_agent_execution(retry["execution_id"])["status"] == "completed"
+    assert attempts == 2
+    await executor.shutdown()

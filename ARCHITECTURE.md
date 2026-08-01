@@ -372,7 +372,7 @@ Remaining work before a production-quality proving ground:
    preflight, and controller-action gate are implemented; semantic conflict
    resolution is intentionally not automatic.
 3. Add a bounded controller-visible retry action for failed detached fastpath
-   jobs.
+   jobs across router restarts; in-process retry is implemented.
 4. Expand the local fixture integration suite for tools, parallel tools,
    tool-result continuation, structured output, cancellation, SSE usage, 401,
    429, 503, and generation pinning.
