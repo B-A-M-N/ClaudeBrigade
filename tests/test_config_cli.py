@@ -7,10 +7,23 @@ from pathlib import Path
 
 import yaml
 
+from enhanced_router import config_cli
 from enhanced_router.config_cli import (
+    _choose,
+    _choose_model,
+    _choose_or_create_id,
     _confirm_and_grant,
+    _delete_saved,
+    _distinct_providers,
+    _edit_fallbacks,
     _load_registry,
     _model_choices,
+    _profile_model,
+    _rank_query_matches,
+    _referencing_configs,
+    configure_inference,
+    configure_launch_preset,
+    configure_sidecar_profile,
 )
 
 
@@ -50,6 +63,399 @@ def _minimal_config_dir(tmp_path: Path) -> Path:
     _write(tmp_path / "fastpath.yaml", {"fastpath": {"enabled": False, "model_id": "none"}})
     _write(tmp_path / "sidecars.yaml", {"sidecars": {}})
     return tmp_path
+
+
+def _two_certified_model_config_dir(tmp_path: Path) -> Path:
+    """A config dir with two fully pre-certified models (allowed for every
+    role, controller-eligible), so configure_inference can pick a primary
+    and a fallback without hitting the _confirm_and_grant gate at all.
+    """
+    _write(tmp_path / "models.yaml", {
+        "models": {
+            "model-a": {
+                "display_name": "Model A",
+                "backend": "litellm",
+                "litellm_model": "openai/model-a",
+                "api_base": "https://example.invalid/v1",
+                "api_key_env": "TEST_PROBE_API_KEY",
+                "provider_id": "testprovider",
+                "capabilities": {
+                    "tools": True, "mutation": True,
+                    "read_tool_certified": True, "write_tool_certified": True,
+                    "controller_eligible": True,
+                },
+                "allowed_roles": ["recon", "implementer", "adversary", "repairer"],
+            },
+            "model-b": {
+                "display_name": "Model B",
+                "backend": "litellm",
+                "litellm_model": "openai/model-b",
+                "api_base": "https://example.invalid/v1",
+                "api_key_env": "TEST_PROBE_API_KEY",
+                "provider_id": "testprovider",
+                "capabilities": {
+                    "tools": True, "mutation": True,
+                    "read_tool_certified": True, "write_tool_certified": True,
+                    "controller_eligible": True,
+                },
+                "allowed_roles": ["recon", "implementer", "adversary", "repairer"],
+            },
+        },
+    })
+    _write(tmp_path / "discovered_models.yaml", {"models": {}})
+    _write(tmp_path / "profiles.yaml", {"profiles": {}})
+    _write(tmp_path / "workflows.yaml", {"workflows": {"normal": {"default_profile": "hybrid"}}})
+    _write(tmp_path / "providers.yaml", {"providers": {}})
+    _write(tmp_path / "fastpath.yaml", {"fastpath": {"enabled": False, "model_id": "none"}})
+    _write(tmp_path / "sidecars.yaml", {
+        "sidecars": {
+            "reviewer": {"model_id": "model-a", "mode": "structured", "endpoint": "auto", "enabled": True},
+        },
+    })
+    return tmp_path
+
+
+def test_choose_paginates_long_option_lists(monkeypatch):
+    options = [(f"model-{i}", f"Model {i}") for i in range(1, 21)]  # 20 options, page size 15
+    responses = iter(["n", "16"])  # page forward, then pick absolute index 16
+    monkeypatch.setattr(builtins, "input", lambda prompt="": next(responses))
+    assert _choose("Pick a model", options) == "model-16"
+
+
+def test_choose_returns_directly_for_short_lists(monkeypatch):
+    options = [("a", "A"), ("b", "B")]
+    monkeypatch.setattr(builtins, "input", lambda prompt="": "2")
+    assert _choose("Pick", options) == "b"
+
+
+def test_choose_page_number_stays_absolute_across_pages(monkeypatch):
+    """Option 1 must still mean option 1 after paging forward and back --
+    numbers are absolute across the whole list, not reset per page."""
+    options = [(f"model-{i}", f"Model {i}") for i in range(1, 21)]
+    responses = iter(["n", "p", "1"])
+    monkeypatch.setattr(builtins, "input", lambda prompt="": next(responses))
+    assert _choose("Pick a model", options) == "model-1"
+
+
+def test_rank_query_matches_prefers_exact_and_prefix_matches():
+    options = [
+        ("zzz-vendor/foo-longcat", "Foo LongCat"),
+        ("longcat-2", "LongCat 2"),
+        ("longcat", "LongCat"),
+        ("other", "mentions longcat in description"),
+        ("unrelated", "no match at all"),
+    ]
+    ranked = _rank_query_matches("longcat", options)
+    assert [item[0] for item in ranked] == ["longcat", "longcat-2", "zzz-vendor/foo-longcat", "other"]
+
+
+def test_rank_query_matches_blank_query_returns_original_order():
+    options = [("b", "B"), ("a", "A")]
+    assert _rank_query_matches("", options) == options
+
+
+def test_distinct_providers_extracts_from_model_choices_labels():
+    options = [
+        ("model-a", "Model A; litellm; provider=alpha; key=X"),
+        ("model-b", "Model B; litellm; provider=beta; key=Y"),
+        ("model-c", "Model C; litellm; provider=alpha; key=Z"),
+    ]
+    assert _distinct_providers(options) == ["alpha", "beta"]
+
+
+def test_choose_model_offers_provider_filter_when_multiple_providers(monkeypatch):
+    options = [
+        ("model-a", "Model A; litellm; provider=alpha; key=X"),
+        ("model-b", "Model B; litellm; provider=beta; key=Y"),
+    ]
+    responses = iter(["alpha", "", "1"])  # provider filter, blank search, pick #1
+    monkeypatch.setattr(builtins, "input", lambda prompt="": next(responses))
+    assert _choose_model("Role model", options) == "model-a"
+
+
+def test_choose_model_skips_provider_filter_with_single_provider(monkeypatch):
+    options = [
+        ("model-a", "Model A; litellm; provider=alpha; key=X"),
+        ("model-b", "Model B; litellm; provider=alpha; key=Y"),
+    ]
+    # Only two inputs expected: search query, then the numbered choice --
+    # no provider-filter prompt, since there's only one provider present.
+    responses = iter(["", "2"])
+    monkeypatch.setattr(builtins, "input", lambda prompt="": next(responses))
+    assert _choose_model("Role model", options) == "model-b"
+
+
+def test_load_registry_tolerates_a_broken_saved_profile_and_still_starts(tmp_path: Path, monkeypatch, capsys):
+    """A pre-existing broken reference in profiles.yaml (e.g. left over
+    after a model was deleted) must not prevent _load_registry -- and
+    therefore the whole wizard menu -- from starting at all. The operator
+    needs a working menu to fix it, not a crash before they can even see
+    what's wrong."""
+    config_dir = _two_certified_model_config_dir(tmp_path)
+    _write(config_dir / "profiles.yaml", {
+        "profiles": {
+            "hybrid": {
+                "recon": "nonexistent-model", "implementer": "model-a",
+                "adversary": "model-a", "repairer": "model-a",
+            },
+        },
+    })
+    monkeypatch.setenv("TEST_PROBE_API_KEY", "fake-key-for-config-check")
+
+    registry, provider_keys = _load_registry(config_dir)  # must not raise
+
+    assert "model-a" in registry.models
+    captured = capsys.readouterr()
+    assert "profiles" in captured.out
+    assert "nonexistent-model" in captured.out
+
+
+def test_choose_or_create_id_prompts_directly_with_no_existing_entries(monkeypatch):
+    monkeypatch.setattr(builtins, "input", lambda prompt="": "my-new-thing")
+    assert _choose_or_create_id("Widget", [], "default-name") == "my-new-thing"
+
+
+def test_choose_or_create_id_offers_numbered_pick_of_existing_entries(monkeypatch):
+    responses = iter(["2"])  # pick the 2nd existing entry by number
+    monkeypatch.setattr(builtins, "input", lambda prompt="": next(responses))
+    result = _choose_or_create_id("Widget", ["alpha", "beta"], "default-name")
+    assert result == "beta"
+
+
+def test_choose_or_create_id_new_option_prompts_for_a_name(monkeypatch):
+    responses = iter(["3", "brand-new"])  # option 3 is "(new)" for a 2-entry list
+    monkeypatch.setattr(builtins, "input", lambda prompt="": next(responses))
+    result = _choose_or_create_id("Widget", ["alpha", "beta"], "default-name")
+    assert result == "brand-new"
+
+
+def test_choose_or_create_id_rejects_invalid_characters(monkeypatch):
+    monkeypatch.setattr(builtins, "input", lambda prompt="": "bad name with spaces")
+    import pytest
+    with pytest.raises(ValueError, match="Widget IDs may contain"):
+        _choose_or_create_id("Widget", [], "default-name")
+
+
+def test_edit_fallbacks_add_then_done(tmp_path: Path, monkeypatch):
+    config_dir = _two_certified_model_config_dir(tmp_path)
+    monkeypatch.setenv("TEST_PROBE_API_KEY", "fake-key-for-config-check")
+    registry, _ = _load_registry(config_dir)
+
+    options = [("model-b", "Model B")]
+    responses = iter(["a", "d"])
+    monkeypatch.setattr(builtins, "input", lambda prompt="": next(responses))
+    monkeypatch.setattr(config_cli, "_choose_model", lambda label, choices, default="": "model-b")
+    monkeypatch.setattr(config_cli, "_choose", lambda label, options, default=1: "auto")
+
+    result = _edit_fallbacks(
+        config_dir, registry, role="recon", fallback_options=options, previous=[],
+    )
+    assert result == [{"model": "model-b", "endpoint": "auto"}]
+
+
+def test_edit_fallbacks_remove(tmp_path: Path, monkeypatch):
+    config_dir = _two_certified_model_config_dir(tmp_path)
+    monkeypatch.setenv("TEST_PROBE_API_KEY", "fake-key-for-config-check")
+    registry, _ = _load_registry(config_dir)
+
+    responses = iter(["r", "1", "d"])
+    monkeypatch.setattr(builtins, "input", lambda prompt="": next(responses))
+
+    result = _edit_fallbacks(
+        config_dir, registry, role="recon", fallback_options=[("model-b", "Model B")],
+        previous=[{"model": "model-b", "endpoint": "auto"}],
+    )
+    assert result == []
+
+
+def test_edit_fallbacks_move_reorders(tmp_path: Path, monkeypatch):
+    config_dir = _two_certified_model_config_dir(tmp_path)
+    monkeypatch.setenv("TEST_PROBE_API_KEY", "fake-key-for-config-check")
+    registry, _ = _load_registry(config_dir)
+
+    previous = [
+        {"model": "model-a", "endpoint": "auto"},
+        {"model": "model-b", "endpoint": "auto"},
+    ]
+    # Move position 2 to position 1 -- reverses the ladder.
+    responses = iter(["m", "2", "1", "d"])
+    monkeypatch.setattr(builtins, "input", lambda prompt="": next(responses))
+
+    result = _edit_fallbacks(
+        config_dir, registry, role="recon",
+        fallback_options=[("model-a", "Model A"), ("model-b", "Model B")],
+        previous=previous,
+    )
+    assert result == [
+        {"model": "model-b", "endpoint": "auto"},
+        {"model": "model-a", "endpoint": "auto"},
+    ]
+
+
+def test_edit_fallbacks_starts_from_previous_ladder_and_can_skip_immediately(tmp_path: Path, monkeypatch):
+    config_dir = _two_certified_model_config_dir(tmp_path)
+    monkeypatch.setenv("TEST_PROBE_API_KEY", "fake-key-for-config-check")
+    registry, _ = _load_registry(config_dir)
+
+    previous = [{"model": "model-b", "endpoint": "provider-x"}]
+    monkeypatch.setattr(builtins, "input", lambda prompt="": "d")
+
+    result = _edit_fallbacks(
+        config_dir, registry, role="recon", fallback_options=[("model-b", "Model B")],
+        previous=previous,
+    )
+    assert result == previous
+
+
+def test_edit_fallbacks_with_no_fallback_options_returns_previous_unchanged(tmp_path: Path, monkeypatch):
+    """No fallback candidates available at all (e.g. only one model is
+    usable for this role) must not prompt for anything."""
+    config_dir = _two_certified_model_config_dir(tmp_path)
+    monkeypatch.setenv("TEST_PROBE_API_KEY", "fake-key-for-config-check")
+    registry, _ = _load_registry(config_dir)
+
+    def _fail_if_called(prompt: str = "") -> str:
+        raise AssertionError("input() should not be called with no fallback options")
+
+    monkeypatch.setattr(builtins, "input", _fail_if_called)
+
+    result = _edit_fallbacks(config_dir, registry, role="recon", fallback_options=[], previous=[])
+    assert result == []
+
+
+def test_profile_model_reads_back_legacy_and_canonical_fallback_shapes():
+    """_profile_model must tolerate both the old bare-string fallback shape
+    and the new {model, endpoint} dict shape when re-opening a saved
+    profile for editing."""
+    legacy = {"recon": {"model": "m1", "endpoint": "ep1", "fallback_models": ["f1", "f2"]}}
+    assert _profile_model(legacy, "recon") == ("m1", "ep1", ["f1", "f2"])
+
+    canonical = {
+        "recon": {
+            "model": "m1", "endpoint": "ep1",
+            "fallback_models": [{"model": "f1", "endpoint": "auto"}, {"model": "f2", "endpoint": "ep2"}],
+        },
+    }
+    assert _profile_model(canonical, "recon") == ("m1", "ep1", ["f1", "f2"])
+
+
+def test_configure_inference_writes_fallback_entries_as_dicts(tmp_path: Path, monkeypatch):
+    config_dir = _two_certified_model_config_dir(tmp_path)
+    monkeypatch.setenv("TEST_PROBE_API_KEY", "fake-key-for-config-check")
+    registry, _ = _load_registry(config_dir)
+
+    def fake_choose_model(label, choices, default=""):
+        # The FallbackEditor asks _choose_model again to pick a fallback
+        # candidate ("Fallback #N for <target>"); everywhere else it's
+        # picking the primary model for a role or the controller.
+        return "model-b" if "Fallback" in label else "model-a"
+
+    def fake_choose(label, options, default=1):
+        # Likewise: the FallbackEditor asks _choose again for the newly
+        # added fallback's own endpoint.
+        return "auto" if "Endpoint for fallback" in label else "ep1"
+
+    # _edit_fallbacks runs once for the controller and once per role (5
+    # total calls this wizard run). Add one fallback ('a', then 'd' to
+    # finish) only while editing 'recon'; every other call just skips
+    # straight to done ('d') with an empty ladder.
+    responses = iter(["d", "a", "d", "d", "d", "d"])
+
+    monkeypatch.setattr(config_cli, "_prompt", lambda label, default=None: default or "")
+    monkeypatch.setattr(builtins, "input", lambda prompt="": next(responses))
+    monkeypatch.setattr(config_cli, "_choose_model", fake_choose_model)
+    monkeypatch.setattr(config_cli, "_choose", fake_choose)
+    monkeypatch.setattr(config_cli, "_confirm_and_grant", lambda *a, **k: True)
+
+    profile_id = configure_inference(config_dir, registry)
+
+    saved = yaml.safe_load((config_dir / "profiles.yaml").read_text())
+    recon = saved["profiles"][profile_id]["recon"]
+    assert recon["model"] == "model-a"
+    assert recon["endpoint"] == "ep1"
+    assert recon["fallback_models"] == [{"model": "model-b", "endpoint": "auto"}]
+    # Controller had no fallbacks added -- must stay the plain legacy string,
+    # not get upgraded to the nested dict shape for no reason.
+    assert saved["profiles"][profile_id]["controller_model"] == "model-a"
+    assert "controller" not in saved["profiles"][profile_id]
+
+
+def test_configure_sidecar_profile_writes_bounded_sidecar_ids(tmp_path: Path, monkeypatch):
+    config_dir = _two_certified_model_config_dir(tmp_path)
+    monkeypatch.setenv("TEST_PROBE_API_KEY", "fake-key-for-config-check")
+    registry, _ = _load_registry(config_dir)
+
+    def fake_prompt(label, default=None):
+        if "Sidecar profile name" in label:
+            return "lightweight"
+        if "Sidecar IDs for this profile" in label:
+            return "reviewer"
+        return default or ""
+
+    monkeypatch.setattr(config_cli, "_prompt", fake_prompt)
+    monkeypatch.setattr(builtins, "input", lambda prompt="": "n")
+
+    profile_id = configure_sidecar_profile(config_dir, registry)
+    assert profile_id == "lightweight"
+
+    saved = yaml.safe_load((config_dir / "sidecar_profiles.yaml").read_text())
+    entry = saved["sidecar_profiles"]["lightweight"]
+    assert entry["sidecar_ids"] == ["reviewer"]
+    assert "fastpath" not in entry
+
+
+def test_configure_sidecar_profile_rejects_unknown_sidecar_id(tmp_path: Path, monkeypatch):
+    config_dir = _two_certified_model_config_dir(tmp_path)
+    monkeypatch.setenv("TEST_PROBE_API_KEY", "fake-key-for-config-check")
+    registry, _ = _load_registry(config_dir)
+
+    def fake_prompt(label, default=None):
+        if "Sidecar profile name" in label:
+            return "broken"
+        if "Sidecar IDs for this profile" in label:
+            return "nonexistent-sidecar"
+        return default or ""
+
+    monkeypatch.setattr(config_cli, "_prompt", fake_prompt)
+
+    import pytest
+    with pytest.raises(ValueError, match="unknown sidecar ID"):
+        configure_sidecar_profile(config_dir, registry)
+
+
+def test_configure_launch_preset_pairs_inference_and_sidecar_profiles(tmp_path: Path, monkeypatch):
+    config_dir = _two_certified_model_config_dir(tmp_path)
+    _write(config_dir / "profiles.yaml", {
+        "profiles": {"hybrid": {"recon": "model-a", "implementer": "model-a", "adversary": "model-a", "repairer": "model-a"}},
+    })
+    _write(config_dir / "sidecar_profiles.yaml", {
+        "sidecar_profiles": {"lightweight": {"sidecar_ids": ["reviewer"]}},
+    })
+    monkeypatch.setenv("TEST_PROBE_API_KEY", "fake-key-for-config-check")
+    registry, _ = _load_registry(config_dir)
+
+    def fake_prompt(label, default=None):
+        if "Launch preset name" in label:
+            return "my-preset"
+        return default or ""
+
+    def fake_choose(label, options, default=1):
+        if label == "Inference profile":
+            return "hybrid"
+        if label == "Sidecar profile":
+            return "lightweight"
+        raise AssertionError(f"unexpected _choose call: {label}")
+
+    monkeypatch.setattr(config_cli, "_prompt", fake_prompt)
+    monkeypatch.setattr(config_cli, "_choose", fake_choose)
+
+    preset_id = configure_launch_preset(config_dir, registry)
+    assert preset_id == "my-preset"
+
+    saved = yaml.safe_load((config_dir / "launch_presets.yaml").read_text())
+    entry = saved["launch_presets"]["my-preset"]
+    assert entry["inference_profile_id"] == "hybrid"
+    assert entry["sidecar_profile_id"] == "lightweight"
 
 
 def test_load_registry_overlays_missing_bundled_compatibility_models(tmp_path: Path):
@@ -224,3 +630,66 @@ def test_confirm_and_grant_failed_probe_offers_override_fallback(tmp_path: Path,
     record = certifications["certifications"]["vendor/uncertified-model"]["recon"]
     assert record["status"] == "failed"
     assert record["error"] == "simulated network failure"
+
+
+def test_referencing_configs_finds_sidecar_used_by_a_sidecar_profile(tmp_path: Path):
+    config_dir = _two_certified_model_config_dir(tmp_path)
+    _write(config_dir / "sidecar_profiles.yaml", {
+        "sidecar_profiles": {"lightweight": {"sidecar_ids": ["reviewer"]}},
+    })
+    blockers = _referencing_configs(config_dir, "sidecar", "reviewer")
+    assert blockers == ["sidecar profile 'lightweight'"]
+
+
+def test_referencing_configs_finds_sidecar_profile_used_by_a_launch_preset(tmp_path: Path):
+    config_dir = _two_certified_model_config_dir(tmp_path)
+    _write(config_dir / "sidecar_profiles.yaml", {
+        "sidecar_profiles": {"lightweight": {"sidecar_ids": ["reviewer"]}},
+    })
+    _write(config_dir / "launch_presets.yaml", {
+        "launch_presets": {"default": {"inference_profile_id": "hybrid", "sidecar_profile_id": "lightweight"}},
+    })
+    blockers = _referencing_configs(config_dir, "sidecar profile", "lightweight")
+    assert blockers == ["launch preset 'default'"]
+
+
+def test_referencing_configs_finds_inference_profile_used_by_workflow_and_preset(tmp_path: Path):
+    config_dir = _two_certified_model_config_dir(tmp_path)
+    _write(config_dir / "profiles.yaml", {"profiles": {"hybrid": {}}})
+    _write(config_dir / "launch_presets.yaml", {
+        "launch_presets": {"default": {"inference_profile_id": "hybrid"}},
+    })
+    blockers = _referencing_configs(config_dir, "inference profile", "hybrid")
+    assert set(blockers) == {"launch preset 'default'", "workflow 'normal'"}
+
+
+def test_referencing_configs_returns_empty_for_unreferenced_item(tmp_path: Path):
+    config_dir = _two_certified_model_config_dir(tmp_path)
+    assert _referencing_configs(config_dir, "sidecar", "reviewer") == []
+
+
+def test_delete_saved_blocks_deletion_of_a_referenced_sidecar(tmp_path: Path, monkeypatch, capsys):
+    config_dir = _two_certified_model_config_dir(tmp_path)
+    _write(config_dir / "sidecar_profiles.yaml", {
+        "sidecar_profiles": {"lightweight": {"sidecar_ids": ["reviewer"]}},
+    })
+    # Only the "which sidecar" picker prompt should fire -- the block message
+    # replaces the "delete permanently?" confirmation entirely, so a second
+    # input() call must never happen.
+    responses = iter(["1"])
+    monkeypatch.setattr(builtins, "input", lambda prompt="": next(responses))
+    _delete_saved(config_dir, kind="sidecar")
+
+    assert "still referenced by sidecar profile 'lightweight'" in capsys.readouterr().out
+    sidecars = yaml.safe_load((config_dir / "sidecars.yaml").read_text())
+    assert "reviewer" in sidecars["sidecars"]
+
+
+def test_delete_saved_allows_deletion_of_an_unreferenced_sidecar(tmp_path: Path, monkeypatch):
+    config_dir = _two_certified_model_config_dir(tmp_path)
+    responses = iter(["1", "y"])
+    monkeypatch.setattr(builtins, "input", lambda prompt="": next(responses))
+    _delete_saved(config_dir, kind="sidecar")
+
+    sidecars = yaml.safe_load((config_dir / "sidecars.yaml").read_text())
+    assert "reviewer" not in sidecars["sidecars"]

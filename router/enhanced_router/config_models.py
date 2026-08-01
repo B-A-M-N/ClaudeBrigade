@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -203,6 +203,30 @@ class SidecarSpec(StrictConfigModel):
         return self
 
 
+class SidecarProfileSpec(StrictConfigModel):
+    """A named, reusable bundle limiting which globally-defined sidecars
+    (sidecars.yaml) are available for a launch, plus that launch's own
+    fastpath coprocessor config.
+
+    Fastpath is scoped per sidecar-profile here rather than being a single
+    global singleton: two launch presets can run different fastpath
+    coprocessors (or none) side by side. When ``fastpath`` is not set, the
+    caller falls back to the bare global ``fastpath.yaml`` singleton for
+    backward compatibility with configs that predate sidecar profiles.
+    """
+
+    sidecar_ids: list[str] = Field(default_factory=list)
+    fastpath: FastpathConfigSpec | None = None
+
+
+class LaunchPresetSpec(StrictConfigModel):
+    """Pairs a saved inference profile with a saved sidecar profile so an
+    operator can switch both together with one named choice at launch."""
+
+    inference_profile_id: str
+    sidecar_profile_id: str | None = None
+
+
 class ModelAuthSpec(StrictConfigModel):
     """Explicit transport authentication for a provider backend.
 
@@ -299,7 +323,11 @@ class ModelSpec(StrictConfigModel):
 class ProfileSpec(StrictConfigModel):
     """Profile mapping role names to model IDs.
 
-    No ``controller`` field — only dynamically routed roles.
+    ``controller`` (a ``RouteTargetSpec``) and the legacy ``controller_model``
+    string are both optional overrides for the profile's controller route;
+    they do not make the controller a statically routed role like recon/
+    implementer/adversary/repairer. Use ``controller_route()`` to read
+    whichever is set.
     """
 
     recon: "str | RouteTargetSpec"
@@ -307,6 +335,7 @@ class ProfileSpec(StrictConfigModel):
     adversary: "str | RouteTargetSpec"
     repairer: "str | RouteTargetSpec"
     controller_model: str | None = None
+    controller: "RouteTargetSpec | None" = None
     specialists: dict[str, "SpecialistSpec"] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -332,13 +361,72 @@ class ProfileSpec(StrictConfigModel):
         value = getattr(self, role)
         return value if isinstance(value, RouteTargetSpec) else RouteTargetSpec(model=value)
 
+    def controller_route(self) -> "RouteTargetSpec | None":
+        """Return the controller's route, from the new ``controller`` field
+        if present, else synthesized from the legacy ``controller_model``
+        string, else ``None`` if this profile configures no controller."""
+        if self.controller is not None:
+            return self.controller
+        if self.controller_model:
+            return RouteTargetSpec(model=self.controller_model)
+        return None
 
-class RouteTargetSpec(StrictConfigModel):
-    """Logical model plus an optional endpoint override."""
+
+class RouteCandidateSpec(StrictConfigModel):
+    """One concrete model+endpoint choice for a role or controller route."""
 
     model: str
     endpoint: str = "auto"
-    fallback_models: list[str] = Field(default_factory=list)
+
+
+class RouteTargetSpec(StrictConfigModel):
+    """A role's (or controller's) primary route plus ordered fallback candidates.
+
+    Each fallback is a full (model, endpoint) pair, not just a model ID, so a
+    fallback can pin a different provider/endpoint for the same model or an
+    entirely different model+endpoint combination.
+    """
+
+    primary: RouteCandidateSpec
+    fallbacks: list[RouteCandidateSpec] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy_shape(cls, data: Any) -> Any:
+        """Parse the old flat {model, endpoint, fallback_models: [str]} shape
+        (and bare fallback dicts already shaped like {model, endpoint}) into
+        the new primary/fallbacks shape. Existing profiles.yaml files and
+        ``RouteTargetSpec(model=...)`` call sites must keep working unchanged."""
+        if not isinstance(data, dict) or "primary" in data:
+            return data
+        if "model" not in data:
+            return data
+        fallback_raw = data.get("fallback_models") or []
+        fallbacks = []
+        for item in fallback_raw:
+            if isinstance(item, str):
+                fallbacks.append({"model": item})
+            elif isinstance(item, dict):
+                fallbacks.append(item)
+        return {
+            "primary": {"model": data["model"], "endpoint": data.get("endpoint", "auto")},
+            "fallbacks": fallbacks,
+        }
+
+    # Backward-compatible read accessors -- every existing caller reads
+    # .model / .endpoint / .fallback_models directly; keep those working so
+    # this migration does not require touching every consumer.
+    @property
+    def model(self) -> str:
+        return self.primary.model
+
+    @property
+    def endpoint(self) -> str:
+        return self.primary.endpoint
+
+    @property
+    def fallback_models(self) -> list[str]:
+        return [c.model for c in self.fallbacks]
 
 
 class SpecialistSpec(StrictConfigModel):
@@ -377,6 +465,7 @@ class RecommendationConstraints(StrictConfigModel):
     required_context_tokens: int | None = None
     local_only: bool = False
     requires_tools: bool = True
+    prefer_low_cost: bool = False
 
 
 class RankedModel(StrictConfigModel):

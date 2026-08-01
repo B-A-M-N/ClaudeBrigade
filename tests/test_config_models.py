@@ -6,11 +6,14 @@ import pytest
 from pydantic import ValidationError
 
 from enhanced_router.config_models import (
+    FastpathConfigSpec,
+    LaunchPresetSpec,
     ModelCapabilities,
     ModelSpec,
     ProfileSpec,
     RecommendationConstraints,
     RankedModel,
+    SidecarProfileSpec,
     TierPolicy,
     WorkflowPhase,
     WorkflowSpec,
@@ -215,15 +218,74 @@ class TestProfileSpec:
         assert profile.recon == "longcat-2"
         assert profile.implementer == "longcat-2"
 
-    def test_no_controller_field(self):
-        """ProfileSpec must not have a controller field."""
+    def test_controller_route_defaults_to_none(self):
+        """With neither controller_model nor controller set, controller_route() is None."""
         profile = ProfileSpec(
             recon="a",
             implementer="b",
             adversary="c",
             repairer="d",
         )
-        assert not hasattr(profile, "controller")
+        assert profile.controller is None
+        assert profile.controller_route() is None
+
+    def test_controller_route_prefers_new_field_over_legacy_string(self):
+        profile = ProfileSpec(
+            recon="a",
+            implementer="b",
+            adversary="c",
+            repairer="d",
+            controller_model="legacy-model",
+            controller={"model": "new-model", "endpoint": "provider-x"},
+        )
+        route = profile.controller_route()
+        assert route is not None
+        assert route.model == "new-model"
+        assert route.endpoint == "provider-x"
+
+    def test_controller_route_synthesizes_from_legacy_controller_model(self):
+        profile = ProfileSpec(
+            recon="a",
+            implementer="b",
+            adversary="c",
+            repairer="d",
+            controller_model="legacy-model",
+        )
+        route = profile.controller_route()
+        assert route is not None
+        assert route.model == "legacy-model"
+        assert route.endpoint == "auto"
+
+
+class TestSidecarProfileSpec:
+    def test_defaults_have_no_sidecars_and_no_dedicated_fastpath(self):
+        spec = SidecarProfileSpec()
+        assert spec.sidecar_ids == []
+        assert spec.fastpath is None
+
+    def test_can_bound_sidecars_and_carry_its_own_fastpath(self):
+        spec = SidecarProfileSpec(
+            sidecar_ids=["reviewer", "verifier"],
+            fastpath={"enabled": True, "model_id": "diffusiongemma"},
+        )
+        assert spec.sidecar_ids == ["reviewer", "verifier"]
+        assert isinstance(spec.fastpath, FastpathConfigSpec)
+        assert spec.fastpath.model_id == "diffusiongemma"
+
+
+class TestLaunchPresetSpec:
+    def test_requires_inference_profile_id(self):
+        with pytest.raises(ValidationError):
+            LaunchPresetSpec()
+
+    def test_sidecar_profile_id_is_optional(self):
+        spec = LaunchPresetSpec(inference_profile_id="hybrid")
+        assert spec.sidecar_profile_id is None
+
+    def test_pairs_both_ids(self):
+        spec = LaunchPresetSpec(inference_profile_id="hybrid", sidecar_profile_id="lightweight")
+        assert spec.inference_profile_id == "hybrid"
+        assert spec.sidecar_profile_id == "lightweight"
 
 
 class TestRecommendationConstraints:

@@ -219,7 +219,7 @@ class LiteLLMSupervisor:
         self._lifecycle_state = "disabled"
         self._shutting_down = False
         self._request_activity: dict[int, dict[str, tuple[bool, float]]] = {}
-        self._last_start_args: tuple[str, dict[str, Any], str] | None = None
+        self._last_start_args: tuple[str, dict[str, Any], str, set[str] | None] | None = None
         self._restart_task: asyncio.Task[Any] | None = None
 
     # ------------------------------------------------------------------
@@ -283,11 +283,12 @@ class LiteLLMSupervisor:
         models: dict[str, Any],
         config_text: str,
         reason: str = "",
+        referenced_ids: set[str] | None = None,
     ) -> dict[str, Any]:
         """Serialize generation startup with all other lifecycle changes."""
         async with self._lifecycle_lock:
             return await self._start_generation_unlocked(
-                registry_hash, models, config_text, reason,
+                registry_hash, models, config_text, reason, referenced_ids,
             )
 
     async def _start_generation_unlocked(
@@ -296,6 +297,7 @@ class LiteLLMSupervisor:
         models: dict[str, Any],
         config_text: str,
         reason: str = "",
+        referenced_ids: set[str] | None = None,
     ) -> dict[str, Any]:
         """Create a new generation and start its LiteLLM child.
 
@@ -308,7 +310,7 @@ class LiteLLMSupervisor:
         self._lifecycle_state = "starting"
         self._shutting_down = False
 
-        digest = config_digest(models)
+        digest = config_digest(models, referenced_ids=referenced_ids)
 
         # Create generation row (staging)
         generation = self._state.create_litellm_generation(
@@ -374,7 +376,10 @@ class LiteLLMSupervisor:
         self._active_pid = pid
         self._processes[generation] = child_proc
         self._lifecycle_state = "active"
-        self._last_start_args = (registry_hash, dict(models), config_text)
+        self._last_start_args = (
+            registry_hash, dict(models), config_text,
+            set(referenced_ids) if referenced_ids is not None else None,
+        )
 
         # Start crash monitor for the new child
         asyncio.create_task(self._monitor_child(pid, generation, dep_id))
@@ -405,12 +410,16 @@ class LiteLLMSupervisor:
         models: dict[str, Any],
         config_text: str,
         reason: str = "",
+        referenced_ids: set[str] | None = None,
     ) -> dict[str, Any]:
         """Reload the LiteLLM catalog with a new generation.
 
         If the config digest hasn't changed, returns immediately with
         ``changed=False``.  Otherwise creates a new generation and
-        activates it.
+        activates it. ``referenced_ids`` must match whatever scope was used
+        to build *config_text*, so a scope-only change (e.g. a new run
+        selecting models a narrower generation excluded) is detected even
+        when the underlying registry model definitions haven't changed.
         """
         from enhanced_router.litellm_config import config_digest
 
@@ -419,7 +428,7 @@ class LiteLLMSupervisor:
             # Skip if nothing changed
             current_active = self._state.get_active_litellm_generation()
             if current_active:
-                new_digest = config_digest(models)
+                new_digest = config_digest(models, referenced_ids=referenced_ids)
                 if current_active["config_digest"] == new_digest:
                     self._lifecycle_state = "active"
                     return {
@@ -433,6 +442,7 @@ class LiteLLMSupervisor:
                 models=models,
                 config_text=config_text,
                 reason=reason,
+                referenced_ids=referenced_ids,
             )
             result["changed"] = True
             return result
@@ -601,13 +611,14 @@ class LiteLLMSupervisor:
             await asyncio.sleep(max(0.0, self._crash_cooldown))
             if self._shutting_down or not self.can_restart() or self._last_start_args is None:
                 return
-            registry_hash, models, config_text = self._last_start_args
+            registry_hash, models, config_text, referenced_ids = self._last_start_args
             try:
                 await self.start_generation(
                     registry_hash=registry_hash,
                     models=models,
                     config_text=config_text,
                     reason="automatic crash recovery",
+                    referenced_ids=referenced_ids,
                 )
                 return
             except Exception as exc:

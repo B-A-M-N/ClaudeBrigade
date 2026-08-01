@@ -134,6 +134,10 @@ async def test_fastpath_route_can_detach_from_prompt_intake(monkeypatch):
             timeout_seconds=5,
         )
 
+        @classmethod
+        def resolve_fastpath(cls, sidecar_profile_id):
+            return cls.fastpath
+
         @staticmethod
         def get_model(model_id: str) -> SimpleNamespace:
             return SimpleNamespace(provider_id="freeinference")

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -16,17 +16,34 @@ from enhanced_router.config_models import (
     ModelEndpointSpec,
     EndpointPolicySpec,
     FastpathConfigSpec,
+    LaunchPresetSpec,
     ModelSpec,
     ProfileSpec,
     ProviderSpec,
     RecommendationConstraints,
     RankedModel,
+    SidecarProfileSpec,
     SidecarSpec,
     SpecialistSpec,
     WorkflowSpec,
 )
 
 _VALID_ROLES = frozenset(("recon", "implementer", "adversary", "repairer"))
+
+# Used only when RecommendationConstraints.prefer_low_cost is set (recommend()'s
+# cost-preference scoring component); free/cheap tiers score higher.
+_COST_CLASS_SCORE = {"free": 5, "low": 3, "standard": 1, "high": 0}
+
+
+@dataclass(frozen=True)
+class ConfigDiagnostic:
+    """One independently-failing validation section, from
+    ModelRegistry.collect_config_diagnostics(). 'section' names which
+    config concern failed (e.g. 'profiles', 'sidecars'); 'message' is the
+    same text _validate_cross_refs would have raised for that section."""
+
+    section: str
+    message: str
 
 
 def _number_value(value: Any) -> float | None:
@@ -79,6 +96,8 @@ class ModelRegistry:
         self._providers: dict[str, ProviderSpec] = {}
         self._sidecars: dict[str, SidecarSpec] = {}
         self._fastpath: FastpathConfigSpec | None = None
+        self._sidecar_profiles: dict[str, SidecarProfileSpec] = {}
+        self._launch_presets: dict[str, LaunchPresetSpec] = {}
         self._discovered_digest: str = ""
         self._raw_yaml: dict[str, str] = {}
 
@@ -196,6 +215,9 @@ class ModelRegistry:
                 controller_model=canonical(raw_profile.get("controller_model"))
                 if raw_profile.get("controller_model")
                 else None,
+                controller=canonical(raw_profile.get("controller"))
+                if raw_profile.get("controller")
+                else None,
                 specialists=specialists,
             )
             profiles[profile_id] = spec
@@ -261,6 +283,44 @@ class ModelRegistry:
             for sidecar_id, sidecar in (data.get("sidecars") or {}).items()
         }
         return self._sidecars
+
+    def load_sidecar_profiles(self, path: str | Path | None = None) -> dict[str, SidecarProfileSpec]:
+        """Load named sidecar-profile bundles from the operator config.
+
+        Optional: a config directory that predates sidecar profiles simply
+        has no sidecar_profiles.yaml, leaving this empty. ``resolve_sidecars``
+        and ``resolve_fastpath`` fall back to the bare global sidecars.yaml /
+        fastpath.yaml in that case.
+        """
+        target = Path(path) if path else self._config_path("sidecar_profiles.yaml")
+        if not target.exists():
+            self._sidecar_profiles = {}
+            self._raw_yaml.pop("sidecar_profiles", None)
+            return self._sidecar_profiles
+        raw = target.read_text(encoding="utf-8")
+        self._raw_yaml["sidecar_profiles"] = raw
+        data = yaml.safe_load(raw) or {}
+        self._sidecar_profiles = {
+            str(profile_id): SidecarProfileSpec(**profile)
+            for profile_id, profile in (data.get("sidecar_profiles") or {}).items()
+        }
+        return self._sidecar_profiles
+
+    def load_launch_presets(self, path: str | Path | None = None) -> dict[str, LaunchPresetSpec]:
+        """Load named launch presets (inference profile + sidecar profile pairs)."""
+        target = Path(path) if path else self._config_path("launch_presets.yaml")
+        if not target.exists():
+            self._launch_presets = {}
+            self._raw_yaml.pop("launch_presets", None)
+            return self._launch_presets
+        raw = target.read_text(encoding="utf-8")
+        self._raw_yaml["launch_presets"] = raw
+        data = yaml.safe_load(raw) or {}
+        self._launch_presets = {
+            str(preset_id): LaunchPresetSpec(**preset)
+            for preset_id, preset in (data.get("launch_presets") or {}).items()
+        }
+        return self._launch_presets
 
     def apply_discovered_catalog(self, entries: Sequence[Any], response_digest: str = "") -> None:
         """Merge authenticated provider metadata into the active generation.
@@ -361,29 +421,34 @@ class ModelRegistry:
                     spec.endpoints[endpoint_id] = endpoint.model_copy(update={"availability": "unavailable"})
         self._discovered_digest = response_digest
 
-    def discover_provider_catalog(
+    def fetch_discovered_entries(
         self,
         provider_id: str,
         *,
         endpoint_id: str = "openai",
-        state: object | None = None,
-        request_id: str | None = None,
         timeout: float = 30.0,
-    ) -> tuple[str, int]:
-        """Fetch and publish one authenticated provider catalog on demand.
+    ) -> list[Any]:
+        """Perform just the network fetch for one provider's catalog.
 
-        Discovery is explicit; startup and health checks never make inference
-        or catalog calls.  The authenticated provider response supplies model
-        context/output limits when it provides them.
+        Pure with respect to registry state -- makes no mutation, so callers
+        (e.g. a bounded thread pool refreshing several providers at once) can
+        run it concurrently across providers without any risk of a
+        read-modify-write race on the shared discovered-catalog file. Pair
+        with ``apply_discovered_entries`` to publish the result.
         """
         import os
 
-        from enhanced_router.provider_discovery import discover_openai_models, response_digest
+        from enhanced_router.provider_discovery import discover_openai_models
 
         provider = self._providers.get(provider_id)
         if provider is None:
             raise ValueError(f"unknown provider '{provider_id}'")
-        base_url = provider.endpoints.get(endpoint_id)
+        # An explicit discovery.url wins -- a provider's catalog listing
+        # endpoint doesn't always match one of its configured inference
+        # endpoints (e.g. a provider-wide /models route versus a
+        # per-deployment chat completions URL).
+        discovery_url = provider.discovery.get("url")
+        base_url = discovery_url or provider.endpoints.get(endpoint_id)
         if not base_url:
             raise ValueError(f"provider '{provider_id}' has no '{endpoint_id}' catalog endpoint")
         if not provider.api_key_env:
@@ -416,10 +481,28 @@ class ModelRegistry:
         # Provider catalogs frequently reuse the same upstream model ID. Keep
         # logical registry IDs provider-qualified while retaining the raw ID
         # for the actual OpenAI-compatible request.
-        entries = [
+        return [
             replace(entry, logical_model_id=f"{provider_id}/{entry.model_id}")
             for entry in entries
         ]
+
+    def apply_discovered_entries(
+        self,
+        entries: Sequence[Any],
+        *,
+        provider_id: str,
+        state: object | None = None,
+        request_id: str | None = None,
+    ) -> tuple[str, int]:
+        """Publish a previously-fetched catalog to this registry.
+
+        Mutates shared registry state (in-memory models, the persisted
+        ``discovered_models.yaml`` file) -- callers refreshing multiple
+        providers must serialize calls to this method even if the fetches
+        that produced *entries* ran concurrently.
+        """
+        from enhanced_router.provider_discovery import response_digest
+
         digest = response_digest(entries)
         self.apply_discovered_catalog(entries, digest)
         self._persist_discovered_catalog(entries)
@@ -434,6 +517,28 @@ class ModelRegistry:
                     request_id=request_id,
                 )
         return digest, len(entries)
+
+    def discover_provider_catalog(
+        self,
+        provider_id: str,
+        *,
+        endpoint_id: str = "openai",
+        state: object | None = None,
+        request_id: str | None = None,
+        timeout: float = 30.0,
+    ) -> tuple[str, int]:
+        """Fetch and publish one authenticated provider catalog on demand.
+
+        Discovery is explicit; startup and health checks never make inference
+        or catalog calls.  The authenticated provider response supplies model
+        context/output limits when it provides them.
+        """
+        entries = self.fetch_discovered_entries(
+            provider_id, endpoint_id=endpoint_id, timeout=timeout,
+        )
+        return self.apply_discovered_entries(
+            entries, provider_id=provider_id, state=state, request_id=request_id,
+        )
 
     @staticmethod
     def _catalog_entry_is_free(provider_id: str, entry: Any) -> bool:
@@ -545,28 +650,86 @@ class ModelRegistry:
         - required capabilities satisfied (tools for all roles, mutation for implementer/repairer)
         - provider endpoint configured (for direct-anthropic) or litellm_model set (for litellm)
         - if auth required, api_key_env is set
+
+        Fail-closed: raises on the FIRST violation found, across all
+        sections. This is what runtime startup (get_registry()) calls, and
+        it must keep failing loudly and immediately on any invalid config.
+        For the interactive wizard, which needs to stay usable even when
+        part of an existing config is broken, see collect_config_diagnostics
+        below -- it runs every section independently and collects each
+        section's failure instead of aborting at the first one.
         """
+        self._validate_profile_routes()
+        self._validate_provider_refs()
+        self._validate_fastpath_ref()
+        self._validate_sidecar_refs()
+        self._validate_workflow_sidecar_refs()
+        self._validate_sidecar_profile_refs()
+        self._validate_launch_preset_refs()
+
+    def collect_config_diagnostics(self) -> list["ConfigDiagnostic"]:
+        """Run every cross-ref validation section independently.
+
+        Unlike _validate_cross_refs (fail-closed, stops at the first
+        violation anywhere), this collects one diagnostic per FAILING
+        SECTION and keeps going -- a broken sidecar reference doesn't hide
+        a broken profile reference, and vice versa. This is what the
+        interactive config wizard uses so an operator can see (and fix)
+        everything wrong with their saved config in one pass, rather than
+        having the wizard refuse to even start over a single bad reference
+        somewhere in a file they weren't trying to touch. Only reports the
+        first failure *within* each section, not every individual bad
+        reference -- an exhaustive per-item scan would require rewriting
+        each check below to not raise, which isn't worth the risk to the
+        fail-closed runtime path both this and _validate_cross_refs share.
+        """
+        sections: list[tuple[str, Any]] = [
+            ("profiles", self._validate_profile_routes),
+            ("providers", self._validate_provider_refs),
+            ("fastpath", self._validate_fastpath_ref),
+            ("sidecars", self._validate_sidecar_refs),
+            ("workflows", self._validate_workflow_sidecar_refs),
+            ("sidecar_profiles", self._validate_sidecar_profile_refs),
+            ("launch_presets", self._validate_launch_preset_refs),
+        ]
+        diagnostics: list[ConfigDiagnostic] = []
+        for section, validator in sections:
+            try:
+                validator()
+            except ValueError as exc:
+                diagnostics.append(ConfigDiagnostic(section=section, message=str(exc)))
+        return diagnostics
+
+    def _validate_profile_routes(self) -> None:
         for pid, profile in self._profiles.items():
-            if profile.controller_model:
-                controller = self._models.get(profile.controller_model)
+            controller_route = profile.controller_route()
+            if controller_route is not None:
+                controller_model_id = controller_route.model
+                controller = self._models.get(controller_model_id)
                 if controller is None:
                     raise ValueError(
                         f"Profile '{pid}' references unknown controller model "
-                        f"'{profile.controller_model}'"
+                        f"'{controller_model_id}'"
                     )
                 if not controller.enabled:
                     raise ValueError(
                         f"Profile '{pid}' references disabled controller model "
-                        f"'{profile.controller_model}'"
+                        f"'{controller_model_id}'"
                     )
                 if not (
                     controller.capabilities.controller_eligible
                     or controller.backend == "anthropic-passthrough"
                 ):
                     raise ValueError(
-                        f"Profile '{pid}' controller model '{profile.controller_model}' "
+                        f"Profile '{pid}' controller model '{controller_model_id}' "
                         "is not controller-compatible"
                     )
+                for fallback_model_id in controller_route.fallback_models:
+                    if fallback_model_id not in self._models:
+                        raise ValueError(
+                            f"Profile '{pid}' controller fallback model "
+                            f"'{fallback_model_id}' is unknown"
+                        )
             for role in ("recon", "implementer", "adversary", "repairer"):
                 mid = profile.route_target(role).model
                 if mid not in self._models:
@@ -664,6 +827,7 @@ class ModelRegistry:
                             f"Profile '{pid}' specialist '{specialist_id}' model '{specialist.model}' does not allow role '{role}'"
                         )
 
+    def _validate_provider_refs(self) -> None:
         if self._providers:
             for model_id, spec in self._models.items():
                 if spec.provider_id and spec.provider_id not in self._providers:
@@ -681,6 +845,7 @@ class ModelRegistry:
                             f"Model '{model_id}' endpoint '{endpoint_id}' must declare provider_id"
                         )
 
+    def _validate_fastpath_ref(self) -> None:
         if self._fastpath is not None:
             if self._fastpath.enabled:
                 fastpath_model = self._models.get(self._fastpath.model_id)
@@ -691,6 +856,7 @@ class ModelRegistry:
                 if fastpath_model.capabilities.write_tool_certified:
                     raise ValueError("fastpath model cannot be write-tool certified")
 
+    def _validate_sidecar_refs(self) -> None:
         for sidecar_id, sidecar in self._sidecars.items():
             if not sidecar_id.strip():
                 raise ValueError("sidecar IDs must not be empty")
@@ -713,6 +879,7 @@ class ModelRegistry:
                     f"'{sidecar.endpoint}' on model '{sidecar.model_id}'"
                 )
 
+    def _validate_workflow_sidecar_refs(self) -> None:
         for workflow_id, workflow in self._workflows.items():
             for phase in workflow.phases:
                 if phase.sidecar and phase.sidecar not in self._sidecars:
@@ -720,6 +887,64 @@ class ModelRegistry:
                         f"workflow '{workflow_id}' phase '{phase.id}' references "
                         f"unknown sidecar '{phase.sidecar}'"
                     )
+
+    def _validate_sidecar_profile_refs(self) -> None:
+        for profile_id, sidecar_profile in self._sidecar_profiles.items():
+            for sidecar_id in sidecar_profile.sidecar_ids:
+                if sidecar_id not in self._sidecars:
+                    raise ValueError(
+                        f"sidecar profile '{profile_id}' references unknown sidecar '{sidecar_id}'"
+                    )
+            if sidecar_profile.fastpath is not None and sidecar_profile.fastpath.enabled:
+                fastpath_model = self._models.get(sidecar_profile.fastpath.model_id)
+                if fastpath_model is None:
+                    raise ValueError(
+                        f"sidecar profile '{profile_id}' fastpath references "
+                        f"unknown model '{sidecar_profile.fastpath.model_id}'"
+                    )
+                if fastpath_model.capabilities.write_tool_certified:
+                    raise ValueError(
+                        f"sidecar profile '{profile_id}' fastpath model cannot be write-tool certified"
+                    )
+
+    def _validate_launch_preset_refs(self) -> None:
+        for preset_id, preset in self._launch_presets.items():
+            if preset.inference_profile_id not in self._profiles:
+                raise ValueError(
+                    f"launch preset '{preset_id}' references unknown inference "
+                    f"profile '{preset.inference_profile_id}'"
+                )
+            if preset.sidecar_profile_id is not None and preset.sidecar_profile_id not in self._sidecar_profiles:
+                raise ValueError(
+                    f"launch preset '{preset_id}' references unknown sidecar "
+                    f"profile '{preset.sidecar_profile_id}'"
+                )
+
+    def profile_model_diversity_warnings(self) -> list[str]:
+        """Flag profiles where recon/implementer/adversary/repairer all
+        resolve to the same model.
+
+        Not part of _validate_cross_refs / collect_config_diagnostics --
+        same-model-for-every-role is a valid, loadable configuration (an
+        operator may deliberately accept it for cost or licensing reasons),
+        just one where the adversary role reviews the implementer role's
+        output under the identical underlying model, which weakens
+        adversarial review into self-review. Advisory only.
+        """
+        warnings: list[str] = []
+        for profile_id, profile in self._profiles.items():
+            models = {
+                profile.route_target(role).model
+                for role in ("recon", "implementer", "adversary", "repairer")
+            }
+            if len(models) == 1:
+                warnings.append(
+                    f"profile '{profile_id}' assigns the same model "
+                    f"('{next(iter(models))}') to recon, implementer, adversary, "
+                    f"and repairer -- adversarial review will not be independent "
+                    f"of the implementation it's reviewing"
+                )
+        return warnings
 
     # ------------------------------------------------------------------
     # Lookup
@@ -751,7 +976,12 @@ class ModelRegistry:
             if spec.enabled and spec.capabilities.controller_eligible
         ]
 
-    def referenced_model_ids(self) -> set[str]:
+    def referenced_model_ids(
+        self,
+        *,
+        profile_ids: set[str] | None = None,
+        sidecar_profile_ids: set[str] | None = None,
+    ) -> set[str]:
         """Return every model_id actually assigned somewhere (profile/sidecar/fastpath).
 
         Provider discovery can add hundreds of models to the registry, but
@@ -763,11 +993,25 @@ class ModelRegistry:
         actually in use; it is not a general-purpose "is this model good"
         check, so callers that want the full catalog (e.g. tests) simply
         don't apply it.
+
+        ``profile_ids`` / ``sidecar_profile_ids`` further bound the result to
+        specific saved profiles (e.g. the ones currently selected by runs in
+        flight) instead of every profile the config has ever saved. ``None``
+        (the default) for either scans everything, matching prior behavior
+        -- required at cold daemon startup, before any run has made a
+        selection to scope to.
         """
         ids: set[str] = set()
-        for profile in self._profiles.values():
-            if profile.controller_model:
-                ids.add(profile.controller_model)
+        profiles = (
+            self._profiles.values()
+            if profile_ids is None
+            else (self._profiles[pid] for pid in profile_ids if pid in self._profiles)
+        )
+        for profile in profiles:
+            controller_route = profile.controller_route()
+            if controller_route is not None:
+                ids.add(controller_route.model)
+                ids.update(controller_route.fallback_models)
             for role in ("recon", "implementer", "adversary", "repairer"):
                 target = getattr(profile, role)
                 if isinstance(target, str):
@@ -777,11 +1021,56 @@ class ModelRegistry:
                     ids.update(target.fallback_models)
             for specialist in profile.specialists.values():
                 ids.add(specialist.model)
-        for sidecar in self._sidecars.values():
-            ids.add(sidecar.model_id)
-        if self._fastpath is not None:
-            ids.add(self._fastpath.model_id)
+
+        if sidecar_profile_ids is None:
+            for sidecar in self._sidecars.values():
+                ids.add(sidecar.model_id)
+            if self._fastpath is not None:
+                ids.add(self._fastpath.model_id)
+            for sidecar_profile in self._sidecar_profiles.values():
+                if sidecar_profile.fastpath is not None:
+                    ids.add(sidecar_profile.fastpath.model_id)
+        else:
+            for sp_id in sidecar_profile_ids:
+                for sidecar in self.resolve_sidecars(sp_id).values():
+                    ids.add(sidecar.model_id)
+                fastpath = self.resolve_fastpath(sp_id)
+                if fastpath is not None:
+                    ids.add(fastpath.model_id)
         return ids
+
+    def referenced_model_ids_for_active_runs(self, state: Any) -> set[str]:
+        """Scope ``referenced_model_ids`` to what runs currently in flight selected.
+
+        Falls back to the unscoped (every saved profile) result when there
+        are no open runs yet, or when any open run launched without a
+        profile selection (a bare ``--model`` override) -- in either case
+        there is no bounded selection set to scope to safely.
+        """
+        selections = state.active_run_selections()
+        if not selections:
+            return self.referenced_model_ids()
+
+        profile_ids: set[str] = set()
+        sidecar_profile_ids: set[str] = set()
+        profile_scope_bounded = True
+        sidecar_scope_bounded = True
+        for selection in selections:
+            profile_id = selection.get("inference_profile_id")
+            sidecar_profile_id = selection.get("sidecar_profile_id")
+            if profile_id:
+                profile_ids.add(profile_id)
+            else:
+                profile_scope_bounded = False
+            if sidecar_profile_id:
+                sidecar_profile_ids.add(sidecar_profile_id)
+            else:
+                sidecar_scope_bounded = False
+
+        return self.referenced_model_ids(
+            profile_ids=profile_ids if profile_scope_bounded else None,
+            sidecar_profile_ids=sidecar_profile_ids if sidecar_scope_bounded else None,
+        )
 
     def get_profile(self, profile_id: str) -> ProfileSpec:
         """Return the ``ProfileSpec`` for *profile_id* or raise."""
@@ -790,20 +1079,20 @@ class ModelRegistry:
             raise KeyError(f"Unknown profile: {profile_id}")
         return spec
 
-    def specialist_manifest(self) -> dict[str, dict[str, str]]:
+    def specialist_manifest(self, profile_id: str | None = None) -> dict[str, dict[str, str]]:
         from enhanced_router.agent_manifest import specialist_manifest
 
-        return specialist_manifest(self)
+        return specialist_manifest(self, profile_id)
 
-    def role_model_aliases(self) -> dict[str, str]:
+    def role_model_aliases(self, profile_id: str | None = None) -> dict[str, str]:
         from enhanced_router.agent_manifest import role_model_aliases
 
-        return role_model_aliases(self)
+        return role_model_aliases(self, profile_id)
 
-    def role_model_bindings(self) -> dict[str, str]:
+    def role_model_bindings(self, profile_id: str | None = None) -> dict[str, str]:
         from enhanced_router.agent_manifest import role_model_bindings
 
-        return role_model_bindings(self)
+        return role_model_bindings(self, profile_id)
 
     def native_agent_name(self, model_id: str, role: str) -> str:
         from enhanced_router.agent_manifest import native_agent_name
@@ -863,15 +1152,13 @@ class ModelRegistry:
         for role in _VALID_ROLES:
             target = profile.route_target(role)
             fallback_models = list(target.fallback_models)
-            candidates = [target.model, *fallback_models]
+            candidate_specs = [target.primary, *target.fallbacks]
             candidate_reasons = [
-                self._model_readiness_reasons(
-                    candidate, role, target.endpoint if index == 0 else "auto"
-                )
-                for index, candidate in enumerate(candidates)
+                self._model_readiness_reasons(spec.model, role, spec.endpoint)
+                for spec in candidate_specs
             ]
             selected = next(
-                (candidate for candidate, reasons in zip(candidates, candidate_reasons) if not reasons),
+                (spec.model for spec, reasons in zip(candidate_specs, candidate_reasons) if not reasons),
                 None,
             )
             roles[role] = {
@@ -917,6 +1204,10 @@ class ModelRegistry:
           4. **Local/remote preference** (0-5) — matches local_only constraint.
           5. **Profile preference** (0-5) — model is the profile default for the role.
           6. **Health bonus** (0-5) — model is healthy (reachable, authenticated, compatible).
+          7. **Cost preference** (0-5) — only scored when
+             ``constraints.prefer_low_cost`` is set; cheaper ``cost_class``
+             tiers score higher. Opt-in and additive so it never changes the
+             ranking for existing callers that don't ask for it.
 
         Returns models sorted by total score descending, then by model_id for
         determinism.
@@ -1017,6 +1308,13 @@ class ModelRegistry:
             if not spec.enabled:
                 reasons.append("disabled")
 
+            # 7. Cost preference (opt-in; additive, never applied by default)
+            if constraints.prefer_low_cost:
+                cost_score = _COST_CLASS_SCORE.get(spec.capabilities.cost_class, 0)
+                score += cost_score
+                if cost_score >= 3:
+                    reasons.append(f"cost-{spec.capabilities.cost_class}")
+
             candidates.append((mid, spec, score, ", ".join(reasons)))
 
         # Sort by score desc, then model_id asc for determinism
@@ -1038,6 +1336,10 @@ class ModelRegistry:
             combined += key + "=" + self._raw_yaml[key]
         combined += "discovered=" + self._discovered_digest
         return hashlib.sha256(combined.encode("utf-8")).hexdigest()
+
+    @property
+    def config_dir(self) -> Path | None:
+        return self._config_dir
 
     def reload(self) -> None:
         """Re-load all YAML files from the config directory."""
@@ -1096,6 +1398,57 @@ class ModelRegistry:
         if spec is None:
             raise KeyError(f"Unknown sidecar: {sidecar_id}")
         return spec
+
+    @property
+    def sidecar_profiles(self) -> dict[str, SidecarProfileSpec]:
+        return self._sidecar_profiles
+
+    def get_sidecar_profile(self, sidecar_profile_id: str) -> SidecarProfileSpec:
+        spec = self._sidecar_profiles.get(sidecar_profile_id)
+        if spec is None:
+            raise KeyError(f"Unknown sidecar profile: {sidecar_profile_id}")
+        return spec
+
+    @property
+    def launch_presets(self) -> dict[str, LaunchPresetSpec]:
+        return self._launch_presets
+
+    def get_launch_preset(self, launch_preset_id: str) -> LaunchPresetSpec:
+        spec = self._launch_presets.get(launch_preset_id)
+        if spec is None:
+            raise KeyError(f"Unknown launch preset: {launch_preset_id}")
+        return spec
+
+    def resolve_sidecars(self, sidecar_profile_id: str | None) -> dict[str, SidecarSpec]:
+        """Return the sidecars available for *sidecar_profile_id*.
+
+        With no profile selected, every globally-defined sidecar remains
+        available -- the pre-sidecar-profile behavior, unchanged for any
+        config that hasn't adopted profiles. With a profile selected, only
+        the sidecar IDs it lists are available, so a launch can bound which
+        (possibly resource-costly) sidecars a run may invoke.
+        """
+        if sidecar_profile_id is None:
+            return self._sidecars
+        profile = self.get_sidecar_profile(sidecar_profile_id)
+        return {
+            sidecar_id: self._sidecars[sidecar_id]
+            for sidecar_id in profile.sidecar_ids
+            if sidecar_id in self._sidecars
+        }
+
+    def resolve_fastpath(self, sidecar_profile_id: str | None) -> FastpathConfigSpec | None:
+        """Return the fastpath config for *sidecar_profile_id*.
+
+        A sidecar profile's own ``fastpath`` takes precedence; falling back
+        to the bare global fastpath.yaml singleton keeps configs that
+        predate sidecar profiles working unchanged.
+        """
+        if sidecar_profile_id is not None:
+            profile = self.get_sidecar_profile(sidecar_profile_id)
+            if profile.fastpath is not None:
+                return profile.fastpath
+        return self._fastpath
 
     def sidecar_readiness(self, sidecar_id: str) -> dict[str, Any]:
         """Report static transport readiness without making an inference call."""
@@ -1206,5 +1559,7 @@ def get_registry() -> ModelRegistry:
         _registry_instance.load_providers()
         _registry_instance.load_fastpath()
         _registry_instance.load_sidecars()
+        _registry_instance.load_sidecar_profiles()
+        _registry_instance.load_launch_presets()
         _registry_instance._validate_cross_refs()
     return _registry_instance

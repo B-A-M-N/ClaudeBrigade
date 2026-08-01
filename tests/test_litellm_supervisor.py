@@ -119,6 +119,45 @@ class TestLiteLLMHelpers:
 
         assert result is False
 
+    @pytest.mark.asyncio
+    async def test_health_probe_sends_master_key_as_bearer_auth(self):
+        """An unauthenticated /health request hits LiteLLM's
+        user_api_key_auth dependency's "no api key" error branch, which
+        unconditionally imports the optional `prisma` package to classify
+        the error -- turning a clean 401 into an uncaught ModuleNotFoundError
+        (HTTP 500) when prisma isn't installed, masking a healthy child as a
+        startup failure. Sending the configured master key must route the
+        request around that branch entirely.
+        """
+        fake_response = mock.MagicMock()
+        fake_response.status_code = 200
+        fake_client = mock.AsyncMock()
+        fake_client.get.return_value = fake_response
+        fake_client.__aenter__ = mock.AsyncMock(return_value=fake_client)
+        fake_client.__aexit__ = mock.AsyncMock(return_value=None)
+
+        with mock.patch("httpx.AsyncClient", return_value=fake_client):
+            await _health_probe(19000, api_key="secret-master-key", timeout=1.0, retries=2, interval=0.01)
+
+        fake_client.get.assert_called_once()
+        _, kwargs = fake_client.get.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer secret-master-key"}
+
+    @pytest.mark.asyncio
+    async def test_health_probe_without_api_key_sends_no_auth_header(self):
+        fake_response = mock.MagicMock()
+        fake_response.status_code = 200
+        fake_client = mock.AsyncMock()
+        fake_client.get.return_value = fake_response
+        fake_client.__aenter__ = mock.AsyncMock(return_value=fake_client)
+        fake_client.__aexit__ = mock.AsyncMock(return_value=None)
+
+        with mock.patch("httpx.AsyncClient", return_value=fake_client):
+            await _health_probe(19000, timeout=1.0, retries=2, interval=0.01)
+
+        _, kwargs = fake_client.get.call_args
+        assert kwargs["headers"] == {}
+
     # ------------------------------------------------------------------
     # _kill_process
     # ------------------------------------------------------------------
@@ -498,6 +537,63 @@ class TestLiteLLMSupervisor:
                 task.result()
             except Exception:
                 pass
+
+    @pytest.mark.asyncio
+    async def test_reload_passes_referenced_ids_through_to_config_digest(self):
+        """A scope-only change (same models, narrower/wider referenced_ids)
+        must still be detectable -- reload must feed the caller's
+        referenced_ids into config_digest rather than always computing an
+        unscoped digest, or a new run's previously-excluded models would
+        never trigger a fresh generation.
+        """
+        state = _make_mock_state()
+        sup = LiteLLMSupervisor(state, "/tmp/litellm-test-config")
+
+        state.get_active_litellm_generation.return_value = {
+            "generation": 1,
+            "config_digest": "old-digest",
+            "status": "active",
+        }
+
+        with mock.patch(
+            "enhanced_router.litellm_config.config_digest", return_value="old-digest"
+        ) as mock_digest:
+            result = await sup.reload(
+                registry_hash="hash-1",
+                models={"m1": mock.MagicMock(backend="litellm", enabled=True)},
+                config_text="model_list:",
+                reason="reload",
+                referenced_ids={"m1"},
+            )
+
+        mock_digest.assert_called_once_with(
+            {"m1": mock.ANY}, referenced_ids={"m1"},
+        )
+        assert result["changed"] is False
+
+    @pytest.mark.asyncio
+    async def test_restart_after_crash_preserves_referenced_ids(self):
+        """Crash recovery replays the last known-good generation via
+        start_generation directly (bypassing reload's digest check), so it
+        must carry the same referenced_ids scope forward too -- otherwise a
+        restarted child would silently widen back out to every model.
+        """
+        state = _make_mock_state()
+        sup = LiteLLMSupervisor(state, "/tmp/litellm-test-config")
+        sup._last_start_args = ("hash-1", {"m1": mock.MagicMock()}, "model_list:", {"m1"})
+
+        with mock.patch.object(
+            sup, "start_generation", new=mock.AsyncMock(return_value={"generation": 2}),
+        ) as mock_start:
+            await sup._restart_after_crash()
+
+        mock_start.assert_called_once_with(
+            registry_hash="hash-1",
+            models={"m1": mock.ANY},
+            config_text="model_list:",
+            reason="automatic crash recovery",
+            referenced_ids={"m1"},
+        )
 
     # ------------------------------------------------------------------
     # shutdown

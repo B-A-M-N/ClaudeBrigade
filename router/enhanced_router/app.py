@@ -72,7 +72,8 @@ async def _init_litellm_supervisor(app: FastAPI) -> None:
     try:
         registry = get_registry()
         reg_hash = registry.registry_hash()
-        config_text = generate_litellm_config(registry.models, referenced_ids=registry.referenced_model_ids())
+        referenced_ids = registry.referenced_model_ids_for_active_runs(state)
+        config_text = generate_litellm_config(registry.models, referenced_ids=referenced_ids)
 
         if registry.models and any(
             s.has_litellm_endpoint() and s.enabled
@@ -83,6 +84,7 @@ async def _init_litellm_supervisor(app: FastAPI) -> None:
                 models=registry.models,
                 config_text=config_text,
                 reason="app-startup",
+                referenced_ids=referenced_ids,
             )
         else:
             LOGGER.info("No enabled litellm models; supervisor ready but idle")
@@ -230,6 +232,23 @@ async def internal_fastpath_route(request: Request) -> JSONResponse:
     return JSONResponse(await _wait_fastpath_job(str(execution["execution_id"])))
 
 
+def _resolve_run_fastpath(registry: Any, run_id: Any) -> Any:
+    """Return the fastpath config for *run_id*'s selected sidecar profile.
+
+    Fastpath is scoped per sidecar-profile rather than a bare global
+    singleton (see ModelRegistry.resolve_fastpath): a run that selected a
+    named sidecar profile gets that profile's own fastpath coprocessor;
+    a run with no selection (or an unknown run_id) falls back to the
+    global fastpath.yaml singleton, unchanged from prior behavior.
+    """
+    sidecar_profile_id = None
+    if isinstance(run_id, str) and run_id:
+        run_row = get_state().get_run(run_id)
+        if run_row:
+            sidecar_profile_id = run_row.get("sidecar_profile_id")
+    return registry.resolve_fastpath(sidecar_profile_id)
+
+
 async def _queue_fastpath_job(
     *,
     packet: dict[str, Any],
@@ -241,7 +260,7 @@ async def _queue_fastpath_job(
     from enhanced_router.sidecar_executor import get_sidecar_executor
 
     registry = get_registry()
-    config = registry.fastpath
+    config = _resolve_run_fastpath(registry, packet.get("run_id"))
     if config is None or not config.enabled or mode not in config.modes:
         raise HTTPException(status_code=404, detail=f"fastpath {mode} mode is disabled")
     run_id = str(packet.get("run_id") or "")
@@ -292,7 +311,7 @@ async def _run_fastpath_route(packet: dict[str, Any]) -> dict[str, Any]:
     from enhanced_router.registry import get_registry
 
     registry = get_registry()
-    config = registry.fastpath
+    config = _resolve_run_fastpath(registry, packet.get("run_id"))
     if config is None or not config.enabled or "route" not in config.modes:
         raise HTTPException(status_code=404, detail="fastpath route mode is disabled")
     encoded = json.dumps(packet, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -387,15 +406,15 @@ async def internal_fastpath_verify(request: Request) -> JSONResponse:
     from enhanced_router.registry import get_registry
 
     registry = get_registry()
-    config = registry.fastpath
-    if config is None or not config.enabled or "verify" not in config.modes:
-        raise HTTPException(status_code=404, detail="fastpath verify mode is disabled")
     try:
         body = await request.json()
     except Exception as exc:
         raise HTTPException(status_code=400, detail="fastpath packet must be JSON") from exc
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="fastpath packet must be an object")
+    config = _resolve_run_fastpath(registry, body.get("run_id"))
+    if config is None or not config.enabled or "verify" not in config.modes:
+        raise HTTPException(status_code=404, detail="fastpath verify mode is disabled")
     packet = body.get("packet", body)
     if not isinstance(packet, dict):
         raise HTTPException(status_code=400, detail="fastpath packet must be an object")
@@ -423,7 +442,7 @@ async def _run_fastpath_verify(body: dict[str, Any]) -> dict[str, Any]:
     from enhanced_router.registry import get_registry
 
     registry = get_registry()
-    config = registry.fastpath
+    config = _resolve_run_fastpath(registry, body.get("run_id"))
     if config is None:
         raise RuntimeError("fastpath is not configured")
     packet = body["packet"]

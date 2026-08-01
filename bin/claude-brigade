@@ -348,6 +348,8 @@ PY
 CLAUDE_ARGS=()
 CONTROLLER_MODEL=""
 BRIGADE_PROFILE="${CLAUDE_BRIGADE_PROFILE:-}"
+SIDECAR_PROFILE="${CLAUDE_BRIGADE_SIDECAR_PROFILE:-}"
+LAUNCH_PRESET="${CLAUDE_BRIGADE_LAUNCH_PRESET:-}"
 while [ "$#" -gt 0 ]; do
   argument="$1"
   case "$argument" in
@@ -362,16 +364,38 @@ while [ "$#" -gt 0 ]; do
       fi
       CONTROLLER_MODEL="$1"
       ;;
-    --brigade-profile=*)
+    --brigade-profile=*|--inference-profile=*)
       BRIGADE_PROFILE="${argument#*=}"
       ;;
-    --brigade-profile)
+    --brigade-profile|--inference-profile)
       shift
       if [ "$#" -eq 0 ]; then
-        echo "--brigade-profile requires a saved profile ID" >&2
+        echo "$argument requires a saved profile ID" >&2
         exit 2
       fi
       BRIGADE_PROFILE="$1"
+      ;;
+    --sidecar-profile=*)
+      SIDECAR_PROFILE="${argument#*=}"
+      ;;
+    --sidecar-profile)
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "--sidecar-profile requires a saved sidecar profile ID" >&2
+        exit 2
+      fi
+      SIDECAR_PROFILE="$1"
+      ;;
+    --launch-preset=*)
+      LAUNCH_PRESET="${argument#*=}"
+      ;;
+    --launch-preset)
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "--launch-preset requires a saved launch preset ID" >&2
+        exit 2
+      fi
+      LAUNCH_PRESET="$1"
       ;;
     --model=*)
       requested_model="${argument#*=}"
@@ -413,7 +437,7 @@ done
 # as a named profile and used for this launch.
 # ---------------------------------------------------------------------------
 
-if [ -z "$CONTROLLER_MODEL" ] && [ -z "${requested_model:-}" ] && [ -z "$BRIGADE_PROFILE" ] && [ -t 0 ]; then
+if [ -z "$CONTROLLER_MODEL" ] && [ -z "${requested_model:-}" ] && [ -z "$BRIGADE_PROFILE" ] && [ -z "$LAUNCH_PRESET" ] && [ -t 0 ]; then
   echo "Start with:" >&2
   echo "  1) Default -- Claude Code + FreeInference sidecar as configured" >&2
   echo "  2) Configure your own controller/role models, fallbacks, and sidecar" >&2
@@ -466,16 +490,52 @@ PY
   fi
 fi
 
+if [ -n "$LAUNCH_PRESET" ]; then
+  # A launch preset pairs a saved inference profile with a saved sidecar
+  # profile. Explicit --brigade-profile/--sidecar-profile flags still win --
+  # the preset only fills in whichever of the two wasn't set directly.
+  _preset_resolved="$(BRIGADE_CONFIG_DIR="$CONFIG_DIR" PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" - "$LAUNCH_PRESET" <<'PY'
+import sys
+from enhanced_router.registry import get_registry
+
+preset = get_registry().get_launch_preset(sys.argv[1])
+print(preset.inference_profile_id)
+print(preset.sidecar_profile_id or "")
+PY
+)" || {
+    echo "Unable to load saved launch preset '$LAUNCH_PRESET'." >&2
+    exit 2
+  }
+  _preset_inference_profile="$(printf '%s\n' "$_preset_resolved" | sed -n '1p')"
+  _preset_sidecar_profile="$(printf '%s\n' "$_preset_resolved" | sed -n '2p')"
+  [ -z "$BRIGADE_PROFILE" ] && BRIGADE_PROFILE="$_preset_inference_profile"
+  [ -z "$SIDECAR_PROFILE" ] && SIDECAR_PROFILE="$_preset_sidecar_profile"
+fi
+
 if [ -n "$BRIGADE_PROFILE" ]; then
   export CLAUDE_BRIGADE_PROFILE="$BRIGADE_PROFILE"
-  # The env var only reaches this process tree; the run row is what a
+fi
+if [ -n "$SIDECAR_PROFILE" ]; then
+  export CLAUDE_BRIGADE_SIDECAR_PROFILE="$SIDECAR_PROFILE"
+fi
+
+if [ -n "$BRIGADE_PROFILE" ] || [ -n "$SIDECAR_PROFILE" ] || [ -n "$LAUNCH_PRESET" ]; then
+  # The env vars only reach this process tree; the run row is what a
   # shared router daemon actually consults (hooks/user_prompt_submit.py
-  # reads state.get_run(run_id) first, falling back to this env var only
+  # reads state.get_run(run_id) first, falling back to these env vars only
   # for a run that was never given an explicit selection).
-  BRIGADE_CONFIG_DIR="$CONFIG_DIR" PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" - "$RUN_ID" "$BRIGADE_PROFILE" <<'PY' 2>/dev/null || true
+  BRIGADE_CONFIG_DIR="$CONFIG_DIR" PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" - \
+    "$RUN_ID" "$BRIGADE_PROFILE" "$SIDECAR_PROFILE" "$LAUNCH_PRESET" <<'PY' 2>/dev/null || true
 import sys
 from enhanced_router.state import get_state
-get_state().set_run_selection(sys.argv[1], inference_profile_id=sys.argv[2])
+
+run_id, inference_profile_id, sidecar_profile_id, launch_preset_id = sys.argv[1:5]
+get_state().set_run_selection(
+    run_id,
+    inference_profile_id=inference_profile_id or None,
+    sidecar_profile_id=sidecar_profile_id or None,
+    launch_preset_id=launch_preset_id or None,
+)
 PY
 fi
 
@@ -491,7 +551,8 @@ from enhanced_router.registry import get_registry
 
 profile_id = sys.argv[1]
 profile = get_registry().get_profile(profile_id)
-print(profile.controller_model or "")
+route = profile.controller_route()
+print(route.model if route is not None else "")
 PY
 )" || {
     echo "Unable to load saved Brigade profile '$BRIGADE_PROFILE'." >&2
@@ -707,7 +768,7 @@ export ANTHROPIC_CUSTOM_HEADERS="$(
 # ---------------------------------------------------------------------------
 
 AGENTS_JSON="$(
-  PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" -m enhanced_router.agents_json "$PROFILE_DIR/agents"
+  PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" -m enhanced_router.agents_json "$PROFILE_DIR/agents" "$BRIGADE_PROFILE"
 )"
 
 # ---------------------------------------------------------------------------

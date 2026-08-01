@@ -15,8 +15,11 @@ import os
 import re
 import sys
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
@@ -80,7 +83,18 @@ def _load_registry(config_dir: Path) -> tuple[ModelRegistry, tuple[str, ...]]:
     registry.load_providers()
     registry.load_fastpath()
     registry.load_sidecars()
-    registry._validate_cross_refs()
+    registry.load_sidecar_profiles()
+    registry.load_launch_presets()
+    # Tolerant, not fail-closed: a broken reference anywhere in the saved
+    # config (e.g. a profile pointing at a model that was since removed)
+    # must not prevent the wizard from even starting -- the operator needs
+    # a working menu to *fix* it. Runtime startup (get_registry()) is a
+    # separate, unrelated call path and still calls _validate_cross_refs()
+    # directly, so the running router stays fail-closed on invalid config.
+    for diagnostic in registry.collect_config_diagnostics():
+        print(f"Warning: saved '{diagnostic.section}' configuration has an issue: {diagnostic.message}")
+    for warning in registry.profile_model_diversity_warnings():
+        print(f"Warning: {warning}")
     return registry, loaded.provider_keys
 
 
@@ -169,36 +183,118 @@ def _prompt_float(label: str, default: float, minimum: float, maximum: float) ->
         print(f"Enter a number from {minimum} to {maximum}.")
 
 
+_PAGE_SIZE = 15
+
+
 def _choose(label: str, options: list[tuple[str, str]], default: int = 1) -> str:
+    """Numbered picker over *options*, paginated for lists longer than a
+    screenful. Numbers are absolute across pages (option 17 is always
+    option 17, on whichever page it's currently shown), so a remembered or
+    typed-ahead number never shifts meaning when the page changes."""
     if not options:
         raise RuntimeError(f"No choices are available for {label}.")
-    print(f"\n{label}")
-    for number, (value, description) in enumerate(options, start=1):
-        print(f"  {number}. {value} — {description}")
+    total_pages = (len(options) - 1) // _PAGE_SIZE + 1
+    page = ((default - 1) // _PAGE_SIZE) if 1 <= default <= len(options) else 0
     while True:
+        start = page * _PAGE_SIZE
+        end = min(start + _PAGE_SIZE, len(options))
+        suffix = f" (page {page + 1}/{total_pages})" if total_pages > 1 else ""
+        print(f"\n{label}{suffix}")
+        for number in range(start, end):
+            value, description = options[number]
+            print(f"  {number + 1}. {value} — {description}")
+        if total_pages > 1:
+            print("  n) next page   p) previous page")
         raw = _prompt("Choose", str(default))
+        lowered = raw.strip().lower()
+        if total_pages > 1 and lowered == "n":
+            page = min(page + 1, total_pages - 1)
+            continue
+        if total_pages > 1 and lowered == "p":
+            page = max(page - 1, 0)
+            continue
         try:
             index = int(raw)
         except ValueError:
-            print("Choose one of the listed numbers.")
+            print("Choose one of the listed numbers, or n/p to change page.")
             continue
         if 1 <= index <= len(options):
             return options[index - 1][0]
         print("Choose one of the listed numbers.")
 
 
+def _rank_query_matches(query: str, options: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Rank *options* against *query*, best match first.
+
+    A plain substring filter treats "starts with the query" the same as
+    "the query happens to appear buried in the description" -- with a
+    provider-discovered catalog of hundreds of models, that buries the
+    model the operator is actually typing towards under noise. Rank
+    instead: exact ID match, then ID-prefix, then ID-substring, then
+    label-substring; ties keep the original (already-sorted-by-ID) order.
+    """
+    query = query.lower()
+    if not query:
+        return list(options)
+
+    def _rank(item: tuple[str, str]) -> int:
+        model_id, label = item
+        model_id_lower = model_id.lower()
+        if model_id_lower == query:
+            return 0
+        if model_id_lower.startswith(query):
+            return 1
+        if query in model_id_lower:
+            return 2
+        if query in label.lower():
+            return 3
+        return 4
+
+    ranked = [(index, item) for index, item in enumerate(options) if _rank(item) < 4]
+    ranked.sort(key=lambda pair: (_rank(pair[1]), pair[0]))
+    return [item for _, item in ranked]
+
+
+def _distinct_providers(options: list[tuple[str, str]]) -> list[str]:
+    """Extract each distinct 'provider=X' token from _model_choices labels,
+    in first-seen order, for the provider-first filtering step."""
+    seen: list[str] = []
+    for _, label in options:
+        for segment in label.split("; "):
+            if segment.startswith("provider="):
+                provider = segment[len("provider="):]
+                if provider not in seen:
+                    seen.append(provider)
+    return seen
+
+
 def _choose_model(
     label: str, options: list[tuple[str, str]], default_id: str = ""
 ) -> str:
-    """Search a potentially large discovered catalog before choosing."""
+    """Search a potentially large discovered catalog before choosing.
+
+    Provider-first filtering narrows hundreds of discovered models down to
+    one provider's handful before the operator has to type anything, and
+    ranked search (see _rank_query_matches) puts the closest ID match
+    first instead of preserving arbitrary catalog order.
+    """
+    providers = _distinct_providers(options)
+    scoped = options
+    if len(providers) > 1:
+        provider_choice = input(
+            f"Filter {label} by provider ({', '.join(providers)}; blank = all): "
+        ).strip()
+        if provider_choice:
+            narrowed = [item for item in options if f"provider={provider_choice}" in item[1]]
+            if narrowed:
+                scoped = narrowed
+            else:
+                print(f"No models from provider '{provider_choice}'; showing all providers instead.")
     while True:
         query = input(f"Search {label} (blank lists all): ").strip().lower()
-        filtered = options if not query else [
-            item for item in options
-            if query in item[0].lower() or query in item[1].lower()
-        ]
+        filtered = scoped if not query else _rank_query_matches(query, scoped)
         if not filtered:
-            print(f"No matches for '{query}'. Press Enter with nothing typed to list all {len(options)} options.")
+            print(f"No matches for '{query}'. Press Enter with nothing typed to list all {len(scoped)} options.")
             continue
         default = next(
             (index for index, item in enumerate(filtered, 1) if item[0] == default_id),
@@ -454,12 +550,114 @@ def _confirm_and_grant(
 def _profile_model(profile: dict[str, Any], role: str) -> tuple[str, str, list[str]]:
     raw = profile.get(role, "")
     if isinstance(raw, dict):
-        return (
-            str(raw.get("model", "")),
-            str(raw.get("endpoint", "auto")),
-            [str(item) for item in raw.get("fallback_models", []) if isinstance(item, str)],
-        )
+        fallback_ids = []
+        for item in raw.get("fallback_models", []):
+            if isinstance(item, str):
+                fallback_ids.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("model"), str):
+                fallback_ids.append(item["model"])
+        return str(raw.get("model", "")), str(raw.get("endpoint", "auto")), fallback_ids
     return str(raw), "auto", []
+
+
+def _profile_fallback_routes(profile: dict[str, Any], role: str) -> list[dict]:
+    """Like _profile_model's third element, but keeps each fallback's own
+    endpoint (not just its model ID) for handing to _edit_fallbacks."""
+    raw = profile.get(role, "")
+    if not isinstance(raw, dict):
+        return []
+    routes = []
+    for item in raw.get("fallback_models", []):
+        if isinstance(item, str):
+            routes.append({"model": item, "endpoint": "auto"})
+        elif isinstance(item, dict) and isinstance(item.get("model"), str):
+            routes.append({"model": item["model"], "endpoint": str(item.get("endpoint", "auto"))})
+    return routes
+
+
+def _edit_fallbacks(
+    config_dir: Path,
+    registry: ModelRegistry,
+    *,
+    role: str | None,
+    controller: bool = False,
+    fallback_options: list[tuple[str, str]],
+    previous: list[dict],
+) -> list[dict]:
+    """Interactive add/remove/reorder editor for a route's fallback ladder.
+
+    Each fallback is a full {model, endpoint} pair (RouteCandidateSpec): a
+    fallback can pin a different provider/endpoint than the primary route,
+    not just fall back to the same model under 'auto'. Replaces a bare
+    comma-separated free-text prompt, which had no way to express a
+    per-fallback endpoint, reorder the ladder, or browse/search candidates.
+    """
+    fallbacks = [dict(item) for item in previous if isinstance(item, dict) and item.get("model")]
+    if not fallback_options:
+        return fallbacks
+    target = _target_label(role, controller)
+    while True:
+        print(f"\nFallback ladder for {target}:")
+        if fallbacks:
+            for index, item in enumerate(fallbacks, 1):
+                print(f"  {index}. {item['model']} (endpoint: {item.get('endpoint', 'auto')})")
+        else:
+            print("  (none)")
+        action = input("a) add fallback   r) remove   m) move   d) done: ").strip().lower()
+        if action == "a":
+            already_used = {item["model"] for item in fallbacks}
+            candidates = [item for item in fallback_options if item[0] not in already_used]
+            if not candidates:
+                print("No more distinct models are available to add.")
+                continue
+            model_id = _choose_model(f"Fallback #{len(fallbacks) + 1} for {target}", candidates)
+            if not _confirm_and_grant(config_dir, registry, model_id, role=role, controller=controller):
+                print(f"Dropping '{model_id}' (not confirmed).")
+                continue
+            model = registry.get_model(model_id)
+            endpoints = [("auto", "registry endpoint selection")]
+            endpoints.extend(
+                (endpoint_id, f"configured {endpoint.backend} endpoint")
+                for endpoint_id, endpoint in sorted(model.endpoints.items())
+            )
+            endpoint = _choose(f"Endpoint for fallback '{model_id}'", endpoints)
+            fallbacks.append({"model": model_id, "endpoint": endpoint})
+        elif action == "r":
+            if not fallbacks:
+                print("No fallbacks to remove.")
+                continue
+            index = _prompt_int("Remove which number", 1, 1, len(fallbacks))
+            removed = fallbacks.pop(index - 1)
+            print(f"Removed '{removed['model']}'.")
+        elif action == "m":
+            if len(fallbacks) < 2:
+                print("Need at least two fallbacks to reorder.")
+                continue
+            source = _prompt_int("Move which number", 1, 1, len(fallbacks))
+            destination = _prompt_int("Move to which position", source, 1, len(fallbacks))
+            item = fallbacks.pop(source - 1)
+            fallbacks.insert(destination - 1, item)
+        elif action == "d":
+            return fallbacks
+        else:
+            print("Choose a, r, m, or d.")
+
+
+def _choose_or_create_id(kind: str, existing: list[str], default_new: str) -> str:
+    """Numbered picker over existing saved *kind* entries, with a 'create
+    new' option -- replaces a free-text name prompt that silently defaulted
+    to the first existing entry and gave no browsable list beyond one
+    printed line.
+    """
+    if not existing:
+        name = _prompt(f"{kind} name", default_new)
+    else:
+        options = [(item, "existing") for item in existing] + [("(new)", "create a new one")]
+        choice = _choose(f"Select a {kind} to edit, or create a new one", options)
+        name = _prompt(f"New {kind} name", default_new) if choice == "(new)" else choice
+    if not _NAME_RE.fullmatch(name):
+        raise ValueError(f"{kind} IDs may contain letters, numbers, '.', '_' and '-'")
+    return name
 
 
 def configure_inference(config_dir: Path, registry: ModelRegistry) -> str:
@@ -473,18 +671,13 @@ def configure_inference(config_dir: Path, registry: ModelRegistry) -> str:
         "\nA profile is a named, reusable set of controller + role model "
         "assignments -- the actual model choices come next, right after this."
     )
-    if existing:
-        print(f"Existing profiles: {', '.join(existing)}")
-        print("Press Enter to edit one of those, or type a new name to create a separate saved setup.")
-    else:
+    if not existing:
         print("No profiles saved yet -- name this one (letters, numbers, '.', '_', '-').")
-    profile_id = _prompt("Profile name", existing[0] if existing else "my-profile")
-    if not _NAME_RE.fullmatch(profile_id):
-        raise ValueError("profile IDs may contain letters, numbers, '.', '_' and '-'")
+    profile_id = _choose_or_create_id("Inference profile", existing, "my-profile")
     current = dict(profiles.get(profile_id) or {})
     print("\n=== Main models: controller + recon/implementer/adversary/repairer ===")
     print("For each, type part of a name to search, or press Enter to list everything.")
-    controller_default = str(current.get("controller_model") or "")
+    controller_default = str(current.get("controller_model") or (current.get("controller") or {}).get("model") or "")
     controller_choices = _model_choices(registry, controller=True)
     if controller_choices:
         while True:
@@ -494,12 +687,26 @@ def configure_inference(config_dir: Path, registry: ModelRegistry) -> str:
             )
             if _confirm_and_grant(config_dir, registry, controller_model, controller=True):
                 break
-        current["controller_model"] = controller_model
+        controller_fallback_options = [item for item in controller_choices if item[0] != controller_model]
+        controller_fallbacks = _edit_fallbacks(
+            config_dir, registry, role=None, controller=True,
+            fallback_options=controller_fallback_options,
+            previous=_profile_fallback_routes(current, "controller"),
+        )
+        current.pop("controller_model", None)
+        current.pop("controller", None)
+        if controller_fallbacks:
+            current["controller"] = {
+                "model": controller_model, "endpoint": "auto",
+                "fallback_models": controller_fallbacks,
+            }
+        else:
+            current["controller_model"] = controller_model
     for role in _ROLES:
         choices = _model_choices(registry, role=role)
         if not choices:
             raise RuntimeError(f"No credential-backed model is available for role '{role}'.")
-        previous, previous_endpoint, previous_fallbacks = _profile_model(current, role)
+        previous, previous_endpoint, _previous_fallbacks = _profile_model(current, role)
         while True:
             selected = _choose_model(
                 f"{role} model", choices,
@@ -515,31 +722,18 @@ def configure_inference(config_dir: Path, registry: ModelRegistry) -> str:
             next((i for i, item in enumerate(endpoints, 1) if item[0] == previous_endpoint), 1),
         )
         fallback_options = [item for item in choices if item[0] != selected]
-        fallback_raw = _prompt(
-            f"{role} fallback model IDs (comma-separated, blank for none)",
-            ",".join(previous_fallbacks),
+        fallback_routes = _edit_fallbacks(
+            config_dir, registry, role=role,
+            fallback_options=fallback_options,
+            previous=_profile_fallback_routes(current, role),
         )
-        fallback_models = [item.strip() for item in fallback_raw.split(",") if item.strip()]
-        allowed_fallbacks = {item[0] for item in fallback_options}
-        unknown_fallbacks = [item for item in fallback_models if item not in allowed_fallbacks]
-        if unknown_fallbacks:
-            raise ValueError(
-                f"fallback model(s) unavailable for role '{role}': {', '.join(unknown_fallbacks)}"
-            )
-        confirmed_fallbacks = []
-        for fallback_id in fallback_models:
-            if _confirm_and_grant(config_dir, registry, fallback_id, role=role):
-                confirmed_fallbacks.append(fallback_id)
-            else:
-                print(f"Dropping '{fallback_id}' from {role} fallbacks (not confirmed).")
-        fallback_models = confirmed_fallbacks
-        if endpoint == "auto" and not fallback_models:
+        if endpoint == "auto" and not fallback_routes:
             current[role] = selected
         else:
             current[role] = {
                 "model": selected,
                 "endpoint": endpoint,
-                "fallback_models": fallback_models,
+                "fallback_models": fallback_routes,
             }
     profiles[profile_id] = current
     _write_yaml(config_dir / "profiles.yaml", raw)
@@ -604,9 +798,7 @@ def configure_sidecar(config_dir: Path, registry: ModelRegistry) -> None:
         sidecars = {}
         raw["sidecars"] = sidecars
     existing = sorted(str(item) for item in sidecars)
-    sidecar_id = _prompt("Saved sidecar ID", existing[0] if existing else "verification_reviewer")
-    if not _NAME_RE.fullmatch(sidecar_id):
-        raise ValueError("sidecar IDs may contain letters, numbers, '.', '_' and '-'")
+    sidecar_id = _choose_or_create_id("Sidecar", existing, "verification_reviewer")
     current = dict(sidecars.get(sidecar_id) or {})
     choices = _model_choices(registry)
     if not choices:
@@ -642,6 +834,121 @@ def configure_sidecar(config_dir: Path, registry: ModelRegistry) -> None:
     _write_yaml(config_dir / "sidecars.yaml", raw)
     print(f"Saved sidecar '{sidecar_id}' to {config_dir / 'sidecars.yaml'}.")
     print("Reference it from a workflow phase with: execution_kind: sidecar_call and sidecar: " + sidecar_id)
+
+
+def configure_sidecar_profile(config_dir: Path, registry: ModelRegistry) -> str:
+    """Configure a named, reusable sidecar-profile bundle (sidecar_profiles.yaml).
+
+    A sidecar profile limits which globally-defined sidecars (sidecars.yaml)
+    are available for a launch, and carries its own fastpath coprocessor
+    config -- fastpath is scoped per sidecar-profile, not one bare global
+    singleton, so different launch presets can run different fastpath
+    models (or none) side by side.
+    """
+    print("\n=== Sidecar & fastpath models: sidecar profile (bounds which sidecars a launch may use) ===")
+    raw = _read_yaml(config_dir / "sidecar_profiles.yaml")
+    profiles = raw.setdefault("sidecar_profiles", {})
+    if not isinstance(profiles, dict):
+        profiles = {}
+        raw["sidecar_profiles"] = profiles
+    existing = sorted(str(item) for item in profiles)
+    profile_id = _choose_or_create_id("Sidecar profile", existing, "default")
+    current = dict(profiles.get(profile_id) or {})
+
+    available_sidecars = sorted(registry.sidecars)
+    if not available_sidecars:
+        raise RuntimeError("No sidecars are configured yet -- add one with the 'sidecar' menu option first.")
+    print(f"Available sidecars: {', '.join(available_sidecars)}")
+    previous_ids = [str(item) for item in current.get("sidecar_ids", []) if isinstance(item, str)]
+    raw_ids = _prompt(
+        "Sidecar IDs for this profile (comma-separated, blank for all)",
+        ",".join(previous_ids),
+    )
+    if raw_ids.strip():
+        sidecar_ids = [item.strip() for item in raw_ids.split(",") if item.strip()]
+        unknown = [item for item in sidecar_ids if item not in registry.sidecars]
+        if unknown:
+            raise ValueError(f"unknown sidecar ID(s): {', '.join(unknown)}")
+    else:
+        sidecar_ids = available_sidecars
+    current["sidecar_ids"] = sidecar_ids
+
+    if input("Configure a dedicated fastpath coprocessor for this profile too? [y/N]: ").strip().lower() == "y":
+        fastpath = dict(current.get("fastpath") or {})
+        choices = [
+            item for item in _model_choices(registry)
+            if not registry.get_model(item[0]).capabilities.write_tool_certified
+        ]
+        if not choices:
+            raise RuntimeError("No enabled credential-backed model is available for the fastpath coprocessor.")
+        previous_model = str(fastpath.get("model_id") or "")
+        model_id = _choose_model("Fastpath coprocessor model", choices, previous_model)
+        model = registry.get_model(model_id)
+        endpoints = [("auto", "registry endpoint selection")]
+        endpoints.extend((endpoint_id, f"configured {endpoint.backend} endpoint") for endpoint_id, endpoint in sorted(model.endpoints.items()))
+        endpoint = _choose(
+            f"Fastpath endpoint for {model_id}", endpoints,
+            next((i for i, item in enumerate(endpoints, 1) if item[0] == fastpath.get("endpoint", "auto")), 1),
+        )
+        fastpath["model_id"] = model_id
+        fastpath["endpoint"] = endpoint
+        fastpath.setdefault("enabled", True)
+        fastpath.setdefault("modes", ["route", "verify"])
+        fastpath["timeout_seconds"] = _prompt_float(
+            "Fastpath timeout seconds", float(fastpath.get("timeout_seconds", 5)), 1, 30,
+        )
+        current["fastpath"] = fastpath
+    elif "fastpath" in current and input(
+        "Remove this profile's dedicated fastpath (fall back to the global fastpath.yaml)? [y/N]: "
+    ).strip().lower() == "y":
+        current.pop("fastpath", None)
+
+    profiles[profile_id] = current
+    _write_yaml(config_dir / "sidecar_profiles.yaml", raw)
+    print(f"Saved sidecar profile '{profile_id}' to {config_dir / 'sidecar_profiles.yaml'}.")
+    print(f"Use it with: claude-brigade --sidecar-profile {profile_id}")
+    return profile_id
+
+
+def configure_launch_preset(config_dir: Path, registry: ModelRegistry) -> str:
+    """Configure a named launch preset pairing a saved inference profile with
+    a saved sidecar profile, so both switch together with one choice."""
+    print("\n=== Launch presets: pair a saved inference profile with a saved sidecar profile ===")
+    inference_profiles = sorted(_read_yaml(config_dir / "profiles.yaml").get("profiles") or {})
+    if not inference_profiles:
+        raise RuntimeError("No inference profiles are saved yet -- run the inference wizard first.")
+    sidecar_profiles = sorted(_read_yaml(config_dir / "sidecar_profiles.yaml").get("sidecar_profiles") or {})
+
+    raw = _read_yaml(config_dir / "launch_presets.yaml")
+    presets = raw.setdefault("launch_presets", {})
+    if not isinstance(presets, dict):
+        presets = {}
+        raw["launch_presets"] = presets
+    existing = sorted(str(item) for item in presets)
+    preset_id = _choose_or_create_id("Launch preset", existing, "default")
+    current = dict(presets.get(preset_id) or {})
+
+    inference_profile_id = _choose(
+        "Inference profile",
+        [(item, "saved inference profile") for item in inference_profiles],
+        next((i for i, item in enumerate(inference_profiles, 1) if item == current.get("inference_profile_id")), 1),
+    )
+    sidecar_profile_options = [("none", "no sidecar profile (use global sidecars.yaml/fastpath.yaml)")] + [
+        (item, "saved sidecar profile") for item in sidecar_profiles
+    ]
+    sidecar_profile_choice = _choose(
+        "Sidecar profile",
+        sidecar_profile_options,
+        next((i for i, item in enumerate(("none", *sidecar_profiles), 1) if item == (current.get("sidecar_profile_id") or "none")), 1),
+    )
+    current["inference_profile_id"] = inference_profile_id
+    current["sidecar_profile_id"] = None if sidecar_profile_choice == "none" else sidecar_profile_choice
+
+    presets[preset_id] = current
+    _write_yaml(config_dir / "launch_presets.yaml", raw)
+    print(f"Saved launch preset '{preset_id}' to {config_dir / 'launch_presets.yaml'}.")
+    print(f"Use it with: claude-brigade --launch-preset {preset_id}")
+    return preset_id
 
 
 def configure_keys(config_dir: Path, registry: ModelRegistry) -> None:
@@ -739,43 +1046,184 @@ def import_environment_credentials(config_dir: Path, registry: ModelRegistry) ->
     print(f"Imported {len(available_keys)} credentials into the OS keyring ({backend_label()}); imported slots participate in rotation.")
 
 
-def refresh_catalogs(registry: ModelRegistry) -> None:
-    """Fetch configured OpenAI-compatible catalogs for keys that are present."""
-    discovered_any = False
+_CATALOG_REFRESH_TTL_SECONDS = 900.0  # 15 minutes
+_CATALOG_REFRESH_TIMEOUT_SECONDS = 12.0
+_CATALOG_REFRESH_MAX_WORKERS = 4
+_CATALOG_REFRESH_STATE_FILENAME = "catalog_refresh_state.json"
+
+
+@dataclass(frozen=True)
+class CatalogRefreshResult:
+    """One provider's outcome from a ``refresh_catalogs`` pass."""
+
+    provider_id: str
+    status: Literal["success", "skipped", "cached", "error"]
+    model_count: int = 0
+    digest: str | None = None
+    detail: str = ""
+
+
+def _load_catalog_refresh_state(config_dir: Path) -> dict[str, dict[str, Any]]:
+    path = config_dir / _CATALOG_REFRESH_STATE_FILENAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_catalog_refresh_state(config_dir: Path, state: dict[str, dict[str, Any]]) -> None:
+    path = config_dir / _CATALOG_REFRESH_STATE_FILENAME
+    path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+    os.chmod(path, 0o600)
+
+
+def refresh_catalogs(
+    registry: ModelRegistry,
+    *,
+    ttl_seconds: float = _CATALOG_REFRESH_TTL_SECONDS,
+    force: bool = False,
+) -> list[CatalogRefreshResult]:
+    """Fetch configured OpenAI-compatible catalogs for keys that are present.
+
+    Network fetches for distinct providers run concurrently (bounded pool,
+    a short per-provider timeout) instead of serially at up to 30s each --
+    the previous behavior meant a config with several credential-backed
+    providers could block the wizard for minutes even when every provider
+    responds quickly on its own. A provider refreshed within *ttl_seconds*
+    is skipped (``force=True`` bypasses this) so re-entering the wizard
+    doesn't repeat unnecessary network round-trips.
+    """
+    config_dir = registry.config_dir
+    refresh_state = _load_catalog_refresh_state(config_dir) if config_dir else {}
+    now = time.time()
+
+    candidates: list[tuple[str, str]] = []  # (provider_id, endpoint_id)
+    results: list[CatalogRefreshResult] = []
     for provider_id, provider in sorted(registry.providers.items()):
         if provider.discovery.get("type") != "openai-models":
             continue
         if not provider.api_key_env or not os.environ.get(provider.api_key_env):
-            print(f"{provider_id}: skipped (missing {provider.api_key_env or 'credential'})")
+            results.append(CatalogRefreshResult(
+                provider_id, "skipped",
+                detail=f"missing {provider.api_key_env or 'credential'}",
+            ))
             continue
-        endpoint_id = "openai" if "openai" in provider.endpoints else next(
-            iter(provider.endpoints), None
+        if not force:
+            last_refreshed = refresh_state.get(provider_id, {}).get("refreshed_at")
+            if isinstance(last_refreshed, (int, float)) and now - last_refreshed < ttl_seconds:
+                results.append(CatalogRefreshResult(
+                    provider_id, "cached",
+                    detail=f"refreshed {int(now - last_refreshed)}s ago",
+                ))
+                continue
+        endpoint_id = provider.discovery.get("endpoint_id") or (
+            "openai" if "openai" in provider.endpoints else next(iter(provider.endpoints), None)
         )
-        if not endpoint_id:
-            print(f"{provider_id}: skipped (no catalog endpoint)")
+        if not endpoint_id and not provider.discovery.get("url"):
+            results.append(CatalogRefreshResult(provider_id, "skipped", detail="no catalog endpoint"))
             continue
+        candidates.append((provider_id, endpoint_id or "openai"))
+
+    fetched: dict[str, Any] = {}
+    errors: dict[str, str] = {}
+    if candidates:
+        with ThreadPoolExecutor(max_workers=min(_CATALOG_REFRESH_MAX_WORKERS, len(candidates))) as pool:
+            futures = {
+                pool.submit(
+                    registry.fetch_discovered_entries,
+                    provider_id, endpoint_id=endpoint_id, timeout=_CATALOG_REFRESH_TIMEOUT_SECONDS,
+                ): provider_id
+                for provider_id, endpoint_id in candidates
+            }
+            for future in as_completed(futures):
+                provider_id = futures[future]
+                try:
+                    fetched[provider_id] = future.result()
+                except Exception as exc:
+                    errors[provider_id] = str(exc)[:160]
+
+    # Publishing mutates shared registry state (the discovered-catalog file
+    # and in-memory models) -- serialize it on the main thread even though
+    # the fetches above ran concurrently.
+    for provider_id, _endpoint_id in candidates:
+        if provider_id in errors:
+            results.append(CatalogRefreshResult(provider_id, "error", detail=errors[provider_id]))
+            continue
+        entries = fetched.get(provider_id, [])
         try:
-            digest, count = registry.discover_provider_catalog(
-                provider_id, endpoint_id=endpoint_id, timeout=30
-            )
+            digest, count = registry.apply_discovered_entries(entries, provider_id=provider_id)
         except Exception as exc:
-            print(f"{provider_id}: discovery failed ({str(exc)[:160]})")
+            results.append(CatalogRefreshResult(provider_id, "error", detail=str(exc)[:160]))
             continue
-        discovered_any = True
-        print(f"{provider_id}: saved {count} models (catalog {digest[:12]})")
-    if not discovered_any:
+        results.append(CatalogRefreshResult(provider_id, "success", model_count=count, digest=digest))
+        refresh_state[provider_id] = {"refreshed_at": now, "digest": digest}
+
+    if config_dir and any(r.status == "success" for r in results):
+        _save_catalog_refresh_state(config_dir, refresh_state)
+
+    for result in sorted(results, key=lambda r: r.provider_id):
+        if result.status == "success":
+            print(f"{result.provider_id}: saved {result.model_count} models (catalog {(result.digest or '')[:12]})")
+        elif result.status == "cached":
+            print(f"{result.provider_id}: skipped ({result.detail}, within TTL)")
+        elif result.status == "skipped":
+            print(f"{result.provider_id}: skipped ({result.detail})")
+        else:
+            print(f"{result.provider_id}: discovery failed ({result.detail})")
+    if not any(r.status == "success" for r in results):
         print("No credential-backed dynamic provider catalogs were refreshed.")
+    return results
+
+
+_DELETE_TARGETS = {
+    "sidecar": ("sidecars.yaml", "sidecars"),
+    "sidecar profile": ("sidecar_profiles.yaml", "sidecar_profiles"),
+    "launch preset": ("launch_presets.yaml", "launch_presets"),
+}
+
+
+def _referencing_configs(config_dir: Path, kind: str, item_id: str) -> list[str]:
+    """Return human-readable descriptions of saved configs that still
+    reference *item_id* -- deleting it out from under them would leave a
+    dangling reference that only surfaces later, as a fail-closed daemon
+    startup error for an operator who may not remember this deletion.
+    """
+    blockers: list[str] = []
+    if kind == "sidecar":
+        sidecar_profiles = _read_yaml(config_dir / "sidecar_profiles.yaml").get("sidecar_profiles") or {}
+        for profile_id, profile in sidecar_profiles.items():
+            if isinstance(profile, dict) and item_id in (profile.get("sidecar_ids") or []):
+                blockers.append(f"sidecar profile '{profile_id}'")
+    elif kind == "sidecar profile":
+        launch_presets = _read_yaml(config_dir / "launch_presets.yaml").get("launch_presets") or {}
+        for preset_id, preset in launch_presets.items():
+            if isinstance(preset, dict) and preset.get("sidecar_profile_id") == item_id:
+                blockers.append(f"launch preset '{preset_id}'")
+    elif kind == "inference profile":
+        launch_presets = _read_yaml(config_dir / "launch_presets.yaml").get("launch_presets") or {}
+        for preset_id, preset in launch_presets.items():
+            if isinstance(preset, dict) and preset.get("inference_profile_id") == item_id:
+                blockers.append(f"launch preset '{preset_id}'")
+        workflows = _read_yaml(config_dir / "workflows.yaml").get("workflows") or {}
+        for workflow_id, workflow in workflows.items():
+            if isinstance(workflow, dict) and workflow.get("default_profile") == item_id:
+                blockers.append(f"workflow '{workflow_id}'")
+    return blockers
 
 
 def _delete_saved(config_dir: Path, *, kind: str) -> None:
-    filename = "sidecars.yaml" if kind == "sidecar" else "profiles.yaml"
-    key = "sidecars" if kind == "sidecar" else "profiles"
+    filename, key = _DELETE_TARGETS.get(kind, ("profiles.yaml", "profiles"))
     raw = _read_yaml(config_dir / filename)
     entries = raw.get(key) if isinstance(raw.get(key), dict) else {}
     if not entries:
         print(f"No saved {kind} configurations found.")
         return
     selected = _choose(f"Delete saved {kind}", [(str(item), "saved configuration") for item in sorted(entries)])
+    blockers = _referencing_configs(config_dir, kind, selected)
+    if blockers:
+        print(f"Cannot delete '{selected}': still referenced by {', '.join(blockers)}.")
+        return
     if input(f"Delete '{selected}' permanently? [y/N]: ").strip().lower() != "y":
         print("Nothing deleted.")
         return
@@ -797,13 +1245,23 @@ def show_saved(config_dir: Path, provider_keys: tuple[str, ...]) -> None:
     profiles = _read_yaml(config_dir / "profiles.yaml").get("profiles") or {}
     for profile_id, value in sorted(profiles.items()):
         print(f"  {profile_id}:")
-        print(f"    controller: {value.get('controller_model', 'Claude/default')}")
+        controller_raw = value.get("controller")
+        if isinstance(controller_raw, dict):
+            controller_label = controller_raw.get("model", "(unset)")
+        else:
+            controller_label = value.get("controller_model") or "Claude/default"
+        print(f"    controller: {controller_label}")
         for role in _ROLES:
             role_value = value.get(role)
             if isinstance(role_value, dict):
                 model = role_value.get("model", "(unset)")
-                fallbacks = role_value.get("fallback_models") or []
-                suffix = f" (fallbacks: {', '.join(fallbacks)})" if fallbacks else ""
+                fallback_ids = [
+                    item if isinstance(item, str) else item.get("model", "")
+                    for item in (role_value.get("fallback_models") or [])
+                    if isinstance(item, (str, dict))
+                ]
+                fallback_ids = [item for item in fallback_ids if item]
+                suffix = f" (fallbacks: {', '.join(fallback_ids)})" if fallback_ids else ""
             else:
                 model = role_value or "(unset)"
                 suffix = ""
@@ -823,6 +1281,24 @@ def show_saved(config_dir: Path, provider_keys: tuple[str, ...]) -> None:
     if not sidecars:
         print("  named sidecars: (none)")
 
+    sidecar_profiles = _read_yaml(config_dir / "sidecar_profiles.yaml").get("sidecar_profiles") or {}
+    for profile_id, value in sorted(sidecar_profiles.items()):
+        sidecar_ids = value.get("sidecar_ids") or []
+        own_fastpath = value.get("fastpath")
+        fastpath_label = f"model={own_fastpath.get('model_id')}" if isinstance(own_fastpath, dict) else "(uses global fastpath.yaml)"
+        print(f"  sidecar profile '{profile_id}': sidecars=[{', '.join(sidecar_ids)}] fastpath={fastpath_label}")
+    if not sidecar_profiles:
+        print("  sidecar profiles: (none)")
+
+    presets = _read_yaml(config_dir / "launch_presets.yaml").get("launch_presets") or {}
+    for preset_id, value in sorted(presets.items()):
+        print(
+            f"  launch preset '{preset_id}': inference_profile={value.get('inference_profile_id')} "
+            f"sidecar_profile={value.get('sidecar_profile_id') or '(none)'}"
+        )
+    if not presets:
+        print("  launch presets: (none)")
+
 
 def menu(config_dir: Path) -> int:
     registry, provider_keys = _load_registry(config_dir)
@@ -835,11 +1311,16 @@ def menu(config_dir: Path) -> int:
         print("  3. Configure fastpath coprocessor (always-on route/verify model)")
         print("  4. Create/edit sidecar (dormant until a workflow phase references it)")
         print("  5. Delete sidecar")
+        print("  6. Create/edit sidecar profile (bounds which sidecars a launch may use)")
+        print("  7. Delete sidecar profile")
+        print("\nLaunch presets -- pair a saved inference profile with a saved sidecar profile")
+        print("  8. Create/edit launch preset")
+        print("  9. Delete launch preset")
         print("\nProviders & credentials")
-        print("  6. Add/edit provider API key")
-        print("  7. Import already-loaded environment keys")
-        print("  8. Refresh provider model catalogs")
-        print("\n  9. Show saved configuration")
+        print("  10. Add/edit provider API key")
+        print("  11. Import already-loaded environment keys")
+        print("  12. Refresh provider model catalogs")
+        print("\n  13. Show saved configuration")
         print("  q. Quit")
         choice = input("Choose: ").strip().lower()
         try:
@@ -859,20 +1340,32 @@ def menu(config_dir: Path) -> int:
                 _delete_saved(config_dir, kind="sidecar")
                 registry, provider_keys = _load_registry(config_dir)
             elif choice == "6":
-                configure_keys(config_dir, registry)
+                configure_sidecar_profile(config_dir, registry)
                 registry, provider_keys = _load_registry(config_dir)
             elif choice == "7":
-                import_environment_credentials(config_dir, registry)
+                _delete_saved(config_dir, kind="sidecar profile")
                 registry, provider_keys = _load_registry(config_dir)
             elif choice == "8":
-                refresh_catalogs(registry)
+                configure_launch_preset(config_dir, registry)
                 registry, provider_keys = _load_registry(config_dir)
             elif choice == "9":
+                _delete_saved(config_dir, kind="launch preset")
+                registry, provider_keys = _load_registry(config_dir)
+            elif choice == "10":
+                configure_keys(config_dir, registry)
+                registry, provider_keys = _load_registry(config_dir)
+            elif choice == "11":
+                import_environment_credentials(config_dir, registry)
+                registry, provider_keys = _load_registry(config_dir)
+            elif choice == "12":
+                refresh_catalogs(registry, force=True)
+                registry, provider_keys = _load_registry(config_dir)
+            elif choice == "13":
                 show_saved(config_dir, provider_keys)
             elif choice in {"q", "quit", "exit"}:
                 return 0
             else:
-                print("Choose 1-9 or q.")
+                print("Choose 1-13 or q.")
         except (EOFError, KeyboardInterrupt):
             print()
             return 0
@@ -882,7 +1375,14 @@ def menu(config_dir: Path) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Interactively manage saved ClaudeBrigade inference and sidecar configuration")
-    parser.add_argument("command", nargs="?", choices=("menu", "keys", "import-env", "refresh", "sidecar", "inference", "fastpath", "show"), default="menu")
+    parser.add_argument(
+        "command", nargs="?",
+        choices=(
+            "menu", "keys", "import-env", "refresh", "sidecar", "inference",
+            "fastpath", "sidecar-profile", "launch-preset", "show",
+        ),
+        default="menu",
+    )
     parser.add_argument("--config-dir", help="BRIGADE_CONFIG_DIR override")
     args = parser.parse_args(argv)
     config_dir = _config_dir(args.config_dir)
@@ -895,13 +1395,17 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "import-env":
             import_environment_credentials(config_dir, registry)
         elif args.command == "refresh":
-            refresh_catalogs(registry)
+            refresh_catalogs(registry, force=True)
         elif args.command == "sidecar":
             configure_sidecar(config_dir, registry)
         elif args.command == "inference":
             configure_inference(config_dir, registry)
         elif args.command == "fastpath":
             configure_fastpath(config_dir, registry)
+        elif args.command == "sidecar-profile":
+            configure_sidecar_profile(config_dir, registry)
+        elif args.command == "launch-preset":
+            configure_launch_preset(config_dir, registry)
         else:
             show_saved(config_dir, provider_keys)
     except (EOFError, KeyboardInterrupt):

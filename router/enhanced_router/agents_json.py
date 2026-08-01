@@ -68,6 +68,7 @@ def parse_agent(path: pathlib.Path) -> tuple[str, dict[str, Any]]:
 def render_agents(
     directory: pathlib.Path,
     registry: Any | None = None,
+    profile_id: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     agents: dict[str, dict[str, Any]] = {}
     paths = sorted(directory.glob("*.md"))
@@ -98,7 +99,7 @@ def render_agents(
                 f"Agent '{agent_name}' has model '{actual_model}' but expected '{expected_model}'"
             )
     if registry is not None:
-        for entry in registry.specialist_manifest().values():
+        for entry in registry.specialist_manifest(profile_id).values():
             native_name = entry["native_agent_name"]
             if native_name in agents:
                 continue
@@ -118,13 +119,17 @@ def render_agents(
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
-        print("usage: python -m enhanced_router.agents_json AGENT_DIRECTORY", file=sys.stderr)
+    if len(sys.argv) not in (2, 3):
+        print(
+            "usage: python -m enhanced_router.agents_json AGENT_DIRECTORY [PROFILE_ID]",
+            file=sys.stderr,
+        )
         return 2
+    profile_id = sys.argv[2] if len(sys.argv) == 3 and sys.argv[2] else None
     try:
         from enhanced_router.registry import get_registry
 
-        agents = render_agents(pathlib.Path(sys.argv[1]), get_registry())
+        agents = render_agents(pathlib.Path(sys.argv[1]), get_registry(), profile_id)
     except (OSError, ValueError, yaml.YAMLError) as exc:
         print(str(exc), file=sys.stderr)
         return 2

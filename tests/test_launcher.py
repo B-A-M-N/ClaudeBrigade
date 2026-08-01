@@ -89,6 +89,13 @@ echo "$@"
     venv_bin.mkdir(parents=True)
     (venv_bin / "python").symlink_to(fake_python)
 
+    # The launcher always resolves modules via PYTHONPATH="$APP_DIR/router"
+    # (the real install layout puts the router package there, alongside the
+    # venv) -- point it at this repo's router package so invocations that
+    # fall through the fake python3 to the real interpreter can actually
+    # import enhanced_router.*.
+    (app_dir / "router").symlink_to(Path(__file__).resolve().parents[1] / "router")
+
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
     env["CLAUDE_BRIGADE_APP_DIR"] = str(app_dir)
@@ -150,6 +157,102 @@ def test_provider_keys_not_in_session_settings(tmp_path: Path):
         assert "LONGCAT_API_KEY" not in settings_part, (
             "Provider keys must not appear in session settings"
         )
+
+
+def _write_launch_preset_config(config_dir: Path) -> None:
+    """A minimal, fully valid config: one model, one inference profile, one
+    sidecar profile, and a launch preset pairing them -- enough for
+    get_registry() to load and validate without touching the real bundled
+    config or any network/provider credentials."""
+    import yaml
+
+    (config_dir / "models.yaml").write_text(yaml.safe_dump({
+        "models": {
+            "model-a": {
+                "display_name": "Model A",
+                "backend": "direct-anthropic",
+                "upstream_model": "A",
+                "api_base": "https://model-a.example.invalid/v1",
+                "capabilities": {
+                    "tools": True, "mutation": True,
+                    "write_tool_certified": True, "read_tool_certified": True,
+                    "controller_eligible": True,
+                },
+                "allowed_roles": ["recon", "implementer", "adversary", "repairer"],
+            },
+        },
+    }), encoding="utf-8")
+    (config_dir / "profiles.yaml").write_text(yaml.safe_dump({
+        "profiles": {
+            "test-profile": {
+                "recon": "model-a", "implementer": "model-a",
+                "adversary": "model-a", "repairer": "model-a",
+                "controller_model": "model-a",
+            },
+        },
+    }), encoding="utf-8")
+    (config_dir / "workflows.yaml").write_text(yaml.safe_dump({
+        "workflows": {"normal": {"default_profile": "test-profile"}},
+    }), encoding="utf-8")
+    (config_dir / "providers.yaml").write_text(yaml.safe_dump({"providers": {}}), encoding="utf-8")
+    (config_dir / "fastpath.yaml").write_text(yaml.safe_dump({
+        "fastpath": {"enabled": False, "model_id": "model-a"},
+    }), encoding="utf-8")
+    (config_dir / "sidecars.yaml").write_text(yaml.safe_dump({
+        "sidecars": {
+            "sidecar-a": {"model_id": "model-a", "mode": "structured", "endpoint": "auto", "enabled": True},
+        },
+    }), encoding="utf-8")
+    (config_dir / "sidecar_profiles.yaml").write_text(yaml.safe_dump({
+        "sidecar_profiles": {
+            "sidecar-profile-a": {"sidecar_ids": ["sidecar-a"]},
+        },
+    }), encoding="utf-8")
+    (config_dir / "launch_presets.yaml").write_text(yaml.safe_dump({
+        "launch_presets": {
+            "preset-a": {"inference_profile_id": "test-profile", "sidecar_profile_id": "sidecar-profile-a"},
+        },
+    }), encoding="utf-8")
+
+
+def test_launch_preset_resolves_controller_and_persists_selection(tmp_path: Path):
+    """--launch-preset must resolve the paired inference profile's controller
+    model (via controller_route(), not just the legacy controller_model
+    string) and persist both the inference and sidecar profile selections
+    onto the created run row -- the DB row a shared daemon actually
+    consults, not just the launching process's environment."""
+    env = _setup_launcher_env(tmp_path)
+    config_dir = tmp_path / "config" / "claude-brigade"
+    _write_launch_preset_config(config_dir)
+
+    launcher = Path(__file__).resolve().parents[1] / "bin" / "claude-brigade"
+    result = subprocess.run(
+        [str(launcher), "--launch-preset", "preset-a", "hello"],
+        env=env, capture_output=True, text=True,
+    )
+    stdout = result.stdout
+    assert "--model model-a" in stdout, f"stdout={stdout!r} stderr={result.stderr!r}"
+
+    import re
+    match = re.search(r'"CLAUDE_BRIGADE_RUN_ID":\s*"([^"]+)"', stdout)
+    assert match, f"could not find CLAUDE_BRIGADE_RUN_ID in stdout={stdout!r}"
+    run_id = match.group(1)
+
+    query = subprocess.run(
+        [sys.executable, "-c", (
+            "import json, sys\n"
+            "from enhanced_router.state import get_state\n"
+            "row = get_state().get_run(sys.argv[1])\n"
+            "print(json.dumps(row))\n"
+        ), run_id],
+        env=env, capture_output=True, text=True,
+    )
+    assert query.returncode == 0, f"stdout={query.stdout!r} stderr={query.stderr!r}"
+    run_row = json.loads(query.stdout)
+    assert run_row is not None
+    assert run_row["inference_profile_id"] == "test-profile"
+    assert run_row["sidecar_profile_id"] == "sidecar-profile-a"
+    assert run_row["launch_preset_id"] == "preset-a"
 
 
 def test_real_bootstrap_env_contract(tmp_path: Path):

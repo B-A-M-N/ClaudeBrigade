@@ -149,15 +149,29 @@ def _credential_env_names(api_key_env: str | None) -> list[str | None]:
     return [api_key_env]
 
 
-def config_digest(models: dict[str, ModelSpec]) -> str:
+def config_digest(
+    models: dict[str, ModelSpec], *, referenced_ids: set[str] | None = None
+) -> str:
     """Return a deterministic SHA-256 hex digest of the litellm-relevant config.
 
     Only includes models with ``backend='litellm'``.  Used for change detection
     in catalog reload.
+
+    ``referenced_ids`` applies the identical discovered-model filter that
+    ``generate_litellm_config`` uses, so a scope-only change (e.g. a new run
+    selecting a profile that references previously-excluded models) changes
+    the digest and triggers a new generation, even though the underlying
+    model definitions in *models* haven't changed at all.
     """
     entries: list[dict[str, Any]] = []
     for model_id, spec in sorted(models.items()):
         if spec.backend != "litellm" and not spec.endpoints:
+            continue
+        if (
+            referenced_ids is not None
+            and spec.catalog_source == "discovered"
+            and model_id not in referenced_ids
+        ):
             continue
         entries.append(
             {

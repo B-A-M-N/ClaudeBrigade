@@ -76,6 +76,24 @@ def direct_model() -> ModelSpec:
 
 
 @pytest.fixture
+def discovered_litellm_model() -> ModelSpec:
+    return ModelSpec(
+        display_name="Discovered Model",
+        backend="litellm",
+        litellm_model="openrouter/vendor/discovered",
+        catalog_source="discovered",
+        capabilities=ModelCapabilities(
+            tools=True,
+            mutation=False,
+            context_tokens=131072,
+            reasoning="medium",
+            local=False,
+        ),
+        allowed_roles={"recon"},
+    )
+
+
+@pytest.fixture
 def disabled_litellm_model() -> ModelSpec:
     return ModelSpec(
         display_name="Disabled Model",
@@ -252,6 +270,31 @@ class TestConfigDigest:
         d1 = config_digest({"m": litellm_model})
         d2 = config_digest({"m": disabled_litellm_model})
         assert d1 != d2
+
+    def test_referenced_ids_excludes_unreferenced_discovered_models(self, discovered_litellm_model):
+        """A discovered model outside the referenced set changes the digest
+        the same way removing it from *models* entirely would -- this is
+        what lets a scope-only change (a new run needing it) be detected as
+        a real config change even though the model's own definition never
+        moved.
+        """
+        models = {"m": discovered_litellm_model}
+        with_scope_excluded = config_digest(models, referenced_ids=set())
+        unscoped = config_digest(models)
+        assert with_scope_excluded != unscoped
+        assert with_scope_excluded == config_digest({})
+
+    def test_referenced_ids_keeps_included_discovered_models(self, discovered_litellm_model):
+        models = {"m": discovered_litellm_model}
+        assert config_digest(models, referenced_ids={"m"}) == config_digest(models)
+
+    def test_referenced_ids_never_excludes_bundled_models(self, litellm_model):
+        """Only catalog_source == 'discovered' models are subject to the
+        referenced-ids filter -- an operator-configured model always
+        counts, matching generate_litellm_config's own filter.
+        """
+        models = {"m": litellm_model}
+        assert config_digest(models, referenced_ids=set()) == config_digest(models)
 
 
 # ---------------------------------------------------------------------------

@@ -25,7 +25,7 @@ def test_registry_manifest_can_generate_a_model_qualified_agent(tmp_path):
         (tmp_path / name).write_text((source / name).read_text(encoding="utf-8"), encoding="utf-8")
 
     class RegistryStub:
-        def specialist_manifest(self):
+        def specialist_manifest(self, profile_id=None):
             return {
                 "brigade-custom-scout": {
                     "native_agent_name": "brigade-custom-scout",

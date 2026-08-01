@@ -19,14 +19,27 @@ GENERIC_ROLE_ALIASES: dict[str, str] = {
 }
 
 
-def specialist_manifest(registry: Any) -> dict[str, dict[str, str]]:
+def specialist_manifest(
+    registry: Any, profile_id: str | None = None
+) -> dict[str, dict[str, str]]:
     """Return configured model-qualified native agents.
 
     A specialist without explicit launch identity remains a profile-level
     scheduling hint; it must not silently become a Claude Code Agent name.
+
+    ``profile_id`` restricts the manifest to a single profile's specialists
+    -- used when rendering a specific launch's agent directory, so an
+    unrelated saved profile's specialist naming conflict can't block a
+    launch that never selected it. ``None`` (the default) scans every saved
+    profile, which remains required for process-wide authorization checks
+    that have no single active profile to scope to.
     """
     result: dict[str, dict[str, str]] = {}
-    for profile_id, profile in sorted(registry.profiles.items()):
+    if profile_id is not None:
+        profiles = {profile_id: registry.profiles[profile_id]} if profile_id in registry.profiles else {}
+    else:
+        profiles = registry.profiles
+    for profile_id, profile in sorted(profiles.items()):
         for specialist_id, specialist in sorted(profile.specialists.items()):
             native_name = specialist.native_agent_name
             public_alias = specialist.public_model_alias
@@ -55,10 +68,10 @@ def specialist_manifest(registry: Any) -> dict[str, dict[str, str]]:
     return result
 
 
-def role_model_aliases(registry: Any) -> dict[str, str]:
+def role_model_aliases(registry: Any, profile_id: str | None = None) -> dict[str, str]:
     """Return stable role aliases plus configured specialist aliases."""
     result = dict(GENERIC_ROLE_ALIASES)
-    for entry in specialist_manifest(registry).values():
+    for entry in specialist_manifest(registry, profile_id).values():
         alias = entry["public_model_alias"]
         role = entry["role"]
         previous = result.get(alias)
@@ -68,10 +81,10 @@ def role_model_aliases(registry: Any) -> dict[str, str]:
     return result
 
 
-def role_model_bindings(registry: Any) -> dict[str, str]:
+def role_model_bindings(registry: Any, profile_id: str | None = None) -> dict[str, str]:
     """Return explicit public/native specialist names to logical model IDs."""
     result: dict[str, str] = {}
-    for entry in specialist_manifest(registry).values():
+    for entry in specialist_manifest(registry, profile_id).values():
         model_id = entry["model_id"]
         for alias in (entry["native_agent_name"], entry["public_model_alias"]):
             previous = result.get(alias)
