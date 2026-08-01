@@ -182,4 +182,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from _shared import fail_open_main
+    raise SystemExit(fail_open_main(main))

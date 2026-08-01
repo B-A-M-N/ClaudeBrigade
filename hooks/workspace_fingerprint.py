@@ -6,11 +6,19 @@ import pathlib
 import subprocess
 import sys
 
+# All git calls in this file route through here, so a stalled git process
+# (e.g. a lock held by another process, a huge repo on a slow filesystem)
+# can't hang a fingerprint computation indefinitely -- callers should treat
+# subprocess.TimeoutExpired the same as any other fingerprint failure.
+_GIT_TIMEOUT_SECONDS = 4.0
+
+
 def run(root: pathlib.Path, *args: str, text: bool = False) -> bytes | str:
     return subprocess.check_output(
         ["git", "-C", str(root), *args],
         stderr=subprocess.DEVNULL,
         text=text,
+        timeout=_GIT_TIMEOUT_SECONDS,
     )
 
 

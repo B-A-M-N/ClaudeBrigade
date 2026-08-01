@@ -16,7 +16,7 @@ from typing import Any
 # directory from which Claude Code invokes it.
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from workspace_fingerprint import fingerprint, repository_root, clear_fingerprint_cache
-from ledger_io import append_jsonl, read_jsonl
+from ledger_io import append_jsonl, read_jsonl, read_jsonl_cached
 from enhanced_router.base import implementation_agents
 
 LOGGER = logging.getLogger(__name__)
@@ -88,7 +88,7 @@ def fields(message: str) -> dict[str, str]:
 def read_epoch_ledger(session_dir: pathlib.Path, active_epoch_id: str) -> list[dict]:
     ledger_path = session_dir / "ledger.jsonl"
     return [
-        event for event in read_jsonl(ledger_path)
+        event for event in read_jsonl_cached(ledger_path)
         if event.get("epoch_id") == active_epoch_id
     ]
 
@@ -97,7 +97,7 @@ def completed_agents(session_dir: pathlib.Path, active_epoch_id: str) -> Counter
     starts: dict[str, str] = {}
     completed: Counter[str] = Counter()
     log = session_dir / "agents.jsonl"
-    for record in read_jsonl(log):
+    for record in read_jsonl_cached(log):
         agent_id = str(record.get("agent_id", ""))
         agent_type = str(record.get("agent_type", "unknown"))
         event = record.get("event")
@@ -338,6 +338,7 @@ def main() -> int:
             ["git", "-C", str(root), "rev-parse", "--verify", "HEAD"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            timeout=4.0,
         ).returncode == 0
 
         if head_exists:
@@ -346,6 +347,7 @@ def main() -> int:
                 check=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
+                timeout=4.0,
             )
         else:
             LOGGER.info("Skipping git diff --check: repository has no commits yet")
@@ -355,7 +357,7 @@ def main() -> int:
             session_id=session_id,
             epoch_id=active_epoch_id,
         )
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
         return block_with_retry_guard(f"Final deterministic workspace check failed: {exc}", session_dir, stop_hook_active, message)
 
     expected = parsed["Verified-Workspace-SHA256"].lower()

@@ -10,7 +10,8 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from workspace_fingerprint import fingerprint
-from ledger_io import append_jsonl, read_jsonl
+from ledger_io import read_jsonl_cached
+from _shared import record_ledger, resolve_session_dir, read_active_epoch_id
 
 
 TEST_BASH = re.compile(
@@ -35,14 +36,10 @@ def _last_ledger_fingerprint(session_dir: pathlib.Path) -> str | None:
     if not ledger_path.exists():
         return None
     last_fp: str | None = None
-    for evt in read_jsonl(ledger_path):
+    for evt in read_jsonl_cached(ledger_path):
         if evt.get("event") == "Mutation" and evt.get("fingerprint"):
             last_fp = str(evt["fingerprint"])
     return last_fp
-
-
-def record_ledger(session_dir: pathlib.Path, record: dict) -> None:
-    append_jsonl(session_dir / "ledger.jsonl", record)
 
 
 def lookup_agent_type(session_dir: pathlib.Path, agent_id: str | None) -> str:
@@ -63,13 +60,10 @@ def main() -> int:
 
     run_id = os.environ.get("CLAUDE_BRIGADE_RUN_ID") or data.get("run_id")
 
-    cache = pathlib.Path(os.environ.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache")) / "claude-brigade"
     session = str(data.get("session_id", "unknown"))
-    session_dir = cache / "sessions" / session
+    session_dir = resolve_session_dir(data)
     session_dir.mkdir(parents=True, exist_ok=True)
-
-    epoch_file = session_dir / "active_epoch_id.txt"
-    epoch_id = epoch_file.read_text(encoding="utf-8").strip() if epoch_file.exists() else "ep_unknown"
+    epoch_id = read_active_epoch_id(session_dir)
 
     event_name = data.get("hook_event_name", "PostToolUse")
     tool_name = str(data.get("tool_name", ""))
@@ -265,4 +259,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from _shared import fail_open_main
+    raise SystemExit(fail_open_main(main))

@@ -13,11 +13,8 @@ LOGGER = logging.getLogger(__name__)
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from workspace_fingerprint import fingerprint  # noqa: E402
 from ledger_io import append_jsonl  # noqa: E402
+from _shared import record_ledger, resolve_session_dir, read_active_epoch_id  # noqa: E402
 from enhanced_router.base import agent_role, mutating_agents  # noqa: E402
-
-
-def record_ledger(session_dir: pathlib.Path, record: dict) -> None:
-    append_jsonl(session_dir / "ledger.jsonl", record)
 
 
 def _role(agent_type: str) -> str:
@@ -304,13 +301,11 @@ def main() -> int:
         data = json.load(sys.stdin)
     except Exception:
         return 0
-    cache = pathlib.Path(os.environ.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache")) / "claude-brigade"
     session = str(data.get("session_id", "unknown"))
-    session_dir = cache / "sessions" / session
+    session_dir = resolve_session_dir(data)
     active_dir = session_dir / "active"
     active_dir.mkdir(parents=True, exist_ok=True)
-    epoch_file = session_dir / "active_epoch_id.txt"
-    epoch_id = epoch_file.read_text(encoding="utf-8").strip() if epoch_file.exists() else "ep_unknown"
+    epoch_id = read_active_epoch_id(session_dir)
     cwd = pathlib.Path(str(data.get("cwd", "."))).resolve()
     try:
         current_fp = fingerprint(cwd, session_id=session, epoch_id=epoch_id)
@@ -427,4 +422,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from _shared import fail_open_main
+    raise SystemExit(fail_open_main(main))
