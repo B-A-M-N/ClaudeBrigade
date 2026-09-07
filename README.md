@@ -1,5 +1,10 @@
 # ClaudeBrigade: Model-Agnostic Controller + Visible Native Agents
 
+> **⚠️ Conceptual R&D project.** This is an experimental research and design
+> exploration, not a production tool. It is unfinished, unaudited, and provided
+> as-is for studying multi-model orchestration patterns. Expect breaking
+> changes, incomplete paths, and behaviors that differ from the documentation.
+
 This installs a second command, `claude-brigade`, backed by a separate Claude Code profile. Your normal `claude` command and `~/.claude` profile are not edited.
 
 The launcher scripts are named `claude-brigade` and friends by default. For backward compatibility during migration, the install also produces `claude-enhanced` symlinks in `~/.local/bin/`. Use `claude-brigade` as the preferred name for all documentation and daily use.
