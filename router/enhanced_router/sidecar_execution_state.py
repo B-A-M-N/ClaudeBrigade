@@ -14,6 +14,8 @@ mixin's normal method resolution order.
 
 from __future__ import annotations
 
+from enhanced_router.repository_base import RepositoryMixin
+
 import hashlib
 import json
 import secrets
@@ -27,8 +29,8 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-class SidecarExecutionRepository:
-    """Mixin providing sidecar execution + execution-event persistence.
+class CoprocessorExecutionRepository(RepositoryMixin):
+    """Mixin providing bounded coprocessor execution + event persistence.
 
     Requires a host class that provides ``_new_conn() -> sqlite3.Connection``
     (``RouteState`` does).
@@ -36,6 +38,113 @@ class SidecarExecutionRepository:
 
     def _new_conn(self) -> sqlite3.Connection:  # pragma: no cover - overridden by RouteState
         raise NotImplementedError
+
+    def finalize_router_owned_execution(
+        self,
+        execution_id: str,
+        *,
+        status: str,
+        **fields: object,
+    ) -> dict | None:
+        """Atomically finish a router-owned call and advance its lifecycle.
+
+        The executor may perform provider I/O, but it must not own pieces of
+        durable lifecycle policy.  This seam makes terminalization consistent
+        for success, failure, timeout and cancellation: execution state,
+        claim release, terminal event and phase readiness are handled in one
+        place.  Controller acceptance is deliberately just another explicit
+        field; a completed response is not accepted evidence by default.
+        """
+        execution = self.get_agent_execution(execution_id)
+        if execution is None:
+            return None
+        updated = self.update_agent_execution(
+            execution_id,
+            status=status,
+            **fields,
+        )
+        if updated is None:
+            return None
+        run_id = str(updated["run_id"])
+        epoch_id = str(updated["epoch_id"])
+        agent_id = str(updated.get("claude_agent_id") or "")
+        claim_status = "timeout" if status in {"timeout", "timed_out"} else status
+        if agent_id:
+            try:
+                self.finish_spawn_assignment(run_id, epoch_id, agent_id, claim_status)
+            except (ValueError, WorkflowStateError):
+                # Detached calls have no action claim.  Native claim state is
+                # reconciled separately; terminal execution state remains the
+                # authoritative record for this router-owned operation.
+                pass
+        event_type = "timeout" if status in {"timeout", "timed_out"} else status
+        try:
+            self.append_execution_event(
+                run_id, epoch_id, execution_id, event_type,
+                {"router_owned": True, "status": event_type},
+            )
+        except Exception:
+            # Terminal state must not be rolled back because event telemetry is
+            # observational and can be rebuilt from the execution row.
+            pass
+        phase_id = str(updated.get("phase_id") or "")
+        if phase_id:
+            try:
+                self.complete_phase_if_ready(run_id, epoch_id, phase_id)
+            except Exception:
+                # Scheduler reconciliation will retry phase evaluation; do not
+                # turn a finished provider call into a phantom provider error.
+                pass
+        return self.get_agent_execution(execution_id)
+
+    def adjudicate_coprocessor_result(
+        self,
+        *,
+        run_id: str,
+        epoch_id: str,
+        execution_id: str,
+        disposition: str,
+        reason: str = "",
+        evidence_valid: bool | None = None,
+        quality_score: float | None = None,
+        accepted_finding_ids: list[str] | None = None,
+        adjudicated_by: str = "controller",
+    ) -> dict | None:
+        """Record the controller's explicit disposition of a call result."""
+        allowed = {"accepted", "partially_accepted", "rejected", "insufficient_evidence"}
+        if disposition not in allowed:
+            raise ValueError(f"invalid coprocessor disposition: {disposition}")
+        if quality_score is not None and not 0 <= quality_score <= 1:
+            raise ValueError("coprocessor quality_score must be between 0 and 1")
+        execution = self.get_agent_execution_scoped(run_id, epoch_id, execution_id)
+        if execution is None:
+            raise WorkflowStateError("coprocessor execution is outside the requested epoch")
+        if execution.get("execution_kind") not in {"coprocessor_call", "sidecar_call"}:
+            raise WorkflowStateError("only coprocessor executions can be adjudicated here")
+        if execution.get("status") != "completed":
+            raise WorkflowStateError("coprocessor result must be terminally completed before adjudication")
+        accepted = disposition in {"accepted", "partially_accepted"}
+        if evidence_valid is None:
+            evidence_valid = accepted
+        updated = self.update_agent_execution(
+            execution_id,
+            accepted_by_controller=accepted,
+            evidence_valid=evidence_valid,
+            quality_score=quality_score,
+            result_disposition=disposition,
+            adjudication_reason=reason[:2000],
+            adjudicated_by=adjudicated_by[:256],
+            adjudicated_at=_utcnow(),
+            accepted_finding_ids_json=json.dumps(
+                accepted_finding_ids or [], separators=(",", ":"),
+            ),
+        )
+        if updated is not None:
+            try:
+                self.complete_phase_if_ready(run_id, epoch_id, str(execution.get("phase_id") or ""))
+            except Exception:
+                pass
+        return updated
 
     def start_sidecar_execution(
         self,
@@ -62,12 +171,12 @@ class SidecarExecutionRepository:
             conn.execute("BEGIN IMMEDIATE")
             claim = conn.execute(
                 "SELECT * FROM runnable_action_claims WHERE action_id=? AND run_id=? "
-                "AND epoch_id=? AND action_kind='sidecar_call' AND claim_token=? "
+                "AND epoch_id=? AND action_kind IN ('sidecar_call','coprocessor_call') AND claim_token=? "
                 "AND status='claimed' AND expires_at >= ?",
                 (action_id, run_id, epoch_id, claim_token, _utcnow()),
             ).fetchone()
             if claim is None:
-                raise WorkflowStateError("sidecar claim is missing, expired, or already consumed")
+                raise WorkflowStateError("coprocessor claim is missing, expired, or already consumed")
             phase = conn.execute(
                 "SELECT status, allowed_roles_json, max_fanout, provider_requirements_json, "
                 "max_parallelism, max_attempts "
@@ -107,11 +216,16 @@ class SidecarExecutionRepository:
             conn.execute(
                 "INSERT INTO agent_executions "
                 "(execution_id, run_id, epoch_id, claude_agent_id, role, model_id, phase_id, "
-                "status, actor_kind, execution_kind, provider_id, independence_key) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'started', 'sidecar', 'sidecar_call', ?, ?)",
+                "status, actor_kind, execution_kind, provider_id, endpoint_id, route_digest, "
+                "candidate_index, token_reservation_id, independence_key) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'started', ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     execution_id, run_id, epoch_id, sidecar_agent_id, claim["role"],
-                    claim["model_id"], claim["phase_id"], claim["provider_id"],
+                    claim["model_id"], claim["phase_id"],
+                    "coprocessor" if claim["action_kind"] == "coprocessor_call" else "sidecar",
+                    claim["action_kind"], claim["provider_id"],
+                    claim["endpoint_id"], claim["route_digest"], claim["candidate_index"],
+                    claim["token_reservation_id"],
                     hashlib.sha256(
                         f"sidecar:{claim['model_id']}:{claim['role']}:{claim['phase_id']}".encode()
                     ).hexdigest(),
@@ -142,7 +256,7 @@ class SidecarExecutionRepository:
         finally:
             conn.close()
 
-    def start_detached_sidecar_execution(
+    def start_detached_coprocessor_execution(
         self,
         *,
         run_id: str,
@@ -156,7 +270,7 @@ class SidecarExecutionRepository:
         parent_execution_id: str | None = None,
         retry_count: int = 0,
     ) -> dict:
-        """Create a persisted router-owned advisory sidecar execution.
+        """Create a persisted router-owned advisory coprocessor execution.
 
         Fastpath jobs are created by the router itself rather than by a
         workflow claim.  They still use the same execution ledger and event
@@ -210,7 +324,7 @@ class SidecarExecutionRepository:
                 "(execution_id, run_id, epoch_id, claude_agent_id, role, model_id, phase_id, "
                 "status, actor_kind, execution_kind, provider_id, retry_count, "
                 "parent_execution_id, independence_key) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'started', 'sidecar', 'sidecar_call', ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'started', 'coprocessor', 'coprocessor_call', ?, ?, ?, ?)",
                 (execution_id, run_id, epoch_id, sidecar_agent_id, role, model_id,
                  phase_id, provider_id, retry_count, parent_execution_id, independence_key),
             )
@@ -231,6 +345,15 @@ class SidecarExecutionRepository:
             raise
         finally:
             conn.close()
+
+    def start_detached_sidecar_execution(self, **kwargs: object) -> dict:
+        """Compatibility wrapper for pre-migration callers.
+
+        New detached writes deliberately use ``coprocessor_call``; this name
+        remains only so installed integrations can migrate without a hard
+        import failure.
+        """
+        return self.start_detached_coprocessor_execution(**kwargs)  # type: ignore[arg-type]
 
     def append_execution_event(
         self,
@@ -283,13 +406,15 @@ class SidecarExecutionRepository:
             ).fetchone()
             if execution is None:
                 raise WorkflowStateError("sidecar execution was not found")
-            if execution["execution_kind"] != "sidecar_call":
+            if execution["execution_kind"] not in {"sidecar_call", "coprocessor_call"}:
                 raise WorkflowStateError("only sidecar executions can be retried")
-            if execution["status"] not in {"failed", "timeout", "cancelled"}:
+            # Cancellation is not evidence that the provider/model failed;
+            # do not consume a fallback candidate on user or controller stop.
+            if execution["status"] not in {"failed", "timeout"}:
                 raise WorkflowStateError("sidecar execution is not in a retryable terminal state")
             claim = conn.execute(
                 "SELECT * FROM runnable_action_claims WHERE execution_id=? "
-                "AND action_kind='sidecar_call' ORDER BY claimed_at DESC LIMIT 1",
+                "AND action_kind IN ('sidecar_call','coprocessor_call') ORDER BY claimed_at DESC LIMIT 1",
                 (execution_id,),
             ).fetchone()
             if claim is None:
@@ -314,11 +439,13 @@ class SidecarExecutionRepository:
             conn.execute(
                 "INSERT INTO runnable_action_claims "
                 "(action_id, run_id, epoch_id, phase_id, role, native_agent_name, model_id, "
-                "action_kind, provider_id, claim_token, status, created_at, claimed_at, expires_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'sidecar_call', ?, ?, 'claimed', ?, ?, ?)",
+                "action_kind, endpoint_id, provider_id, route_digest, candidate_index, claim_token, "
+                "status, created_at, claimed_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)",
                 (retry_action_id, execution["run_id"], execution["epoch_id"], execution["phase_id"],
                  execution["role"], claim["native_agent_name"], execution["model_id"],
-                 execution["provider_id"], retry_token, now, now, expires),
+                 claim["action_kind"], claim["endpoint_id"], execution["provider_id"],
+                 claim["route_digest"], claim["candidate_index"], retry_token, now, now, expires),
             )
             conn.commit()
             return {
@@ -330,6 +457,7 @@ class SidecarExecutionRepository:
             raise
         finally:
             conn.close()
+
 
     def get_execution_events(
         self,
@@ -360,3 +488,7 @@ class SidecarExecutionRepository:
             return result
         finally:
             conn.close()
+
+
+# Compatibility name for the pre-migration bounded sidecar lane.
+SidecarExecutionRepository = CoprocessorExecutionRepository

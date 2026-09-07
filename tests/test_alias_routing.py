@@ -114,6 +114,139 @@ def test_role_alias_resolves_to_certified_freeinference_model():
     assert result.registry_hash is not None
 
 
+def test_native_sidecar_public_alias_routes_to_its_own_model():
+    """A sidecar's public alias is independently routable after attachment."""
+    state = _fresh_state()
+    run_id = "test-sidecar-route"
+    state.create_run(run_id, "test-session", "/tmp")
+    state.create_epoch_from_profile(run_id, "ep-sidecar", "normal", "freeinference")
+    state.get_spawn_assignment = lambda *_args, **_kwargs: {
+        "native_agent_name": "brigade-sidecar-secondary-implementation-worker",
+        "role": "implementer",
+        "model_id": "minimax-m3",
+    }
+
+    result = resolve_request(
+        identity=_identity(run_id, "sidecar-agent-1"),
+        public_model="anthropic-brigade-sidecar-secondary-implementation-worker",
+    )
+
+    assert result.kind == BackendType.LITELLM
+    assert result.model_id == "minimax-m3"
+    assert result.upstream_model == "openai/minimax-m3"
+
+
+def test_native_sidecar_fallback_uses_claimed_provider_and_endpoint():
+    """A claimed native fallback is routed as the exact worker assignment."""
+    state = _fresh_state()
+    run_id = "test-sidecar-fallback-route"
+    state.create_run(run_id, "test-session", "/tmp")
+    state.create_epoch_from_profile(run_id, "ep-sidecar-fallback", "normal", "freeinference")
+
+    import enhanced_router.registry as registry_module
+    from enhanced_router.config_models import RouteCandidateSpec
+
+    registry = registry_module._registry_instance
+    assert registry is not None
+    worker = registry.sidecar_agents["qwen-grounder"]
+    worker.fallback_routes = [
+        RouteCandidateSpec(
+            model="glm-5.1",
+            endpoint="openai",
+            provider_id="freeinference",
+        )
+    ]
+    state.get_spawn_assignment = lambda *_args, **_kwargs: {
+        "native_agent_name": "brigade-sidecar-grounder",
+        "role": "recon",
+        "model_id": "glm-5.1",
+        "provider_id": "freeinference",
+        "endpoint_id": "openai",
+    }
+
+    result = resolve_request(
+        identity=_identity(run_id, "sidecar-fallback-agent"),
+        public_model="anthropic-brigade-sidecar-grounder",
+    )
+
+    assert result.model_id == "glm-5.1"
+    assert result.provider_id == "freeinference"
+    assert result.endpoint_id == "openai"
+
+
+def test_controller_slot_fallback_selects_enabled_candidate_before_binding():
+    """A disabled Main candidate advances to the next exact slot route."""
+    state = _fresh_state()
+    run_id = "test-controller-fallback-route"
+    state.create_run(
+        run_id,
+        "test-session",
+        "/tmp",
+        inference_profile_id="freeinference",
+    )
+
+    import enhanced_router.registry as registry_module
+    from enhanced_router.config_models import RouteCandidateSpec, SlotRouteSpec
+
+    registry = registry_module._registry_instance
+    assert registry is not None
+    profile = registry.profiles["freeinference"]
+    profile.slots["main"] = SlotRouteSpec(
+        model="glm-5.1",
+        endpoint="openai",
+        provider_id="freeinference",
+        fallbacks=[
+            RouteCandidateSpec(
+                model="glm-5-turbo",
+                provider_id="freeinference",
+            )
+        ],
+        reserve_class="controller",
+    )
+    registry.models["glm-5.1"].enabled = False
+
+    state.create_epoch(run_id, "ep-controller-fallback", "normal", "freeinference")
+    state.snapshot_slot_bindings(
+        run_id,
+        "ep-controller-fallback",
+        registry.slot_alias_manifest("freeinference").values(),
+        registry.registry_hash(),
+    )
+
+    result = resolve_request(
+        identity=_identity(run_id),
+        public_model="anthropic-brigade-slot-main",
+    )
+
+    assert result.model_id == "glm-5-turbo"
+    assert result.provider_id == "freeinference"
+    assert result.agent_binding_id is None
+
+    # The fallback candidate becomes the immutable controller binding. A
+    # later request for the native Main alias must reuse it rather than
+    # comparing it back to the disabled primary slot.
+    again = resolve_request(
+        identity=_identity(run_id),
+        public_model="anthropic-brigade-slot-main",
+    )
+    assert again.model_id == "glm-5-turbo"
+
+
+def test_native_sidecar_public_alias_requires_attached_action():
+    state = _fresh_state()
+    run_id = "test-sidecar-route-unclaimed"
+    state.create_run(run_id, "test-session", "/tmp")
+    state.create_epoch_from_profile(run_id, "ep-sidecar-unclaimed", "normal", "freeinference")
+
+    with pytest.raises(Exception) as exc_info:
+        resolve_request(
+            identity=_identity(run_id, "unclaimed-sidecar-agent"),
+            public_model="anthropic-brigade-sidecar-secondary-implementation-worker",
+        )
+    assert exc_info.value.status_code == 409
+    assert "native sidecar action is not attached" in str(exc_info.value.detail)
+
+
 # ===================================================================
 # test_role_alias_binding_is_immutable
 # ===================================================================
@@ -143,6 +276,30 @@ def test_role_alias_binding_is_immutable():
     assert r2.agent_binding_id == binding_id_1
     assert r2.upstream_model == "openai/kimi-k2.7-code"
     assert r2.kind == BackendType.LITELLM
+
+
+def test_existing_binding_rejects_role_and_model_mismatch():
+    """A pinned worker cannot silently change role or backing model."""
+    state = _fresh_state()
+    run_id = "test-run-binding-conflict"
+    agent_id = "test-agent-binding-conflict"
+    state.create_run(run_id, "test-session", "/tmp")
+    state.create_epoch_from_profile(run_id, "ep-conflict", "normal", "freeinference")
+
+    resolve_request(
+        identity=_identity(run_id, agent_id),
+        public_model="anthropic-brigade-implementer",
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        resolve_request(
+            identity=_identity(run_id, agent_id),
+            public_model="anthropic-brigade-adversary",
+        )
+
+    assert exc_info.value.status_code == 409
+    assert "agent binding conflict" in str(exc_info.value.detail)
+    assert "bound role 'implementer'" in str(exc_info.value.detail)
 
 
 # ===================================================================

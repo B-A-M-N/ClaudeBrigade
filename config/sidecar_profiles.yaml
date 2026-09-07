@@ -1,0 +1,12 @@
+sidecar_profiles:
+  fi-flow-proven:
+    sidecar_agent_ids:
+      - qwen-grounder
+      - deepseek-implementer
+      - deepseek-repairer
+      - minimax-senior-reviewer
+      - kimi-completion-controller
+      - minimax-completion-reviewer
+      - glm-critical-gate
+    coprocessor_ids: [route-advisor, verification-reviewer, post-edit-sentinel]
+    coprocessors_enabled: true

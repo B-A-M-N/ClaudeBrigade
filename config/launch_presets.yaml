@@ -1,0 +1,9 @@
+launch_presets:
+  fi-flow-proven:
+    inference_profile_id: freeinference
+    sidecar_profile_id: fi-flow-proven
+    workflow_id: normal
+  claude-augmented:
+    inference_profile_id: freeinference
+    sidecar_profile_id: fi-flow-proven
+    workflow_id: sidecar-augmented-normal

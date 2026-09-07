@@ -24,6 +24,7 @@ from enhanced_router.backends import (
 from enhanced_router.registry import ModelRegistry
 from enhanced_router.state import RouteState, ControllerModelError
 from enhanced_router.endpoint_selection import select_endpoint
+from enhanced_router.route_ladder import dedupe_candidates, target_candidates, route_digest
 
 logger = logging.getLogger("claude-enhanced-router")
 
@@ -190,6 +191,8 @@ def resolve_request(
     explicit_model_id: str | None = None,
     explicit_endpoint: str | None = None,
     sidecar: bool = False,
+    _controller_candidate: dict | None = None,
+    _route_candidate: dict | None = None,
 ) -> ResolvedRoute:
     """Resolve a Claude Code request to a backend route using identity-first dispatch.
 
@@ -220,7 +223,147 @@ def resolve_request(
 
     registry: ModelRegistry = get_registry()
     state: RouteState = get_state()
-    role = registry.role_model_aliases().get(public_model, ROLE_MODEL_ALIASES.get(public_model))
+    run_row = state.get_run(identity.run_id) if identity.run_id else None
+    inference_profile_id = run_row.get("inference_profile_id") if run_row else None
+    sidecar_profile_id = run_row.get("sidecar_profile_id") if run_row else None
+    slot_entries = registry.slot_alias_manifest(inference_profile_id)
+    worker_entry = next(
+        (
+            entry for entry in registry.native_worker_manifest(
+                inference_profile_id, sidecar_profile_id
+            ).values()
+            if public_model in {
+                str(entry.get("public_model_alias") or ""),
+                str(entry.get("native_agent_name") or ""),
+            }
+            and entry.get("source_kind") == "sidecar_agent"
+        ),
+        None,
+    )
+    native_assignment: dict | None = None
+    if worker_entry is not None and identity.run_id and identity.claude_agent_id:
+        assignment_epoch = state.get_active_epoch(identity.run_id)
+        if assignment_epoch is not None:
+            native_assignment = state.get_spawn_assignment(
+                identity.run_id,
+                assignment_epoch["epoch_id"],
+                str(identity.claude_agent_id),
+            )
+    slot_entry = next(
+        (
+            entry for entry in slot_entries.values()
+            if public_model in {entry["model_alias"], entry["public_model_alias"]}
+        ),
+        None,
+    )
+    # The slot projection is copied into SQLite when an epoch starts. Once
+    # that snapshot exists it is authoritative for controller selection; the
+    # mutable registry is used only to identify the public alias and to load
+    # the selected model definition.
+    slot_snapshot: dict | None = None
+    if identity.run_id and identity.claude_session_id and slot_entry is not None:
+        active_epoch = state.get_active_epoch(identity.run_id)
+        if active_epoch is not None:
+            snapshot = state.get_slot_binding(
+                identity.run_id, active_epoch["epoch_id"], str(slot_entry.get("slot")),
+            )
+            if snapshot is not None:
+                slot_snapshot = snapshot
+                try:
+                    snapshot_fallbacks = json.loads(
+                        snapshot.get("fallback_policy_json") or "[]"
+                    )
+                except (TypeError, ValueError):
+                    snapshot_fallbacks = []
+                slot_entry = {
+                    **slot_entry,
+                    "model_id": snapshot["logical_model_id"],
+                    "provider_id": snapshot.get("provider_id"),
+                    "endpoint": snapshot.get("endpoint_id") or "auto",
+                    "fallbacks": snapshot_fallbacks if isinstance(snapshot_fallbacks, list) else [],
+                }
+    if slot_entry is not None:
+        role = None if slot_entry.get("slot") == "main" else slot_entry.get("role")
+    elif worker_entry is not None:
+        # Native sidecar aliases are individually routable. Their model and
+        # endpoint come from the sidecar worker definition, while workflow
+        # admission/lifecycle still proves the exact native identity.
+        role = worker_entry.get("role") or "recon"
+    else:
+        role = registry.role_model_aliases(
+            inference_profile_id, sidecar_profile_id
+        ).get(public_model, ROLE_MODEL_ALIASES.get(public_model))
+
+    if (
+        worker_entry is not None
+        and explicit_model_id is not None
+        and str(explicit_model_id)
+        != str((native_assignment or {}).get("model_id") or worker_entry.get("model_id"))
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Native sidecar alias '{public_model}' is assigned to "
+                f"model '{(native_assignment or {}).get('model_id') or worker_entry.get('model_id')}', "
+                f"not '{explicit_model_id}'."
+            ),
+        )
+
+    # Main/controller failover happens before the first immutable binding is
+    # created. Once a controller binding exists, the binding-first path above
+    # returns it unchanged; no request is replayed after streaming starts.
+    if (
+        identity.run_id
+        and identity.claude_session_id
+        and role is None
+        and _controller_candidate is None
+        and state.get_controller_binding(identity.run_id, identity.claude_session_id) is None
+    ):
+        ladder: list[dict] = []
+        if slot_entry is not None:
+            ladder = dedupe_candidates([
+                {
+                    "model": slot_entry.get("model_id"),
+                    "provider_id": slot_entry.get("provider_id"),
+                    "endpoint": slot_entry.get("endpoint", "auto"),
+                },
+                *(item for item in (slot_entry.get("fallbacks") or []) if isinstance(item, dict)),
+            ])
+        # Older profiles may define controller fallbacks in the controller
+        # route while the native Main slot only carries the primary.  Merge
+        # that legacy lane only when no immutable slot snapshot exists; once
+        # an epoch snapshot is present, reading the mutable profile here would
+        # violate binding immutability.
+        if slot_snapshot is None and inference_profile_id in registry.profiles:
+            profile = registry.profiles[inference_profile_id]
+            ladder = dedupe_candidates([
+                *ladder,
+                *target_candidates(profile.controller_route()),
+            ])
+        if len(ladder) > 1:
+            failures: list[str] = []
+            for candidate in ladder:
+                try:
+                    return resolve_request(
+                        identity=identity,
+                        public_model=public_model,
+                        explicit_model_id=explicit_model_id,
+                        explicit_endpoint=explicit_endpoint,
+                        sidecar=sidecar,
+                        _controller_candidate=candidate,
+                    )
+                except HTTPException as exc:
+                    if exc.status_code not in {404, 503}:
+                        raise
+                    failures.append(
+                        f"{candidate.get('provider_id') or 'default'}/"
+                        f"{candidate.get('model')}@{candidate.get('endpoint', 'auto')}: "
+                        f"{exc.detail}"
+                    )
+            raise HTTPException(
+                status_code=503,
+                detail="controller route ladder exhausted; " + " | ".join(failures),
+            )
 
     # Reject malformed native-agent requests before opening the SQLite state
     # database.  This keeps the identity contract deterministic even when the
@@ -243,13 +386,48 @@ def resolve_request(
         existing = state.get_agent_binding(identity.run_id, identity.claude_agent_id)
 
     if existing is not None:
-        # Existing binding found — use it regardless of incoming model
-        if role is not None and existing.get("role") != role:
-            # Model mismatch: log it but still use the existing binding
-            logger.warning(
-                "Binding model mismatch: agent=%s bound_role=%s request_role=%s "
-                "(using existing binding, ignoring mismatch)",
-                identity.claude_agent_id, existing.get("role"), role,
+        # Existing bindings are immutable, but an incoming identity must still
+        # agree with the binding.  Silently serving a reviewer request from an
+        # implementer binding makes the public route misleading and can erase
+        # the independence boundary between workflow phases.
+        requested_model_id: str | None = None
+        if worker_entry is not None:
+            requested_model_id = str(
+                (native_assignment or {}).get("model_id")
+                or worker_entry.get("model_id")
+                or ""
+            ) or None
+        elif slot_entry is not None:
+            requested_model_id = str(slot_entry.get("model_id") or "") or None
+        else:
+            requested_model_id = registry.role_model_bindings(
+                inference_profile_id, sidecar_profile_id
+            ).get(public_model)
+        bound_role = str(existing.get("role") or "")
+        bound_model_id = str(existing.get("model_id") or "")
+        mismatch: str | None = None
+        if role is not None and bound_role != str(role):
+            mismatch = (
+                f"bound role '{bound_role}' does not match requested role '{role}'"
+            )
+        elif role is not None and requested_model_id and bound_model_id != requested_model_id:
+            mismatch = (
+                f"bound model '{bound_model_id}' does not match requested model "
+                f"'{requested_model_id}'"
+            )
+        elif role is not None and explicit_model_id and bound_model_id != str(explicit_model_id):
+            mismatch = (
+                f"bound model '{bound_model_id}' does not match explicit model "
+                f"'{explicit_model_id}'"
+            )
+        if mismatch:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"agent binding conflict for '{identity.claude_agent_id}': "
+                    f"{mismatch}; release the binding or use the originally "
+                    "bound native identity"
+                ),
             )
 
         cat_gen = existing.get("catalog_generation")
@@ -297,7 +475,40 @@ def resolve_request(
         epoch_id = active_epoch["epoch_id"]
 
         # Resolve role route from epoch
-        route = state.get_role_route(identity.run_id, epoch_id, role)
+        route = None
+        if worker_entry is not None:
+            assignment_endpoint = (native_assignment or {}).get("endpoint_id")
+            assignment_model = (native_assignment or {}).get("model_id")
+            assignment_provider = (native_assignment or {}).get("provider_id")
+            selected_endpoint = (
+                assignment_endpoint
+                if assignment_endpoint and assignment_endpoint != "auto"
+                else worker_entry.get("endpoint", "auto")
+            )
+            route = {
+                "version": 0,
+                "model_id": (
+                    _route_candidate.get("model")
+                    if _route_candidate is not None
+                    else assignment_model or worker_entry["model_id"]
+                ),
+                "provider_id": (
+                    _route_candidate.get("provider_id")
+                    if _route_candidate is not None
+                    else assignment_provider or worker_entry.get("provider_id")
+                ),
+                "endpoint_override": (
+                    None
+                    if (_route_candidate or {}).get(
+                        "endpoint", selected_endpoint
+                    ) == "auto"
+                    else (_route_candidate or {}).get(
+                        "endpoint", selected_endpoint
+                    )
+                ),
+            }
+        else:
+            route = state.get_role_route(identity.run_id, epoch_id, role)
         if route is None and sidecar and explicit_model_id:
             route = {"version": 0, "model_id": explicit_model_id}
         if route is None:
@@ -305,18 +516,36 @@ def resolve_request(
                 status_code=404,
                 detail=f"No route defined for role '{role}' in epoch {epoch_id}",
             )
+        if _route_candidate is not None:
+            route = {
+                **route,
+                "model_id": _route_candidate.get("model") or route.get("model_id"),
+                "provider_id": _route_candidate.get("provider_id"),
+                "endpoint_override": (
+                    None
+                    if _route_candidate.get("endpoint", "auto") == "auto"
+                    else _route_candidate.get("endpoint")
+                ),
+            }
 
-        model_id_value = explicit_model_id or registry.role_model_bindings().get(
-            public_model, route["model_id"]
+        model_id_value = (
+            (_route_candidate or {}).get("model")
+            or explicit_model_id
+            or ((native_assignment or {}).get("model_id") if worker_entry is not None else None)
+            or (worker_entry or {}).get("model_id")
+            or registry.role_model_bindings(
+                inference_profile_id, sidecar_profile_id
+            ).get(public_model, route["model_id"])
         )
         if not isinstance(model_id_value, str) or not model_id_value:
             raise HTTPException(status_code=500, detail=f"Role '{role}' has no model binding")
         model_id = model_id_value
-        assignment = None
+        assignment = native_assignment
         if not sidecar:
-            assignment = state.get_spawn_assignment(
-                identity.run_id, epoch_id, str(identity.claude_agent_id),
-            )
+            if assignment is None:
+                assignment = state.get_spawn_assignment(
+                    identity.run_id, epoch_id, str(identity.claude_agent_id),
+                )
             if assignment is None:
                 pending = state.get_unattached_spawn_claim_for_role(
                     identity.run_id, epoch_id, role,
@@ -329,12 +558,33 @@ def resolve_request(
                             "SubagentStart before the first model request"
                         ),
                     )
+                if worker_entry is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "native sidecar action is not attached; claim the exact "
+                            "sidecar action and wait for SubagentStart before routing"
+                        ),
+                    )
             if assignment is not None:
-                if assignment.get("role") != role or assignment.get("model_id") != model_id:
+                expected_native_name = (
+                    worker_entry.get("native_agent_name")
+                    if worker_entry is not None
+                    else None
+                )
+                if (
+                    assignment.get("role") != role
+                    or assignment.get("model_id") != model_id
+                    or (
+                        expected_native_name is not None
+                        and assignment.get("native_agent_name") != expected_native_name
+                    )
+                ):
                     raise HTTPException(
                         status_code=409,
                         detail=(
                             "native agent assignment mismatch: the first request must use "
+                            f"native_agent={assignment.get('native_agent_name')!r}, "
                             f"role={assignment.get('role')!r}, model={assignment.get('model_id')!r}"
                         ),
                     )
@@ -378,7 +628,11 @@ def resolve_request(
                         state,
                         explicit_endpoint=candidate_id,
                         require_certified=True,
-                        provider_id=spec.endpoints[candidate_id].provider_id or spec.provider_id,
+                        provider_id=(
+                            route.get("provider_id")
+                            or spec.endpoints[candidate_id].provider_id
+                            or spec.provider_id
+                        ),
                         configuration_hash=reg_hash,
                         required_capabilities=("messages",) if sidecar else ("messages", "streaming", "tools"),
                     ))
@@ -403,13 +657,36 @@ def resolve_request(
                     # certified for local/operator-owned models; provider
                     # deployments must have capability-specific evidence.
                     require_certified=True,
-                    provider_id=spec.provider_id,
+                    provider_id=route.get("provider_id") or spec.provider_id,
                     configuration_hash=reg_hash,
                     required_capabilities=("messages",) if sidecar else ("messages", "streaming", "tools"),
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=503, detail=str(exc)) from exc
         endpoint = selected.spec
+
+        # A native sidecar fallback is an exact spawn assignment.  The child
+        # may not silently re-resolve to a different provider or endpoint.
+        if worker_entry is not None and assignment is not None:
+            expected_provider = assignment.get("provider_id")
+            actual_provider = endpoint.provider_id or spec.provider_id
+            expected_endpoint = assignment.get("endpoint_id")
+            if expected_provider and actual_provider != expected_provider:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "native agent assignment provider mismatch: expected "
+                        f"{expected_provider!r}, resolved {actual_provider!r}"
+                    ),
+                )
+            if expected_endpoint and expected_endpoint != "auto" and selected.endpoint_id != expected_endpoint:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "native agent assignment endpoint mismatch: expected "
+                        f"{expected_endpoint!r}, resolved {selected.endpoint_id!r}"
+                    ),
+                )
 
         # Resolve api_base from the selected, immutable endpoint.
         resolved_api_base = _resolve_api_base(endpoint.api_base, endpoint.api_base_env)
@@ -483,6 +760,15 @@ def resolve_request(
                 if managed_group else selected.reason
             ),
             endpoint_policy_json=json.dumps(spec.endpoint_policy.model_dump()),
+            route_digest=route_digest({
+                "model": model_id,
+                "endpoint": selected.endpoint_id,
+                "provider_id": endpoint.provider_id or spec.provider_id,
+            }),
+            candidate_index=(
+                int(str((native_assignment or {}).get("candidate_index")))
+                if (native_assignment or {}).get("candidate_index") is not None else 0
+            ),
             certification_id=None if managed_group else endpoint.certification_id,
             provider_id=(
                 endpoint.provider_id or spec.provider_id
@@ -541,24 +827,33 @@ def resolve_request(
             return route
 
     reg_hash = registry.registry_hash()
+    controller_candidate = _controller_candidate or {}
+    controller_model_id = str(
+        controller_candidate.get("model")
+        or (slot_entry["model_id"] if slot_entry is not None else public_model)
+    )
+    candidate_provider_id = controller_candidate.get("provider_id")
+    candidate_endpoint = controller_candidate.get("endpoint")
+    if candidate_endpoint == "auto":
+        candidate_endpoint = None
     try:
-        controller_spec = registry.get_model(public_model)
+        controller_spec = registry.get_model(controller_model_id)
     except KeyError:
         # Preserve standalone compatibility for callers without a run while
         # requiring configured models for a bound controller session.
         if not identity.run_id:
             return ResolvedRoute(kind=BackendType.ANTHROPIC_PASSTHROUGH, model_id=public_model)
-        raise HTTPException(status_code=404, detail=f"Controller model '{public_model}' is not in the registry")
+        raise HTTPException(status_code=404, detail=f"Controller model '{controller_model_id}' is not in the registry")
 
     if not controller_spec.enabled:
-        raise HTTPException(status_code=503, detail=f"Controller model '{public_model}' is disabled")
+        raise HTTPException(status_code=503, detail=f"Controller model '{controller_model_id}' is disabled")
     if identity.run_id:
         try:
-            state.validate_controller_model(identity.run_id, public_model)
+            state.validate_controller_model(identity.run_id, controller_model_id)
         except ControllerModelError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
 
-    managed_group = controller_spec.routing_mode == "managed-group"
+    managed_group = controller_spec.routing_mode == "managed-group" and not candidate_endpoint
     managed_deployments: tuple[str, ...] = ()
     managed_provider_ids: set[str | None] = set()
     if managed_group:
@@ -566,19 +861,23 @@ def resolve_request(
         for candidate_id in sorted(controller_spec.endpoints):
             try:
                 eligible.append(select_endpoint(
-                    public_model,
+                    controller_model_id,
                     controller_spec,
                     state,
                     explicit_endpoint=candidate_id,
                     require_certified=True,
-                    provider_id=controller_spec.endpoints[candidate_id].provider_id or controller_spec.provider_id,
+                    provider_id=(
+                        candidate_provider_id
+                        or controller_spec.endpoints[candidate_id].provider_id
+                        or controller_spec.provider_id
+                    ),
                     configuration_hash=reg_hash,
                     required_capabilities=("messages", "streaming", "tools"),
                 ))
             except ValueError:
                 continue
         if not eligible:
-            raise HTTPException(status_code=503, detail=f"Controller model '{public_model}' has no eligible managed deployment")
+            raise HTTPException(status_code=503, detail=f"Controller model '{controller_model_id}' has no eligible managed deployment")
         selected = eligible[0]
         managed_deployments = tuple(item.endpoint_id for item in eligible)
         managed_provider_ids = {
@@ -586,16 +885,17 @@ def resolve_request(
         }
     else:
         try:
-            selected = select_endpoint(
-                public_model,
-                controller_spec,
-                state,
+                selected = select_endpoint(
+                    controller_model_id,
+                    controller_spec,
+                    state,
+                    explicit_endpoint=candidate_endpoint,
                     # Standard Claude passthrough is already an explicit
                     # backend boundary, not a provider deployment selected by
                     # Brigade.  All other controller deployments require the
                     # same endpoint certification as worker routes.
                     require_certified=controller_spec.backend != "anthropic-passthrough",
-                provider_id=controller_spec.provider_id,
+                provider_id=candidate_provider_id or controller_spec.provider_id,
                 configuration_hash=reg_hash,
                 required_capabilities=("messages", "streaming", "tools"),
             )
@@ -604,7 +904,7 @@ def resolve_request(
     endpoint = selected.spec
     resolved_api_base = _resolve_api_base(endpoint.api_base, endpoint.api_base_env)
     if endpoint.backend == "direct-anthropic" and not resolved_api_base:
-        raise HTTPException(status_code=503, detail=f"No endpoint configured for controller '{public_model}'")
+        raise HTTPException(status_code=503, detail=f"No endpoint configured for controller '{controller_model_id}'")
     if endpoint.api_key_env and not _credential_available(endpoint.api_key_env):
         raise HTTPException(status_code=503, detail=f"API key env var '{endpoint.api_key_env}' is not set")
 
@@ -619,15 +919,15 @@ def resolve_request(
         catalog_generation = dep["generation"]
         litellm_base_url = f"http://127.0.0.1:{dep['port']}"
         litellm_model_name = (
-            f"brigade-{controller_spec.deployment_group or public_model}"
+            f"brigade-{controller_spec.deployment_group or controller_model_id}"
             if managed_group
-            else f"brigade-{public_model}--{selected.endpoint_id}" if controller_spec.endpoints else f"brigade-{public_model}"
+            else f"brigade-{controller_model_id}--{selected.endpoint_id}" if controller_spec.endpoints else f"brigade-{controller_model_id}"
         )
 
     auth_spec_json = json.dumps(endpoint.auth.model_dump()) if endpoint.auth else None
     if identity.run_id and identity.claude_session_id:
         provider_id = (
-            endpoint.provider_id or controller_spec.provider_id
+            endpoint.provider_id or candidate_provider_id or controller_spec.provider_id
             if not managed_group
             else next(iter(managed_provider_ids)) if len(managed_provider_ids) == 1 else None
         )
@@ -653,6 +953,9 @@ def resolve_request(
                         execution_id=f"controller:{identity.claude_session_id}",
                         lane="controller",
                         max_active=provider.limits.max_active_agents,
+                        model_id=controller_model_id,
+                        health_max_age_seconds=provider.health_max_age_seconds,
+                        allow_untested_models=provider.allow_untested_models,
                         reason="main controller binding",
                     )
                     reservation_created = True
@@ -670,7 +973,7 @@ def resolve_request(
                 run_id=identity.run_id,
                 client_session_id=identity.claude_session_id,
                 public_model=public_model,
-                registry_model_id=public_model,
+                registry_model_id=controller_model_id,
                 backend=endpoint.backend,
                 upstream_model=endpoint.upstream_model or endpoint.litellm_model,
                 provider_id=(
@@ -690,14 +993,20 @@ def resolve_request(
                 api_key_env=endpoint.api_key_env,
                 endpoint_id=None if managed_group else selected.endpoint_id,
                 endpoint_selection_reason=(
-                    f"managed deployment group '{controller_spec.deployment_group or public_model}'"
+                    f"managed deployment group '{controller_spec.deployment_group or controller_model_id}'"
                     if managed_group else selected.reason
                 ),
                 endpoint_policy_json=json.dumps(controller_spec.endpoint_policy.model_dump()),
+                route_digest=route_digest({
+                    "model": controller_model_id,
+                    "endpoint": selected.endpoint_id,
+                    "provider_id": provider_id,
+                }),
+                candidate_index=int((_controller_candidate or {}).get("candidate_index") or 0),
                 litellm_model_name=litellm_model_name,
                 configuration_hash=reg_hash,
                 routing_mode="managed-group" if managed_group else "fixed",
-                deployment_group=controller_spec.deployment_group or public_model if managed_group else None,
+                deployment_group=controller_spec.deployment_group or controller_model_id if managed_group else None,
                 allowed_deployments_json=json.dumps(managed_deployments) if managed_group else None,
                 deployment_policy_digest=reg_hash if managed_group else None,
             )
@@ -714,7 +1023,7 @@ def resolve_request(
 
     return ResolvedRoute(
         kind=kind,
-        model_id=public_model,
+        model_id=controller_model_id,
         upstream_model=endpoint.upstream_model or endpoint.litellm_model,
         api_base=resolved_api_base,
         api_key_env=endpoint.api_key_env,

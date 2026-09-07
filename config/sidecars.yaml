@@ -1,12 +1,219 @@
-# Independent bounded specialist inference. These do not inherit the
-# Claude Code controller/role profile unless a workflow phase explicitly
-# chooses role-based sidecar compatibility by omitting `sidecar`.
-sidecars:
-  route_advisor:
+# Master switch for launches that do not select a named sidecar profile.
+# A named profile can apply its own narrower `coprocessors_enabled` switch.
+# This affects bounded router-owned calls only; native sidecar agents and
+# fastpath retain independent enablement controls.
+coprocessors_enabled: true
+
+# Native Claude Code workers selected independently from the role profile.
+# They receive their tools and backing model through the --agents manifest;
+# they never run through CoprocessorExecutor.
+sidecar_agents:
+  qwen-grounder:
+    worker_id: grounder
+    model_id: qwen3.6-35b
+    native_agent_name: brigade-sidecar-grounder
+    public_model_alias: anthropic-brigade-sidecar-grounder
+    roles: [recon, grounding]
+    description: Checks assumptions, scope adherence, and missing requirements
+    template: brigade-grounder
+    tools: [Read, Grep, Glob, Bash]
+    can_mutate: false
+    isolation: none
+    background: true
+    max_turns: 60
+    effort: medium
+    max_parallelism: 2
+
+  deepseek-implementer:
+    worker_id: implementation-worker
+    model_id: deepseek-v4-flash
+    native_agent_name: brigade-sidecar-implementer
+    public_model_alias: anthropic-brigade-sidecar-implementer
+    roles: [implementer]
+    description: Primary fi-flow implementation and correction worker
+    template: brigade-sidecar-implementer
+    tools: [Read, Grep, Glob, Bash, Edit, Write]
+    can_mutate: true
+    counts_as_implementation: true
+    isolation: worktree
+    background: true
+    max_turns: 140
+    effort: high
+    permission_mode: acceptEdits
+    max_parallelism: 2
+
+  deepseek-repairer:
+    worker_id: repair-worker
+    model_id: deepseek-v4-flash
+    native_agent_name: brigade-sidecar-repairer
+    public_model_alias: anthropic-brigade-sidecar-repairer
+    roles: [repairer]
+    description: Applies only controller-accepted fi-flow corrections
+    template: brigade-sidecar-repairer
+    tools: [Read, Grep, Glob, Bash, Edit, Write]
+    can_mutate: true
+    counts_as_implementation: true
+    isolation: worktree
+    background: true
+    max_turns: 120
+    effort: high
+    permission_mode: acceptEdits
+
+  minimax-builder:
+    worker_id: secondary-implementation-worker
+    model_id: minimax-m3
+    native_agent_name: brigade-sidecar-secondary-implementation-worker
+    public_model_alias: anthropic-brigade-sidecar-secondary-implementation-worker
+    roles: [implementer]
+    description: High-throughput implementation worker
+    tools: [Read, Grep, Glob, Bash, Edit, Write]
+    can_mutate: true
+    isolation: worktree
+    background: true
+    max_turns: 140
+    effort: high
+    max_parallelism: 2
+
+  minimax-reviewer:
+    worker_id: reviewer
+    model_id: minimax-m3
+    native_agent_name: brigade-sidecar-reviewer
+    public_model_alias: anthropic-brigade-sidecar-reviewer
+    roles: [adversary]
+    description: Independent implementation reviewer
+    tools: [Read, Grep, Glob, Bash]
+    can_mutate: false
+    isolation: none
+    background: true
+    max_turns: 120
+    effort: high
+
+  minimax-repairer:
+    worker_id: senior-repair-worker
+    model_id: minimax-m3
+    native_agent_name: brigade-sidecar-senior-repair-worker
+    public_model_alias: anthropic-brigade-sidecar-senior-repair-worker
+    roles: [repairer]
+    description: Repair worker for accepted adversarial findings
+    tools: [Read, Grep, Glob, Bash, Edit, Write]
+    can_mutate: true
+    isolation: worktree
+    background: true
+    max_turns: 120
+    effort: high
+
+  minimax-senior-reviewer:
+    worker_id: senior-reviewer
+    model_id: minimax-m3
+    native_agent_name: brigade-sidecar-senior-reviewer
+    public_model_alias: anthropic-brigade-sidecar-senior-reviewer
+    roles: [adversary]
+    description: Conditional senior review for COMPLEX grounded work
+    template: brigade-sidecar-senior-reviewer
+    tools: [Read, Grep, Glob, Bash]
+    disallowed_tools: [Edit, Write, NotebookEdit, Agent, Workflow]
+    can_mutate: false
+    isolation: none
+    background: true
+    max_turns: 120
+    effort: high
+
+  kimi-completion-controller:
+    worker_id: completion-controller
+    model_id: kimi-k2.7-code
+    native_agent_name: brigade-sidecar-completion-controller
+    public_model_alias: anthropic-brigade-sidecar-completion-controller
+    roles: [adjudicator]
+    description: Diagnose-only completion controller for final requirement coverage
+    template: brigade-sidecar-completion-controller
+    tools: [Read, Grep, Glob, Bash]
+    disallowed_tools: [Edit, Write, NotebookEdit, Agent, Workflow]
+    can_mutate: false
+    isolation: none
+    background: true
+    max_turns: 100
+    effort: high
+
+  minimax-completion-reviewer:
+    worker_id: completion-reviewer
+    model_id: minimax-m3
+    native_agent_name: brigade-sidecar-completion-reviewer
+    public_model_alias: anthropic-brigade-sidecar-completion-reviewer
+    roles: [adversary]
+    description: Optional diagnose-only completion review after Kimi NEEDS_REVIEW
+    template: brigade-sidecar-completion-reviewer
+    tools: [Read, Grep, Glob, Bash]
+    disallowed_tools: [Edit, Write, NotebookEdit, Agent, Workflow]
+    can_mutate: false
+    isolation: none
+    background: true
+    max_turns: 100
+    effort: high
+
+  glm-critical-gate:
+    worker_id: critical-gate
+    model_id: glm-5.2
+    native_agent_name: brigade-sidecar-critical-gate
+    public_model_alias: anthropic-brigade-sidecar-critical-gate
+    roles: [adjudicator, architect, adversary]
+    description: Final read-only critical gate for the current workspace
+    template: brigade-sidecar-critical-gate
+    tools: [Read, Grep, Glob, Bash]
+    disallowed_tools: [Edit, Write, NotebookEdit, Agent, Workflow]
+    can_mutate: false
+    isolation: none
+    background: true
+    max_turns: 100
+    effort: high
+
+  glm-critical:
+    worker_id: critical-advisor
+    model_id: glm-5.1
+    native_agent_name: brigade-sidecar-critical-advisor
+    public_model_alias: anthropic-brigade-sidecar-critical-advisor
+    roles: [adversary, architect, adjudicator]
+    description: Critical design and conflict-resolution specialist
+    tools: [Read, Grep, Glob, Bash]
+    can_mutate: false
+    isolation: none
+    background: true
+    max_turns: 100
+    effort: high
+
+coprocessors:
+  post-edit-sentinel:
+    model_id: diffusiongemma
+    mode: sentinel
+    timeout_seconds: 2
+    max_packet_bytes: 32000
+    max_output_tokens: 256
+    output_schema_id: sentinel_v1
+    input_schema_id: feedback_packet_v1
+    prompt_version: post-edit-sentinel-v1
+    capability_contract_version: feedback-v1
+    supported_task_classes: [trivial, normal, cross-cutting, high-risk]
+    supported_artifact_types: [source, configuration, tests, migrations]
+    required_evidence: [task_contract, evidence_manifest, workspace_digest]
+    maximum_diff_lines: 400
+    maximum_context_tokens: 12000
+    abstention_required_when_incomplete: true
+    minimum_confidence: 0.60
+    system_prompt: >-
+      You are a bounded post-edit sentinel. You are advisory evidence only;
+      you cannot authorize mutation, review, escalation, integration, or
+      completion. Inspect only the supplied task contract, risk signals,
+      changed files, bounded diff, and evidence manifest. Do not infer facts
+      that are absent or truncated. Return ONLY this JSON object: alert must
+      be one of none, watch, escalate; why must be one concise observation
+      grounded in an evidence reference; suggested_next must be one of
+      re_ground, invoke_minimax, invoke_controller, invoke_glm, proceed, or
+      none; confidence must be between 0 and 1; evidence_refs must contain
+      only keys present in evidence_manifest. suggested_next is a hypothesis,
+      never an instruction. Prefer none when evidence is incomplete.
+
+  route-advisor:
     model_id: diffusiongemma
     mode: route
-    endpoint: auto
-    enabled: true
     timeout_seconds: 5
     max_packet_bytes: 64000
     max_output_tokens: 1024
@@ -15,14 +222,39 @@ sidecars:
       advisory and cannot lower the deterministic workflow tier, choose a
       physical endpoint, mutate files, or authorize completion.
 
-  verification_reviewer:
+  verification-reviewer:
     model_id: glm-5.1
     mode: verify
-    endpoint: auto
-    enabled: true
     timeout_seconds: 45
     max_packet_bytes: 64000
     max_output_tokens: 2048
+    output_schema_id: feedback_v1
+    prompt_version: verification-review-v1
+    capability_contract_version: feedback-v1
+    supported_task_classes: [trivial, normal, cross-cutting, high-risk]
+    supported_artifact_types: [source, configuration, tests, migrations]
+    required_evidence: [task_contract, evidence_manifest, workspace_digest]
+    maximum_diff_lines: 400
+    maximum_context_tokens: 12000
+    abstention_required_when_incomplete: true
     system_prompt: >-
-      Review only the bounded evidence packet and return only the requested
-      JSON. Your result is advisory until accepted by the controller.
+      Review only the bounded evidence packet and return feedback_v1 JSON with
+      decision (continue, repair, escalate, or insufficient_evidence), findings
+      (id, severity, claim, evidence_refs, required_action, confidence),
+      unknowns, and needs_more_evidence. Use only evidence manifest keys.
+      Return no prose. Your result is advisory until accepted by the controller.
+
+feedback_monitor:
+  # The hook checks this policy locally after each tool batch. A provider call
+  # is made only for a fresh checkpoint, never for every MCP event.
+  enabled: true
+  coprocessor_id: post-edit-sentinel
+  checkpoints: [post_edit_checkpoint]
+  watched_tools: [Edit, Write, NotebookEdit, Bash]
+  cooldown_seconds: 15
+  # One sentinel per mutating execution keeps the signal at the phase
+  # boundary budget instead of turning every edit into another model call.
+  max_calls_per_execution: 1
+  max_parallelism: 1
+  wait_seconds: 2
+  required: false

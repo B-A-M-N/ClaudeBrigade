@@ -1,4 +1,4 @@
-"""Bounded, router-owned execution lane for read-only specialist calls."""
+"""Compatibility implementation for bounded coprocessor calls."""
 
 from __future__ import annotations
 
@@ -11,18 +11,23 @@ from dataclasses import dataclass
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from jsonschema import ValidationError as JSONSchemaValidationError
+from jsonschema import validate as validate_json_schema
+
 from enhanced_router.backends import (
     BackendType,
     proxy_direct_anthropic,
     proxy_litellm_messages,
 )
 from enhanced_router.routing import RequestIdentity, resolve_request
+from enhanced_router.route_ladder import candidate_dict, dedupe_candidates, route_digest
 from enhanced_router.state import RouteState, WorkflowStateError
 
 LOGGER = logging.getLogger("claude-enhanced-router.sidecar")
 
 _MAX_PACKET_BYTES = 64_000
 _MAX_RESULT_BYTES = 128_000
+_RETRYABLE_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504, 529})
 
 
 @dataclass(frozen=True)
@@ -40,8 +45,8 @@ class _InternalRequest:
     url: _URL = _URL()
 
 
-class SidecarExecutor:
-    """Run structured, read-only specialist calls under router supervision."""
+class CoprocessorExecutor:
+    """Run bounded structured calls under router supervision."""
 
     def __init__(self, state: RouteState) -> None:
         self.state = state
@@ -139,7 +144,7 @@ class SidecarExecutor:
         execution = self.state.get_agent_execution(execution_id)
         if (
             execution is not None
-            and execution.get("execution_kind") == "sidecar_call"
+            and execution.get("execution_kind") in {"sidecar_call", "coprocessor_call"}
             and str(execution.get("phase_id") or "").startswith("fastpath:")
         ):
             if execution.get("status") not in {"failed", "timeout"}:
@@ -191,7 +196,7 @@ class SidecarExecutor:
         parent_execution_id: str | None = None,
     ) -> dict[str, Any]:
         """Run a router-owned advisory job under persisted sidecar lifecycle."""
-        execution = self.state.start_detached_sidecar_execution(
+        execution = self.state.start_detached_coprocessor_execution(
             run_id=run_id,
             epoch_id=epoch_id,
             execution_id=execution_id,
@@ -230,6 +235,53 @@ class SidecarExecutor:
         task.add_done_callback(lambda finished: self._forget(execution_id, finished))
         return execution
 
+    async def invoke_feedback(
+        self,
+        *,
+        run_id: str,
+        epoch_id: str,
+        coprocessor_id: str,
+        packet: dict[str, Any],
+        parent_execution_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Start one automatic feedback call under normal provider admission."""
+        from enhanced_router.registry import get_registry
+
+        registry = get_registry()
+        spec = registry.get_coprocessor(coprocessor_id)
+        if not spec.enabled:
+            raise WorkflowStateError(f"coprocessor '{coprocessor_id}' is disabled")
+        model = registry.get_model(spec.model_id)
+        provider_id = spec.provider_id or model.provider_id
+        if not provider_id:
+            raise WorkflowStateError(
+                f"coprocessor '{coprocessor_id}' has no provider route"
+            )
+        execution_id = f"cfb_{uuid.uuid4().hex}"
+
+        async def runner() -> dict[str, Any]:
+            return await self._run_feedback_request(
+                execution_id=execution_id,
+                run_id=run_id,
+                epoch_id=epoch_id,
+                spec=spec,
+                packet=packet,
+            )
+
+        return await self.invoke_detached(
+            run_id=run_id,
+            epoch_id=epoch_id,
+            execution_id=execution_id,
+            phase_id=f"feedback:{coprocessor_id}",
+            role=f"coprocessor:{coprocessor_id}",
+            model_id=spec.model_id,
+            provider_id=provider_id,
+            packet=packet,
+            timeout_seconds=spec.timeout_seconds,
+            runner=runner,
+            parent_execution_id=parent_execution_id,
+        )
+
     async def wait(self, execution_id: str) -> dict[str, Any] | None:
         """Wait for a locally owned detached job and return durable state."""
         task = self._tasks.get(execution_id)
@@ -260,28 +312,129 @@ class SidecarExecutor:
         execution = self.state.get_agent_execution_scoped(run_id, epoch_id, execution_id)
         if execution is None:
             return
-        agent_id = str(execution["claude_agent_id"])
         try:
             self.state.update_agent_execution(execution_id, status="running")
             self._event(execution_id, execution, "running", {})
             timeout_seconds = self._timeout_seconds(execution)
-            response_payload, status_code, usage = await asyncio.wait_for(
-                self._request(
+            sidecar = self._sidecar_spec(execution)
+            candidates = dedupe_candidates([
+                {
+                    "model": sidecar.model_id,
+                    "endpoint": sidecar.endpoint,
+                    "provider_id": getattr(sidecar, "provider_id", None),
+                },
+                *[
+                    candidate_dict(item)
+                    for item in getattr(sidecar, "fallback_routes", [])
+                ],
+            ]) if sidecar is not None else [{}]
+            response_payload: dict[str, Any] | None = None
+            status_code = 500
+            usage: dict[str, int] = {}
+            selected_attempt_id: str | None = None
+            for index, candidate in enumerate(candidates or [{}]):
+                candidate = candidate_dict(candidate)
+                attempt_id = f"{execution_id}:route:{index}"
+                self.state.start_route_attempt(
+                    attempt_id=attempt_id,
                     run_id=run_id,
                     epoch_id=epoch_id,
-                    execution=execution,
-                    packet=packet,
-                ),
-                timeout=timeout_seconds,
-            )
-            if status_code < 200 or status_code >= 300:
-                raise RuntimeError(f"sidecar provider returned HTTP {status_code}")
-            result = self._extract_result(response_payload)
-            self._validate_result_schema(run_id, epoch_id, execution, result)
+                    execution_id=execution_id,
+                    candidate_index=index,
+                    model_id=candidate["model"],
+                    provider_id=candidate.get("provider_id"),
+                    endpoint_id=candidate.get("endpoint", "auto"),
+                    route_digest=route_digest(candidate),
+                )
+                attempt_finished = False
+                try:
+                    response_payload, status_code, usage = await asyncio.wait_for(
+                        self._request(
+                            run_id=run_id,
+                            epoch_id=epoch_id,
+                            execution=execution,
+                            packet=packet,
+                            candidate=candidate or None,
+                        ),
+                        timeout=timeout_seconds,
+                    )
+                    if 200 <= status_code < 300:
+                        # Do not call a provider response successful until
+                        # extraction and the declared output schema have also
+                        # passed.  Transport success with malformed JSON is a
+                        # failed structured attempt, not quality evidence.
+                        selected_attempt_id = attempt_id
+                        attempt_finished = True
+                        break
+                    if status_code not in _RETRYABLE_HTTP_STATUSES:
+                        raise RuntimeError(f"sidecar provider returned HTTP {status_code}")
+                    raise RuntimeError(f"sidecar provider returned HTTP {status_code}")
+                except asyncio.CancelledError:
+                    if not attempt_finished:
+                        self.state.finish_route_attempt(
+                            attempt_id, status="cancelled", status_code=status_code,
+                        )
+                    raise
+                except ValueError:
+                    # A malformed structured result is not a transport
+                    # failure and must not silently move the same packet to a
+                    # second provider.
+                    self.state.finish_route_attempt(
+                        attempt_id, status="failed", status_code=status_code,
+                        error_class="malformed_result",
+                    )
+                    raise
+                except Exception as exc:
+                    self.state.finish_route_attempt(
+                        attempt_id, status="failed", status_code=status_code,
+                        error_class=self._error_class(exc), error=str(exc),
+                    )
+                    if status_code not in _RETRYABLE_HTTP_STATUSES:
+                        raise
+                    if index + 1 >= len(candidates):
+                        raise
+                    # Bounded calls may release their failed candidate before
+                    # selecting the next route. Native Claude workers never
+                    # use this executor and remain immutably bound.
+                    self.state.release_binding(
+                        run_id, str(execution["claude_agent_id"]),
+                    )
+            if response_payload is None:
+                raise RuntimeError("sidecar route ladder returned no response")
+            try:
+                result = self._extract_result(response_payload)
+                self._validate_result_schema(run_id, epoch_id, execution, result)
+            except Exception as exc:
+                if selected_attempt_id is not None:
+                    self.state.finish_route_attempt(
+                        selected_attempt_id,
+                        status="failed",
+                        status_code=status_code,
+                        error_class="malformed_result",
+                        error=str(exc),
+                    )
+                    selected_attempt_id = None
+                raise
             result_json = json.dumps(result, separators=(",", ":"), ensure_ascii=False)
             if len(result_json.encode("utf-8")) > _MAX_RESULT_BYTES:
+                if selected_attempt_id is not None:
+                    self.state.finish_route_attempt(
+                        selected_attempt_id,
+                        status="failed",
+                        status_code=status_code,
+                        error_class="malformed_result",
+                        error="sidecar result exceeds the 128 KiB bound",
+                    )
+                    selected_attempt_id = None
                 raise ValueError("sidecar result exceeds the 128 KiB bound")
-            completed = self.state.update_agent_execution(
+            if selected_attempt_id is not None:
+                self.state.finish_route_attempt(
+                    selected_attempt_id,
+                    status="succeeded",
+                    status_code=status_code,
+                    usage=usage,
+                )
+            self.state.finalize_router_owned_execution(
                 execution_id,
                 status="completed",
                 result_type="structured_json",
@@ -289,9 +442,9 @@ class SidecarExecutor:
                 output_hash=hashlib.sha256(result_json.encode("utf-8")).hexdigest(),
                 result_json=result_json,
                 schema_valid=True,
-                evidence_valid=True,
-                accepted_by_controller=True,
-                quality_score=1.0,
+                evidence_valid=None,
+                accepted_by_controller=False,
+                quality_score=None,
                 verdict=(result.get("verdict") if isinstance(result, dict)
                          and isinstance(result.get("verdict"), str) else None),
                 confidence=(float(result["confidence"]) if isinstance(result, dict)
@@ -300,33 +453,22 @@ class SidecarExecutor:
                 total_tokens=usage.get("total_tokens") if usage else None,
                 input_tokens=usage.get("input_tokens") if usage else None,
                 output_tokens=usage.get("output_tokens") if usage else None,
+                estimated_cost=usage.get("estimated_cost") if usage else None,
             )
-            self._event(execution_id, completed or execution, "completed", {
-                "result_type": "structured_json",
-                "status_code": status_code,
-            })
-            self.state.finish_spawn_assignment(run_id, epoch_id, agent_id, "completed")
         except asyncio.CancelledError:
-            cancelled = self.state.update_agent_execution(
+            self.state.finalize_router_owned_execution(
                 execution_id, status="cancelled", error="cancelled by controller",
                 error_class="cancelled_by_controller",
             )
-            self._event(execution_id, cancelled or execution, "cancelled", {})
-            self.state.finish_spawn_assignment(run_id, epoch_id, agent_id, "cancelled")
         except Exception as exc:
             error_class = self._error_class(exc)
-            failed = self.state.update_agent_execution(
+            self.state.finalize_router_owned_execution(
                 execution_id,
                 status="failed",
                 error=str(exc)[:500],
                 error_class=error_class,
                 request_count=1,
             )
-            self._event(execution_id, failed or execution, "failed", {
-                "error_class": error_class,
-                "reason": str(exc)[:500],
-            })
-            self.state.finish_spawn_assignment(run_id, epoch_id, agent_id, "failed")
 
     def _recover_detached_job(self, execution: dict[str, Any]) -> dict[str, Any]:
         """Rebuild a supported fastpath runner from durable execution evidence."""
@@ -393,7 +535,7 @@ class SidecarExecutor:
             result_json = json.dumps(result, separators=(",", ":"), ensure_ascii=False)
             if len(result_json.encode("utf-8")) > _MAX_RESULT_BYTES:
                 raise ValueError("detached sidecar result exceeds the 128 KiB bound")
-            completed = self.state.update_agent_execution(
+            self.state.finalize_router_owned_execution(
                 execution_id,
                 status="completed",
                 result_type="structured_json",
@@ -401,34 +543,26 @@ class SidecarExecutor:
                 output_hash=hashlib.sha256(result_json.encode("utf-8")).hexdigest(),
                 result_json=result_json,
                 schema_valid=True,
-                evidence_valid=True,
+                evidence_valid=None,
                 accepted_by_controller=False,
-                quality_score=1.0,
+                quality_score=None,
             )
             self._detached_jobs.pop(execution_id, None)
-            self._event(execution_id, completed or execution, "completed", {
-                "result_type": "structured_json",
-            })
         except asyncio.CancelledError:
-            cancelled = self.state.update_agent_execution(
+            self.state.finalize_router_owned_execution(
                 execution_id,
                 status="cancelled",
                 error="cancelled by controller",
                 error_class="cancelled_by_controller",
             )
-            self._event(execution_id, cancelled or execution, "cancelled", {})
         except Exception as exc:
             error_class = self._error_class(exc)
-            failed = self.state.update_agent_execution(
+            self.state.finalize_router_owned_execution(
                 execution_id,
                 status="timed_out" if isinstance(exc, asyncio.TimeoutError) else "failed",
                 error=str(exc)[:500],
                 error_class=error_class,
             )
-            self._event(execution_id, failed or execution, "failed", {
-                "error_class": error_class,
-                "reason": str(exc)[:500],
-            })
 
     async def _request(
         self,
@@ -437,10 +571,12 @@ class SidecarExecutor:
         epoch_id: str,
         execution: dict[str, Any],
         packet: dict[str, Any],
-    ) -> tuple[dict[str, Any], int, dict[str, int]]:
-        role = str(execution["role"])
+        coprocessor: Any | None = None,
+        candidate: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], int, dict[str, Any]]:
+        role = "adversary" if coprocessor is not None else str(execution["role"])
         public_model = f"anthropic-brigade-{role}"
-        sidecar = self._sidecar_spec(execution)
+        sidecar = coprocessor or self._sidecar_spec(execution)
         identity = RequestIdentity(
             run_id=run_id,
             claude_session_id=None,
@@ -451,13 +587,28 @@ class SidecarExecutor:
         resolved = resolve_request(
             identity=identity,
             public_model=public_model,
-            explicit_model_id=sidecar.model_id if sidecar is not None else None,
+            explicit_model_id=(
+                candidate.get("model") if candidate else None
+            ) or (sidecar.model_id if sidecar is not None else None),
             explicit_endpoint=(
-                sidecar.endpoint
+                candidate.get("endpoint")
+                if candidate is not None and candidate.get("endpoint") not in {None, "auto"}
+                else sidecar.endpoint
                 if sidecar is not None and sidecar.endpoint != "auto"
                 else None
             ),
             sidecar=sidecar is not None,
+            _route_candidate=candidate,
+        )
+        request_lane = (
+            "feedback"
+            if str(execution.get("role") or "").startswith("coprocessor:")
+            else "fastpath"
+            if str(execution.get("phase_id") or "").startswith("fastpath:")
+            else "worker"
+        )
+        resolved = type(resolved)(
+            **{**resolved.__dict__, "request_lane": request_lane}
         )
         request = _InternalRequest(
             method="POST",
@@ -501,11 +652,134 @@ class SidecarExecutor:
             raise RuntimeError("sidecar backend returned a non-object response")
         raw_usage = parsed.get("usage")
         usage = raw_usage if isinstance(raw_usage, dict) else {}
+        raw_cost = usage.get("cost", usage.get("estimated_cost"))
+        try:
+            estimated_cost = float(raw_cost) if raw_cost is not None else None
+        except (TypeError, ValueError):
+            estimated_cost = None
         return parsed, int(getattr(response, "status_code", 500)), {
             "input_tokens": int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0),
             "output_tokens": int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0),
             "total_tokens": int(usage.get("total_tokens", 0) or 0),
+            "estimated_cost": estimated_cost,
         }
+
+    async def _run_feedback_request(
+        self,
+        *,
+        execution_id: str,
+        run_id: str,
+        epoch_id: str,
+        spec: Any,
+        packet: dict[str, Any],
+    ) -> dict[str, Any]:
+        execution = {
+            "execution_id": execution_id,
+            "run_id": run_id,
+            "epoch_id": epoch_id,
+            "claude_agent_id": f"sidecar:{execution_id}",
+            "role": f"coprocessor:{spec.model_id}",
+        }
+        candidates = dedupe_candidates([
+            {
+                "model": spec.model_id,
+                "endpoint": spec.endpoint,
+                "provider_id": spec.provider_id,
+            },
+            *[
+                candidate_dict(item)
+                for item in getattr(spec, "fallback_routes", [])
+            ],
+        ])
+        response: dict[str, Any] | None = None
+        selected_attempt_id: str | None = None
+        selected_status_code: int | None = None
+        selected_usage: dict[str, Any] = {}
+        for index, candidate in enumerate(candidates or [{}]):
+            candidate = candidate_dict(candidate)
+            status_code: int | None = None
+            attempt_id = f"{execution_id}:route:{index}"
+            self.state.start_route_attempt(
+                attempt_id=attempt_id,
+                run_id=run_id,
+                epoch_id=epoch_id,
+                execution_id=execution_id,
+                candidate_index=index,
+                model_id=candidate["model"],
+                provider_id=candidate.get("provider_id"),
+                endpoint_id=candidate.get("endpoint", "auto"),
+                route_digest=route_digest(candidate),
+            )
+            try:
+                response, status_code, usage = await self._request(
+                    run_id=run_id,
+                    epoch_id=epoch_id,
+                    execution=execution,
+                    packet=packet,
+                    coprocessor=spec,
+                    candidate=candidate or None,
+                )
+                if 200 <= status_code < 300:
+                    self.state.update_agent_execution(
+                        execution_id,
+                        request_count=1,
+                        input_tokens=usage.get("input_tokens"),
+                        output_tokens=usage.get("output_tokens"),
+                        total_tokens=usage.get("total_tokens"),
+                        estimated_cost=usage.get("estimated_cost"),
+                    )
+                    selected_attempt_id = attempt_id
+                    selected_status_code = status_code
+                    selected_usage = usage
+                    break
+                raise RuntimeError(f"coprocessor provider returned HTTP {status_code}")
+            except asyncio.CancelledError:
+                self.state.finish_route_attempt(
+                    attempt_id, status="cancelled", status_code=status_code,
+                )
+                raise
+            except ValueError:
+                self.state.finish_route_attempt(
+                    attempt_id, status="failed", status_code=status_code,
+                    error_class="malformed_result",
+                )
+                raise
+            except Exception as exc:
+                self.state.finish_route_attempt(
+                    attempt_id, status="failed", status_code=status_code,
+                    error_class=self._error_class(exc), error=str(exc),
+                )
+                if status_code is not None and status_code not in _RETRYABLE_HTTP_STATUSES:
+                    raise
+                if index + 1 >= len(candidates):
+                    raise
+                self.state.release_binding(
+                    run_id, str(execution["claude_agent_id"]),
+                )
+        if response is None:
+            raise RuntimeError("coprocessor route ladder returned no response")
+        try:
+            result = self._extract_result(response)
+            self._validate_named_output_schema(spec, result, packet)
+        except Exception as exc:
+            if selected_attempt_id is not None:
+                self.state.finish_route_attempt(
+                    selected_attempt_id,
+                    status="failed",
+                    status_code=selected_status_code,
+                    error_class="malformed_result",
+                    error=str(exc),
+                )
+                selected_attempt_id = None
+            raise
+        if selected_attempt_id is not None:
+            self.state.finish_route_attempt(
+                selected_attempt_id,
+                status="succeeded",
+                status_code=selected_status_code,
+                usage=selected_usage,
+            )
+        return {"coprocessor_result": result}
 
     def _sidecar_spec(self, execution: dict[str, Any]) -> Any | None:
         phase = next(
@@ -551,8 +825,8 @@ class SidecarExecutor:
             raise ValueError("sidecar response contained no structured result")
         try:
             return json.loads(text)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return {"text": text[:32_000]}
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("coprocessor response was not valid JSON") from exc
 
     def _validate_result_schema(
         self, run_id: str, epoch_id: str, execution: dict[str, Any], result: Any,
@@ -565,13 +839,133 @@ class SidecarExecutor:
         schema_raw = phase.get("result_schema") if phase else None
         if not schema_raw:
             return
-        schema = json.loads(str(schema_raw))
-        required = schema.get("required", []) if isinstance(schema, dict) else []
-        if not isinstance(result, dict) or not isinstance(required, list):
-            raise ValueError("sidecar result does not match its phase schema")
-        missing = [str(key) for key in required if key not in result]
-        if missing:
-            raise ValueError(f"sidecar result is missing: {', '.join(missing)}")
+        try:
+            schema = json.loads(str(schema_raw))
+            if not isinstance(schema, dict):
+                raise ValueError("sidecar phase schema must be a JSON object")
+            validate_json_schema(instance=result, schema=schema)
+        except (TypeError, ValueError, json.JSONDecodeError, JSONSchemaValidationError) as exc:
+            raise ValueError("sidecar result does not match its phase schema") from exc
+
+    @staticmethod
+    def _validate_named_output_schema(
+        spec: Any, result: Any, packet: dict[str, Any],
+    ) -> None:
+        """Validate named coprocessor contracts before persistence."""
+        schema_id = str(getattr(spec, "output_schema_id", None) or "").strip()
+        if not schema_id:
+            if not isinstance(result, (dict, list, str, int, float, bool)) and result is not None:
+                raise ValueError("coprocessor result is not JSON-compatible")
+            return
+        if schema_id == "json_object":
+            if not isinstance(result, dict):
+                raise ValueError("coprocessor output contract requires a JSON object")
+            return
+        if schema_id == "sentinel_v1":
+            schema = {
+                "type": "object",
+                "required": [
+                    "alert", "why", "suggested_next", "confidence", "evidence_refs",
+                ],
+                "properties": {
+                    "alert": {"enum": ["none", "watch", "escalate"]},
+                    "why": {"type": "string", "minLength": 1, "maxLength": 500},
+                    "suggested_next": {
+                        "enum": [
+                            "re_ground", "invoke_minimax", "invoke_controller",
+                            "invoke_glm", "proceed", "none",
+                        ]
+                    },
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "evidence_refs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "additionalProperties": False,
+            }
+            try:
+                validate_json_schema(instance=result, schema=schema)
+            except JSONSchemaValidationError as exc:
+                raise ValueError("coprocessor sentinel does not match sentinel_v1") from exc
+            if not isinstance(result, dict):
+                raise ValueError("coprocessor sentinel must be a JSON object")
+            evidence_manifest = packet.get("evidence_manifest")
+            refs = {str(ref) for ref in result.get("evidence_refs", [])}
+            if not isinstance(evidence_manifest, dict):
+                if refs:
+                    raise ValueError(
+                        "coprocessor sentinel contains findings without an evidence manifest"
+                    )
+            else:
+                unknown = sorted(refs - set(evidence_manifest))
+                if unknown:
+                    raise ValueError(
+                        "coprocessor sentinel references unknown evidence: "
+                        + ", ".join(unknown[:8])
+                    )
+            if getattr(spec, "minimum_confidence", None) is not None:
+                if float(result["confidence"]) < float(spec.minimum_confidence):
+                    raise ValueError("coprocessor sentinel confidence is below the configured minimum")
+            return
+        if schema_id == "feedback_v1":
+            schema = {
+                "type": "object",
+                "required": ["decision", "findings", "unknowns", "needs_more_evidence"],
+                "properties": {
+                    "decision": {
+                        "enum": ["continue", "repair", "escalate", "insufficient_evidence"],
+                    },
+                    "findings": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["id", "severity", "claim", "evidence_refs", "confidence"],
+                            "properties": {
+                                "id": {"type": "string", "minLength": 1},
+                                "severity": {"enum": ["blocker", "high", "medium", "low"]},
+                                "claim": {"type": "string"},
+                                "evidence_refs": {"type": "array", "items": {"type": "string"}},
+                                "required_action": {"type": "string"},
+                                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                            },
+                            "additionalProperties": False,
+                        },
+                    },
+                    "unknowns": {"type": "array", "items": {"type": "string"}},
+                    "needs_more_evidence": {"type": "boolean"},
+                },
+                "additionalProperties": False,
+            }
+            try:
+                validate_json_schema(instance=result, schema=schema)
+            except JSONSchemaValidationError as exc:
+                raise ValueError("coprocessor feedback does not match feedback_v1") from exc
+            if not isinstance(result, dict):
+                raise ValueError("coprocessor feedback must be a JSON object")
+            evidence_manifest = packet.get("evidence_manifest")
+            refs = {
+                str(ref)
+                for finding in result.get("findings", [])
+                if isinstance(finding, dict)
+                for ref in finding.get("evidence_refs", [])
+            }
+            if isinstance(evidence_manifest, dict):
+                allowed = set(evidence_manifest)
+                unknown = sorted(refs - allowed)
+                if unknown:
+                    raise ValueError(
+                        "coprocessor feedback references unknown evidence: "
+                        + ", ".join(unknown[:8])
+                    )
+            elif refs:
+                raise ValueError("coprocessor feedback contains findings without an evidence manifest")
+            if getattr(spec, "minimum_confidence", None) is not None:
+                threshold = float(spec.minimum_confidence)
+                if any(float(item["confidence"]) < threshold for item in result["findings"]):
+                    raise ValueError("coprocessor feedback contains a finding below minimum confidence")
+            return
+        raise ValueError(f"unknown coprocessor output schema '{schema_id}'")
 
     def _event(self, execution_id: str, execution: dict[str, Any], event_type: str, payload: dict) -> None:
         try:
@@ -598,17 +992,22 @@ class SidecarExecutor:
         return "sidecar_runtime_error"
 
 
-_executor: SidecarExecutor | None = None
+_executor: CoprocessorExecutor | None = None
 
 
-def get_sidecar_executor(state: RouteState | None = None) -> SidecarExecutor:
+def get_coprocessor_executor(state: RouteState | None = None) -> CoprocessorExecutor:
     global _executor
     if _executor is None:
         if state is None:
             from enhanced_router.state import get_state
             state = get_state()
-        _executor = SidecarExecutor(state)
+        _executor = CoprocessorExecutor(state)
     return _executor
+
+
+def get_sidecar_executor(state: RouteState | None = None) -> CoprocessorExecutor:
+    """Compatibility alias for the pre-migration executor name."""
+    return get_coprocessor_executor(state)
 
 
 async def shutdown_sidecar_executor() -> None:
@@ -616,3 +1015,12 @@ async def shutdown_sidecar_executor() -> None:
     if _executor is not None:
         await _executor.shutdown()
         _executor = None
+
+
+async def shutdown_coprocessor_executor() -> None:
+    """Stop the bounded coprocessor lane."""
+    await shutdown_sidecar_executor()
+
+
+# Compatibility class name for existing integrations and tests.
+SidecarExecutor = CoprocessorExecutor

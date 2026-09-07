@@ -38,6 +38,34 @@ def _setup_sidecar(state: RouteState, monkeypatch: pytest.MonkeyPatch) -> dict:
     return state.claim_runnable_action("r1", "ep-1", action["action_id"])
 
 
+def test_sentinel_output_schema_requires_evidence_and_bounded_advisory():
+    spec = SimpleNamespace(output_schema_id="sentinel_v1", minimum_confidence=0.60)
+    packet = {"evidence_manifest": {"diff": "bounded diff"}}
+    SidecarExecutor._validate_named_output_schema(
+        spec,
+        {
+            "alert": "watch",
+            "why": "A changed hunk touches persistence.",
+            "suggested_next": "re_ground",
+            "confidence": 0.81,
+            "evidence_refs": ["diff"],
+        },
+        packet,
+    )
+    with pytest.raises(ValueError, match="unknown evidence"):
+        SidecarExecutor._validate_named_output_schema(
+            spec,
+            {
+                "alert": "watch",
+                "why": "missing evidence reference",
+                "suggested_next": "re_ground",
+                "confidence": 0.81,
+                "evidence_refs": ["not-in-manifest"],
+            },
+            packet,
+        )
+
+
 @pytest.mark.asyncio
 async def test_sidecar_completes_and_persists_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     state = RouteState(tmp_path / "state.db")
@@ -58,9 +86,23 @@ async def test_sidecar_completes_and_persists_events(tmp_path: Path, monkeypatch
     assert final is not None
     assert final["status"] == "completed"
     assert final["result_json"] == '{"verdict":"pass"}'
+    assert final["accepted_by_controller"] == 0
+    assert state.get_workflow_phases("r1", "ep-1")[0]["status"] == "active"
+    adjudicated = state.adjudicate_coprocessor_result(
+        run_id="r1", epoch_id="ep-1", execution_id=execution["execution_id"],
+        disposition="accepted", reason="controller reviewed the bounded result",
+        quality_score=0.9,
+    )
+    assert adjudicated is not None
+    assert adjudicated["accepted_by_controller"] == 1
+    assert state.get_workflow_phases("r1", "ep-1")[0]["status"] == "completed"
     assert [event["event_type"] for event in state.get_execution_events(
         "r1", "ep-1", execution["execution_id"],
     )] == ["started", "running", "completed"]
+    attempts = state.get_route_attempts("r1", "ep-1", execution["execution_id"])
+    assert len(attempts) == 1
+    assert attempts[0]["candidate_index"] == 0
+    assert attempts[0]["status"] == "succeeded"
     await executor.shutdown()
 
 
@@ -90,6 +132,70 @@ async def test_sidecar_retry_uses_bounded_original_packet(tmp_path: Path, monkey
     second_final = await executor.wait(second["execution_id"])
     assert second_final is not None
     assert second_final["status"] == "completed"
+    first_attempts = state.get_route_attempts("r1", "ep-1", first["execution_id"])
+    second_attempts = state.get_route_attempts("r1", "ep-1", second["execution_id"])
+    assert first_attempts[0]["status"] == "failed"
+    assert second_attempts[0]["status"] == "succeeded"
+    await executor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_malformed_structured_result_is_not_recorded_as_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    state = RouteState(tmp_path / "state.db")
+    claim = _setup_sidecar(state, monkeypatch)
+    executor = SidecarExecutor(state)
+
+    async def fake_request(**kwargs):
+        return ({"content": [{"type": "text", "text": "not-json"}]}, 200, {})
+
+    executor._request = fake_request  # type: ignore[method-assign]
+    execution = await executor.invoke(
+        run_id="r1", epoch_id="ep-1", action_id=claim["action_id"],
+        claim_token=claim["claim_token"], packet={"task": "malformed"},
+    )
+    final = await executor.wait(execution["execution_id"])
+    assert final is not None
+    assert final["status"] == "failed"
+    attempts = state.get_route_attempts("r1", "ep-1", execution["execution_id"])
+    assert attempts[0]["status"] == "failed"
+    assert attempts[0]["error_class"] == "malformed_result"
+    await executor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_non_retryable_provider_response_does_not_advance_route_ladder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    state = RouteState(tmp_path / "state.db")
+    claim = _setup_sidecar(state, monkeypatch)
+    executor = SidecarExecutor(state)
+    calls = 0
+    sidecar = SimpleNamespace(
+        model_id="model-a",
+        endpoint="auto",
+        provider_id=None,
+        fallback_routes=[SimpleNamespace(model="model-b", endpoint="auto", provider_id=None)],
+        timeout_seconds=30,
+    )
+    monkeypatch.setattr(executor, "_sidecar_spec", lambda _execution: sidecar)
+
+    async def fake_request(**kwargs):
+        nonlocal calls
+        calls += 1
+        return ({"error": "invalid request"}, 400, {})
+
+    executor._request = fake_request  # type: ignore[method-assign]
+    execution = await executor.invoke(
+        run_id="r1", epoch_id="ep-1", action_id=claim["action_id"],
+        claim_token=claim["claim_token"], packet={"task": "no-fallback"},
+    )
+    final = await executor.wait(execution["execution_id"])
+    assert final is not None
+    assert final["status"] == "failed"
+    assert calls == 1
+    attempts = state.get_route_attempts("r1", "ep-1", execution["execution_id"])
+    assert len(attempts) == 1
+    assert attempts[0]["status"] == "failed"
     await executor.shutdown()
 
 
@@ -116,7 +222,7 @@ async def test_detached_sidecar_persists_lifecycle_and_is_cancellable(tmp_path: 
         timeout_seconds=30,
         runner=fake_runner,
     )
-    assert execution["execution_kind"] == "sidecar_call"
+    assert execution["execution_kind"] == "coprocessor_call"
     assert execution["claude_agent_id"] == "sidecar:fp-test"
     cancelled = await executor.cancel("fp-test")
     assert cancelled is not None
