@@ -15,6 +15,7 @@ from enhanced_router.litellm_supervisor import (
     _exit_code_or_none,
     _find_free_port,
     _health_probe,
+    _install_dispatch_filter_module,
     _kill_process,
     _wait_process,
 )
@@ -58,6 +59,12 @@ def _make_mock_state() -> mock.MagicMock:
 class TestLiteLLMHelpers:
     """Tests for _find_free_port, _health_probe, _kill_process,
     _wait_process, _exit_code_or_none."""
+
+    def test_dispatch_filter_module_is_installed_atomically(self, tmp_path):
+        target = _install_dispatch_filter_module(tmp_path)
+        assert target.name == "brigade_litellm_dispatch.py"
+        assert "class BrigadeDeploymentFilter" in target.read_text(encoding="utf-8")
+        assert oct(target.stat().st_mode & 0o777) == "0o600"
 
     # ------------------------------------------------------------------
     # _find_free_port

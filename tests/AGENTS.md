@@ -4,7 +4,8 @@
 
 This subtree contains the offline tests for routing, registry/configuration,
 state/workflows, MCP authorization, hooks, provider admission, LiteLLM,
-fastpath, sidecars, launch behavior, and shadow-worktree integration.
+fastpath, native model slots, sidecar workers, coprocessors, launch behavior,
+and shadow-worktree integration.
 
 ## Ownership
 
@@ -24,6 +25,9 @@ failure paths, not merely exercise happy-path syntax.
 - Credential tests must mock the keyring backend, never contain real secrets,
   and must verify that slot names/availability can be shown without exposing
   values. Cover both same-provider key rotation and model/provider fallback.
+- Native-slot tests must prove that slot aliases, stable role aliases, and
+  separately configured sidecar identities coexist. Bounded coprocessor tests
+  must prove that they cannot receive tools, mutation, or workflow authority.
 - Preserve the project import convention: `enhanced_router` is loaded from
   `router/`, and hook modules are loaded from `hooks/` via `conftest.py`.
 

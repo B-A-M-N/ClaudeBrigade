@@ -33,6 +33,18 @@ fi
 _BRIGADE_PYTHON="${CLAUDE_BRIGADE_PYTHON:-$APP_DIR/venv/bin/python}"
 _BRIGADE_PYTHONPATH="${_SOURCE_DIR:-$APP_DIR}/router"
 
+# Read-only operator status must not start Claude Code, acquire the launcher
+# lock, or create a new run.  It is intentionally available as:
+#   claude-brigade status [--json]
+if [[ "${1:-}" == "status" ]]; then
+  shift
+  export BRIGADE_CONFIG_DIR="$CONFIG_DIR"
+  export BRIGADE_STATE_DIR="$STATE_DIR"
+  export BRIGADE_CACHE_DIR="$CACHE_DIR"
+  export PYTHONPATH="$_BRIGADE_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}"
+  exec "$_BRIGADE_PYTHON" -m enhanced_router.status_cli "$@"
+fi
+
 # ---------------------------------------------------------------------------
 # Helper: find free TCP port
 # ---------------------------------------------------------------------------
@@ -274,6 +286,9 @@ BANNED_ENV_KEYS=(
   ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL
   ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
   ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL
+  ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_CUSTOM_MODEL_OPTION
+  ANTHROPIC_CUSTOM_MODEL_OPTION_NAME ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION
+  CLAUDE_CODE_BG_CLASSIFIER_MODEL CLAUDE_CODE_AUTO_MODE_MODEL
   CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_SUBAGENT_MODEL
   CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
   # BrokeLLM-inspired: block all provider API keys to prevent cross-provider
@@ -450,11 +465,12 @@ done
 # ---------------------------------------------------------------------------
 
 if [ -z "$CONTROLLER_MODEL" ] && [ -z "${requested_model:-}" ] && [ -z "$BRIGADE_PROFILE" ] && [ -z "$LAUNCH_PRESET" ] && [ -t 0 ]; then
-  echo "Start with:" >&2
-  echo "  1) Default -- Claude Code + FreeInference sidecar as configured" >&2
-  echo "  2) Configure your own controller/role models, fallbacks, and sidecar" >&2
-  printf 'Choice [1]: ' >&2
-  read -r _startup_choice || _startup_choice=""
+  # Keep the launcher's stdout available for the selected value while the
+  # Python config CLI renders the actual prompt through Rich on stderr.
+  _startup_choice="$({
+    BRIGADE_CONFIG_DIR="$CONFIG_DIR" PYTHONPATH="$_BRIGADE_PYTHONPATH" "$_BRIGADE_PYTHON" -c \
+      'from enhanced_router.config_cli import startup_choice; print(startup_choice())'
+  } </dev/tty)" || _startup_choice=""
   if [ "$_startup_choice" = "2" ]; then
     _wizard_result_file="$(mktemp)"
     # Run the unified launch-wizard using the config CLI. Uses --output-json
@@ -479,22 +495,27 @@ if [ -n "$LAUNCH_PRESET" ]; then
   # A launch preset pairs a saved inference profile with a saved sidecar
   # profile. Explicit --brigade-profile/--sidecar-profile flags still win --
   # the preset only fills in whichever of the two wasn't set directly.
-  _preset_resolved="$(BRIGADE_CONFIG_DIR="$CONFIG_DIR" PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" - "$LAUNCH_PRESET" <<'PY'
+_preset_resolved="$(BRIGADE_CONFIG_DIR="$CONFIG_DIR" PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" - "$LAUNCH_PRESET" <<'PY'
 import sys
 from enhanced_router.registry import get_registry
 
 preset = get_registry().get_launch_preset(sys.argv[1])
 print(preset.inference_profile_id)
 print(preset.sidecar_profile_id or "")
+print(preset.workflow_id or "")
 PY
 )" || {
     echo "Unable to load saved launch preset '$LAUNCH_PRESET'." >&2
     exit 2
   }
-  _preset_inference_profile="$(printf '%s\n' "$_preset_resolved" | sed -n '1p')"
-  _preset_sidecar_profile="$(printf '%s\n' "$_preset_resolved" | sed -n '2p')"
-  [ -z "$BRIGADE_PROFILE" ] && BRIGADE_PROFILE="$_preset_inference_profile"
-  [ -z "$SIDECAR_PROFILE" ] && SIDECAR_PROFILE="$_preset_sidecar_profile"
+_preset_inference_profile="$(printf '%s\n' "$_preset_resolved" | sed -n '1p')"
+_preset_sidecar_profile="$(printf '%s\n' "$_preset_resolved" | sed -n '2p')"
+_preset_workflow="$(printf '%s\n' "$_preset_resolved" | sed -n '3p')"
+[ -z "$BRIGADE_PROFILE" ] && BRIGADE_PROFILE="$_preset_inference_profile"
+[ -z "$SIDECAR_PROFILE" ] && SIDECAR_PROFILE="$_preset_sidecar_profile"
+if [ -n "$_preset_workflow" ]; then
+  export CLAUDE_BRIGADE_WORKFLOW="$_preset_workflow"
+fi
 fi
 
 if [ -n "$BRIGADE_PROFILE" ]; then
@@ -536,8 +557,17 @@ from enhanced_router.registry import get_registry
 
 profile_id = sys.argv[1]
 profile = get_registry().get_profile(profile_id)
-route = profile.controller_route()
-print(route.model if route is not None else "")
+registry = get_registry()
+slot = (
+    registry.slot_alias_manifest(profile_id).get("main")
+    if profile.slots
+    else None
+)
+if slot is not None:
+    print(slot["public_model_alias"])
+else:
+    route = profile.controller_route()
+    print(route.model if route is not None else "")
 PY
 )" || {
     echo "Unable to load saved Brigade profile '$BRIGADE_PROFILE'." >&2
@@ -550,12 +580,15 @@ PY
 fi
 
 if [ -n "${requested_model:-}" ]; then
-  if ! PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" - "$requested_model" <<'PY'
+  if ! PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" - "$requested_model" "$BRIGADE_PROFILE" <<'PY'
 import sys
 from enhanced_router.registry import get_registry
 
-model_id = sys.argv[1]
+requested_model, profile_id = sys.argv[1], sys.argv[2]
 registry = get_registry()
+profile = registry.get_profile(profile_id) if profile_id else None
+slot_models = registry.slot_model_aliases(profile_id) if profile and profile.slots else {}
+model_id = slot_models.get(requested_model, requested_model)
 try:
     spec = registry.get_model(model_id)
 except KeyError as exc:
@@ -684,6 +717,9 @@ done
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL
 unset ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
 unset ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL
+unset ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_CUSTOM_MODEL_OPTION
+unset ANTHROPIC_CUSTOM_MODEL_OPTION_NAME ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION
+unset CLAUDE_CODE_BG_CLASSIFIER_MODEL CLAUDE_CODE_AUTO_MODE_MODEL
 unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_SUBAGENT_MODEL
 unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
 # BrokeLLM-inspired: unset all common provider keys
@@ -697,6 +733,70 @@ unset FREEMODEL_CC_API_KEY MODELSCOPE_API_KEY UNOROUTER_API_KEY LOGFLARE_API_KEY
 export CLAUDE_CODE_FORK_SUBAGENT=0
 export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 
+# Project the selected Brigade profile into Claude Code's native model slots.
+# The router receives the public aliases below and resolves them to the
+# immutable epoch slot binding. Sidecar workers remain independent named
+# identities and do not alter these role lanes.
+if [ -n "$BRIGADE_PROFILE" ]; then
+  _slot_projection="$({
+    BRIGADE_CONFIG_DIR="$CONFIG_DIR" PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" - "$BRIGADE_PROFILE" <<'PY'
+import sys
+from enhanced_router.registry import get_registry
+
+profile_id = sys.argv[1]
+registry = get_registry()
+profile = registry.get_profile(profile_id)
+slots = registry.slot_alias_manifest(profile_id) if profile.slots else {}
+for name in ("main", "background", "haiku", "sonnet", "opus", "fable", "custom"):
+    print((slots.get(name) or {}).get("public_model_alias", ""))
+PY
+  })" || true
+  _slot_main="$(printf '%s\n' "$_slot_projection" | sed -n '1p')"
+  _slot_background="$(printf '%s\n' "$_slot_projection" | sed -n '2p')"
+  _slot_haiku="$(printf '%s\n' "$_slot_projection" | sed -n '3p')"
+  _slot_sonnet="$(printf '%s\n' "$_slot_projection" | sed -n '4p')"
+  _slot_opus="$(printf '%s\n' "$_slot_projection" | sed -n '5p')"
+  _slot_fable="$(printf '%s\n' "$_slot_projection" | sed -n '6p')"
+  _slot_custom="$(printf '%s\n' "$_slot_projection" | sed -n '7p')"
+  if [ -n "$_slot_main" ]; then export ANTHROPIC_MODEL="$_slot_main"; fi
+  if [ -n "$_slot_background" ]; then export ANTHROPIC_SMALL_FAST_MODEL="$_slot_background"; fi
+  if [ -n "$_slot_sonnet" ]; then export ANTHROPIC_DEFAULT_SONNET_MODEL="$_slot_sonnet"; fi
+  if [ -n "$_slot_haiku" ]; then export ANTHROPIC_DEFAULT_HAIKU_MODEL="$_slot_haiku"; fi
+  if [ -n "$_slot_opus" ]; then export ANTHROPIC_DEFAULT_OPUS_MODEL="$_slot_opus"; fi
+  if [ -n "$_slot_fable" ]; then export ANTHROPIC_DEFAULT_FABLE_MODEL="$_slot_fable"; fi
+  if [ -n "$_slot_custom" ]; then
+    export ANTHROPIC_CUSTOM_MODEL_OPTION="$_slot_custom"
+    export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="ClaudeBrigade custom route"
+    export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="Operator-selected ClaudeBrigade model route"
+  fi
+fi
+# Claude Code's classifier remains on the native haiku alias.  Background
+# requests themselves use the independent small-fast/background lane above.
+export CLAUDE_CODE_BG_CLASSIFIER_MODEL="haiku"
+export CLAUDE_CODE_AUTO_MODE_MODEL="haiku"
+export CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=3
+export CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1
+
+# Project the selected feedback policy once at launch.  The hook consumes
+# this non-secret snapshot locally so it does not reopen YAML or query SQLite
+# for every PostToolBatch event.
+_feedback_watched_tools="$({
+  BRIGADE_CONFIG_DIR="$CONFIG_DIR" PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" - "$SIDECAR_PROFILE" <<'PY'
+import json
+import sys
+
+from enhanced_router.registry import get_registry
+
+profile_id = sys.argv[1] or None
+monitor = get_registry().resolve_feedback_monitor(profile_id)
+print(json.dumps(list(monitor.watched_tools) if monitor is not None else []))
+PY
+})" || true
+if [ -z "$_feedback_watched_tools" ]; then
+  _feedback_watched_tools='["Edit","Write","NotebookEdit","Bash"]'
+fi
+export BRIGADE_FEEDBACK_WATCHED_TOOLS="$_feedback_watched_tools"
+
 # ---------------------------------------------------------------------------
 # Export Brigade path variables for hooks and downstream processes
 #
@@ -708,8 +808,10 @@ export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 CLAUDE_BRIGADE_PYTHON="$APP_DIR/venv/bin/python"
 export CLAUDE_BRIGADE_PYTHON
 export CLAUDE_CONFIG_DIR="$PROFILE_DIR"
+export ENHANCED_ROUTER_TOKEN="$ROUTER_TOKEN"
 
 ROUTER_BASE_URL="http://127.0.0.1:${PORT}"
+export BRIGADE_ROUTER_URL="$ROUTER_BASE_URL"
 
 # ---------------------------------------------------------------------------
 # Session settings (passed to Claude Code process)
@@ -721,6 +823,7 @@ ROUTER_BASE_URL="http://127.0.0.1:${PORT}"
 SESSION_SETTINGS_JSON="$(
   python3 - "$ROUTER_BASE_URL" "$CLAUDE_BRIGADE_PYTHON" "$RUN_ID" "$BRIGADE_CONFIG_DIR" "$BRIGADE_STATE_DIR" "$BRIGADE_CACHE_DIR" "$ROUTER_TOKEN" <<'PY'
 import json
+import os
 import sys
 
 router_url, python_path, run_id, config_dir, state_dir, cache_dir, router_token = sys.argv[1:8]
@@ -729,6 +832,25 @@ print(json.dumps({
     "env": {
         "ANTHROPIC_BASE_URL": router_url,
         "ANTHROPIC_AUTH_TOKEN": router_token,
+        "ENHANCED_ROUTER_TOKEN": router_token,
+        "BRIGADE_ROUTER_URL": router_url,
+        "ANTHROPIC_MODEL": os.environ.get("ANTHROPIC_MODEL", ""),
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": os.environ.get("ANTHROPIC_DEFAULT_SONNET_MODEL", ""),
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": os.environ.get("ANTHROPIC_DEFAULT_HAIKU_MODEL", ""),
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": os.environ.get("ANTHROPIC_DEFAULT_OPUS_MODEL", ""),
+        "ANTHROPIC_DEFAULT_FABLE_MODEL": os.environ.get("ANTHROPIC_DEFAULT_FABLE_MODEL", ""),
+        "ANTHROPIC_SMALL_FAST_MODEL": os.environ.get("ANTHROPIC_SMALL_FAST_MODEL", ""),
+        "ANTHROPIC_CUSTOM_MODEL_OPTION": os.environ.get("ANTHROPIC_CUSTOM_MODEL_OPTION", ""),
+        "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": os.environ.get("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME", ""),
+        "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": os.environ.get("ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION", ""),
+        "CLAUDE_CODE_BG_CLASSIFIER_MODEL": os.environ.get("CLAUDE_CODE_BG_CLASSIFIER_MODEL", "haiku"),
+        "CLAUDE_CODE_AUTO_MODE_MODEL": os.environ.get("CLAUDE_CODE_AUTO_MODE_MODEL", "haiku"),
+        "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": os.environ.get("CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS", "3"),
+        "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": os.environ.get("CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH", "1"),
+        "CLAUDE_CODE_SUBAGENT_MODEL": "",
+        "BRIGADE_FEEDBACK_WATCHED_TOOLS": os.environ.get(
+            "BRIGADE_FEEDBACK_WATCHED_TOOLS", "[]"
+        ),
         "CLAUDE_BRIGADE_PYTHON": python_path,
         "CLAUDE_BRIGADE_RUN_ID": run_id,
         "BRIGADE_CONFIG_DIR": config_dir,
@@ -753,7 +875,9 @@ export ANTHROPIC_CUSTOM_HEADERS="$(
 # ---------------------------------------------------------------------------
 
 AGENTS_JSON="$(
-  PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" -m enhanced_router.agents_json "$PROFILE_DIR/agents" "$BRIGADE_PROFILE"
+  PYTHONPATH="$APP_DIR/router" "$APP_DIR/venv/bin/python" -m enhanced_router.agents_json "$PROFILE_DIR/agents" \
+    --inference-profile "$BRIGADE_PROFILE" \
+    --sidecar-profile "$SIDECAR_PROFILE"
 )"
 
 # ---------------------------------------------------------------------------

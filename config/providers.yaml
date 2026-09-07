@@ -1,3 +1,4 @@
+provider_schema_version: 2
 providers:
   freeinference:
     display_name: FreeInference
@@ -16,8 +17,13 @@ providers:
       max_concurrency: 4
       max_active_agents: 4
       max_inflight_requests: 4
+      controller_reserve: 1
+      max_worker_concurrency: 3
+      priority_policy: strict
       max_queued_agents: 8
       queue_timeout_seconds: 20
+    health_max_age_seconds: 900
+    allow_untested_models: true
     deadlines:
       time_to_first_token_seconds: 45
       stream_idle_seconds: 90
@@ -25,7 +31,7 @@ providers:
       agent_wall_seconds: 900
     retry:
       max_attempts: 2
-      retryable_statuses: [429, 502, 503, 529]
+      retryable_statuses: [408, 429, 500, 502, 503, 504, 529]
       max_backoff_seconds: 15
 
   openrouter:
@@ -41,8 +47,8 @@ providers:
       max_queued_agents: 4
       queue_timeout_seconds: 20
     retry:
-      max_attempts: 1
-      retryable_statuses: [429, 500, 502, 503, 504]
+      max_attempts: 2
+      retryable_statuses: [408, 429, 500, 502, 503, 504, 529]
       max_backoff_seconds: 10
     routing_owner: brigade
 
@@ -61,8 +67,8 @@ providers:
       max_queued_agents: 4
       queue_timeout_seconds: 20
     retry:
-      max_attempts: 1
-      retryable_statuses: [429, 500, 502, 503, 504]
+      max_attempts: 2
+      retryable_statuses: [408, 429, 500, 502, 503, 504, 529]
       max_backoff_seconds: 10
     routing_owner: brigade
 
@@ -79,8 +85,8 @@ providers:
       max_queued_agents: 4
       queue_timeout_seconds: 20
     retry:
-      max_attempts: 1
-      retryable_statuses: [429, 500, 502, 503, 504]
+      max_attempts: 2
+      retryable_statuses: [408, 429, 500, 502, 503, 504, 529]
       max_backoff_seconds: 10
     routing_owner: brigade
 
@@ -97,8 +103,8 @@ providers:
       max_queued_agents: 4
       queue_timeout_seconds: 20
     retry:
-      max_attempts: 1
-      retryable_statuses: [429, 500, 502, 503, 504]
+      max_attempts: 2
+      retryable_statuses: [408, 429, 500, 502, 503, 504, 529]
       max_backoff_seconds: 10
     routing_owner: brigade
 
@@ -115,8 +121,8 @@ providers:
       max_queued_agents: 4
       queue_timeout_seconds: 20
     retry:
-      max_attempts: 1
-      retryable_statuses: [429, 500, 502, 503, 504]
+      max_attempts: 2
+      retryable_statuses: [408, 429, 500, 502, 503, 504, 529]
       max_backoff_seconds: 10
     routing_owner: brigade
 
@@ -133,8 +139,8 @@ providers:
       max_queued_agents: 4
       queue_timeout_seconds: 20
     retry:
-      max_attempts: 1
-      retryable_statuses: [429, 500, 502, 503, 504]
+      max_attempts: 2
+      retryable_statuses: [408, 429, 500, 502, 503, 504, 529]
       max_backoff_seconds: 10
     routing_owner: brigade
 
@@ -151,8 +157,8 @@ providers:
       max_queued_agents: 4
       queue_timeout_seconds: 20
     retry:
-      max_attempts: 1
-      retryable_statuses: [429, 500, 502, 503, 504]
+      max_attempts: 2
+      retryable_statuses: [408, 429, 500, 502, 503, 504, 529]
       max_backoff_seconds: 10
     routing_owner: brigade
 
@@ -170,8 +176,8 @@ providers:
       max_queued_agents: 4
       queue_timeout_seconds: 20
     retry:
-      max_attempts: 1
-      retryable_statuses: [429, 500, 502, 503, 504]
+      max_attempts: 2
+      retryable_statuses: [408, 429, 500, 502, 503, 504, 529]
       max_backoff_seconds: 10
     routing_owner: brigade
 
@@ -188,8 +194,8 @@ providers:
       max_queued_agents: 4
       queue_timeout_seconds: 20
     retry:
-      max_attempts: 1
-      retryable_statuses: [429, 500, 502, 503, 504]
+      max_attempts: 2
+      retryable_statuses: [408, 429, 500, 502, 503, 504, 529]
       max_backoff_seconds: 10
     routing_owner: brigade
 
@@ -206,7 +212,7 @@ providers:
       max_queued_agents: 4
       queue_timeout_seconds: 20
     retry:
-      max_attempts: 1
-      retryable_statuses: [429, 500, 502, 503, 504]
+      max_attempts: 2
+      retryable_statuses: [408, 429, 500, 502, 503, 504, 529]
       max_backoff_seconds: 10
     routing_owner: brigade

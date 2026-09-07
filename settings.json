@@ -86,6 +86,10 @@
           {
             "type": "command",
             "command": "\"$CLAUDE_BRIGADE_PYTHON\" \"$CLAUDE_CONFIG_DIR/hooks/audit_tool.py\""
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_BRIGADE_PYTHON\" \"$CLAUDE_CONFIG_DIR/hooks/feedback_monitor.py\""
           }
         ]
       }
@@ -106,6 +110,26 @@
           {
             "type": "command",
             "command": "\"$CLAUDE_BRIGADE_PYTHON\" \"$CLAUDE_CONFIG_DIR/hooks/audit_agent.py\""
+          }
+        ]
+      }
+    ],
+    "WorktreeCreate": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_BRIGADE_PYTHON\" \"$CLAUDE_CONFIG_DIR/hooks/worktree_lifecycle.py\""
+          }
+        ]
+      }
+    ],
+    "WorktreeRemove": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_BRIGADE_PYTHON\" \"$CLAUDE_CONFIG_DIR/hooks/worktree_lifecycle.py\""
           }
         ]
       }

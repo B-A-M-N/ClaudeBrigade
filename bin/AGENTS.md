@@ -31,6 +31,9 @@ diagnostics, and operator-facing shell behavior.
 - `install.sh` offers to invoke `claude-brigade-config` immediately in an
   interactive terminal. `CLAUDE_BRIGADE_SKIP_CONFIG=1` suppresses that prompt
   for scripted or headless installs; pasted keys remain hidden at input.
+- Upgrade installs migrate the versioned provider schema by filling only
+  missing bundled metadata in the existing user `providers.yaml`; they do not
+  overwrite operator endpoints, limits, provider additions, or removals.
 - Do not add destructive cleanup, reset, stash, commit, or force-merge logic
   to hooks or launcher paths.
 

@@ -74,6 +74,25 @@ def test_shadow_preserves_dirty_baseline_without_stash_or_commit(
         state.update_workspace_status(shadow.workspace_id, "discarded")
 
 
+def test_native_worktree_hook_path_preserves_dirty_baseline(
+    git_repo: tuple[Path, RouteState, ShadowWorktreeManager],
+) -> None:
+    repo, _state, manager = git_repo
+    (repo / "tracked.txt").write_text("native baseline\n", encoding="utf-8")
+    (repo / "untracked.txt").write_text("keep\n", encoding="utf-8")
+    path, baseline = manager.create_preserved_native_worktree(
+        run_id="run-1", name="worker/one",
+    )
+    try:
+        assert path.is_dir()
+        assert (path / "tracked.txt").read_text(encoding="utf-8") == "native baseline\n"
+        assert (path / "untracked.txt").read_text(encoding="utf-8") == "keep\n"
+        assert manager.is_registered_worktree(path)
+        assert baseline.base_sha == _git(repo, "rev-parse", "HEAD")
+    finally:
+        manager.remove_shadow(path)
+
+
 def test_changeset_is_validated_and_green_changes_apply_to_main(
     git_repo: tuple[Path, RouteState, ShadowWorktreeManager],
 ) -> None:

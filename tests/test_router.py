@@ -1,12 +1,48 @@
 import pytest
+from starlette.requests import Request
 from fastapi.testclient import TestClient
 from enhanced_router.app import (
     app,
     LONGCAT_UPSTREAM_ID,
     normalize_longcat_payload,
     _parse_retry_after,
+    _read_json_request,
 )
 import httpx
+
+
+def _json_request(body: bytes, *, content_length: str | None = None) -> Request:
+    headers = []
+    if content_length is not None:
+        headers.append((b"content-length", content_length.encode()))
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages",
+        "query_string": b"",
+        "headers": headers,
+        "client": ("127.0.0.1", 1234),
+        "server": ("127.0.0.1", 8787),
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return Request(scope, receive)
+
+
+@pytest.mark.asyncio
+async def test_inbound_json_body_is_bounded_before_routing():
+    request = _json_request((b'{"x":"' + b"x" * 100 + b'"}'))
+    assert await _read_json_request(request, max_bytes=256) == {"x": "x" * 100}
+
+    oversized = _json_request(b"x" * 1025)
+    with pytest.raises(Exception, match="exceeds configured limit"):
+        await _read_json_request(oversized, max_bytes=256)
+
+    declared = _json_request(b"{}", content_length="1025")
+    with pytest.raises(Exception, match="exceeds configured limit"):
+        await _read_json_request(declared, max_bytes=256)
 
 
 def test_longcat_normalization_rewrites_model_and_beta_fields():
@@ -52,6 +88,30 @@ def test_longcat_normalization_rewrites_model_and_beta_fields():
     assert "strict" not in result["tools"][0]
     assert "defer_loading" not in result["tools"][0]
     assert "strict" in result["tools"][0]["input_schema"]["properties"]
+
+
+def test_longcat_normalization_preserves_parallel_tool_continuation_messages():
+    payload = {
+        "model": "anthropic-longcat-2-0",
+        "messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "call-a", "name": "Read", "input": {"file": "a"}},
+                {"type": "tool_use", "id": "call-b", "name": "Glob", "input": {"pattern": "*.py"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call-a", "content": "a.py"},
+                {"type": "tool_result", "tool_use_id": "call-b", "content": [
+                    {"type": "text", "text": "a.py"},
+                ]},
+            ]},
+        ],
+        "tools": [],
+    }
+
+    result = normalize_longcat_payload(payload)
+
+    assert [block["id"] for block in result["messages"][0]["content"]] == ["call-a", "call-b"]
+    assert [block["tool_use_id"] for block in result["messages"][1]["content"]] == ["call-a", "call-b"]
 
 
 def test_parse_retry_after_numeric_and_invalid():

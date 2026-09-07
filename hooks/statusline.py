@@ -38,12 +38,11 @@ def _compute_status() -> str:
         for marker in active_dir.glob("*.json"):
             try:
                 record = json.loads(marker.read_text())
-                name = str(record.get("agent_type", "agent"))
+                name = str(record.get("native_agent_name") or record.get("agent_type", "agent"))
                 backing = str(record.get("pinned_backing_model") or record.get("resolved_model") or "?")
                 agents.append(f"{name}:{backing}")
             except Exception:
                 pass
-    active = ",".join(sorted(agents)) if agents else "main"
     provider_summary = ""
     run_id = os.environ.get("CLAUDE_BRIGADE_RUN_ID") or str(data.get("run_id") or "")
     if run_id:
@@ -56,17 +55,29 @@ def _compute_status() -> str:
             if session_binding:
                 model = session_binding.get("registry_model_id") or model
             active_epoch = state.get_active_epoch(run_id)
-            epoch_id = str(active_epoch.get("epoch_id")) if active_epoch else None
+            if active_epoch is None:
+                raise RuntimeError("no active Brigade epoch")
+            epoch_id = str(active_epoch["epoch_id"])
             executions = state.get_agent_executions(run_id, epoch_id=epoch_id)
             live_statuses = {"started", "running", "streaming", "verifying"}
             state_agents = []
             for item in executions:
                 if item.get("status") not in live_statuses:
                     continue
-                prefix = "[S]" if item.get("execution_kind") == "sidecar_call" else "[N]"
+                execution_kind = str(item.get("execution_kind") or "")
+                if execution_kind in {"coprocessor_call", "sidecar_call"}:
+                    prefix = "[C]"
+                elif item.get("worker_kind") == "sidecar_agent":
+                    prefix = "[N:S]"
+                else:
+                    prefix = "[N]"
+                provider = str(item.get("provider_id") or "")
+                model_id = str(item.get("model_id") or "?")
+                endpoint = str(item.get("endpoint_id") or "auto")
+                route = f"{provider}/{model_id}@{endpoint}" if provider else f"{model_id}@{endpoint}"
                 state_agents.append(
-                    f"{prefix} {item.get('role') or 'agent'}:"
-                    f"{item.get('model_id') or '?'} {item.get('status') or 'unknown'}"
+                    f"{prefix} {item.get('native_agent_name') or item.get('worker_id') or item.get('role') or 'agent'}"
+                    f" — {route} — {item.get('status') or 'unknown'}"
                 )
             if state_agents:
                 agents = state_agents
@@ -113,8 +124,15 @@ def _compute_status() -> str:
             )
             if pending_merge:
                 provider_summary += f" | controller-merge {pending_merge}"
+            from enhanced_router.presentation import compact_status, orchestration_snapshot
+            provider_summary += " | " + compact_status(orchestration_snapshot(state, run_id, epoch_id))
         except Exception:
             provider_summary = ""
+
+    # SQLite is authoritative when available. Recompute this after replacing
+    # marker projections so native sidecars and coprocessors actually reach
+    # the rendered status line.
+    active = ",".join(sorted(agents)) if agents else "main"
 
     try:
         branch = subprocess.check_output(

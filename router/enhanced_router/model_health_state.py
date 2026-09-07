@@ -10,15 +10,78 @@ names.
 
 from __future__ import annotations
 
+from enhanced_router.repository_base import RepositoryMixin
+
 import sqlite3
 from datetime import datetime, timezone
+
+
+def evaluate_model_health(
+    row: sqlite3.Row | dict | None,
+    *,
+    max_age_seconds: float = 900.0,
+    allow_untested: bool = True,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Evaluate whether a persisted health result is safe for admission.
+
+    Health records are intentionally conservative at the admission boundary:
+    an absent record is ``untested`` (configurable), a malformed or old record
+    is ``stale``, and a record whose probe failed is ``unhealthy``.  The
+    function is pure so reservation promotion can evaluate rows inside its
+    existing SQLite transaction without opening a second connection.
+    """
+    if row is None:
+        return {
+            "admissible": bool(allow_untested),
+            "status": "untested",
+            "reason": "no model health check has been recorded",
+            "age_seconds": None,
+        }
+
+    checked_at = row["checked_at"] if isinstance(row, sqlite3.Row) else row.get("checked_at")
+    current = now or datetime.now(timezone.utc)
+    age_seconds: float | None = None
+    if not checked_at:
+        status = "stale"
+        reason = "model health record has no checked_at timestamp"
+    else:
+        try:
+            stamp = datetime.fromisoformat(str(checked_at).replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            age_seconds = max(0.0, (current - stamp).total_seconds())
+        except ValueError:
+            age_seconds = None
+        if age_seconds is None or age_seconds > max_age_seconds:
+            status = "stale"
+            reason = f"model health check is older than {max_age_seconds:g}s"
+        else:
+            reachable = bool(row["reachable"] if isinstance(row, sqlite3.Row) else row.get("reachable"))
+            authenticated = bool(
+                row["authenticated"] if isinstance(row, sqlite3.Row) else row.get("authenticated")
+            )
+            compatible = bool(row["compatible"] if isinstance(row, sqlite3.Row) else row.get("compatible"))
+            if not (reachable and authenticated and compatible):
+                status = "unhealthy"
+                reason = "latest model health check failed reachability, authentication, or compatibility"
+            else:
+                status = str(row["status"] if isinstance(row, sqlite3.Row) else row.get("status") or "healthy")
+                reason = "latest model health check is fresh and passed"
+
+    return {
+        "admissible": status not in {"stale", "unhealthy"},
+        "status": status,
+        "reason": reason,
+        "age_seconds": age_seconds,
+    }
 
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-class ModelHealthRepository:
+class ModelHealthRepository(RepositoryMixin):
     """Mixin providing model health/certification persistence methods.
 
     Requires a host class that provides ``_new_conn() -> sqlite3.Connection``

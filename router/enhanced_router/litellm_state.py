@@ -11,6 +11,8 @@ their original names; nothing outside this file changes.
 
 from __future__ import annotations
 
+from enhanced_router.repository_base import RepositoryMixin
+
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -20,7 +22,7 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-class LiteLLMGenerationRepository:
+class LiteLLMGenerationRepository(RepositoryMixin):
     """Mixin providing LiteLLM generation/deployment lifecycle methods.
 
     Requires a host class that provides ``_new_conn() -> sqlite3.Connection``
@@ -146,6 +148,180 @@ class LiteLLMGenerationRepository:
                 params,
             )
             conn.commit()
+        finally:
+            conn.close()
+
+    def record_litellm_deployment_event(
+        self,
+        *,
+        deployment_id: int,
+        generation: int,
+        event: str,
+        status: str | None = None,
+        pid: int | None = None,
+        port: int | None = None,
+        active_requests: int = 0,
+        active_streams: int = 0,
+        reason: str | None = None,
+        metadata: dict | None = None,
+    ) -> dict:
+        """Persist one bounded LiteLLM deployment lifecycle observation."""
+        if not event.strip():
+            raise ValueError("deployment telemetry event must not be empty")
+        conn = self._new_conn()
+        try:
+            now = _utcnow()
+            cursor = conn.execute(
+                "INSERT INTO litellm_deployment_events "
+                "(deployment_id, generation, event, status, pid, port, "
+                "active_requests, active_streams, reason, metadata_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    deployment_id,
+                    generation,
+                    event,
+                    status,
+                    pid,
+                    port,
+                    max(0, int(active_requests)),
+                    max(0, int(active_streams)),
+                    (reason or "")[:500] or None,
+                    json.dumps(metadata or {}, sort_keys=True, separators=(",", ":")),
+                    now,
+                ),
+            )
+            conn.commit()
+            event_id = int(cursor.lastrowid or 0)
+            row = conn.execute(
+                "SELECT * FROM litellm_deployment_events WHERE event_id=?",
+                (event_id,),
+            ).fetchone()
+            return dict(row) if row is not None else {"event_id": event_id}
+        finally:
+            conn.close()
+
+    def get_litellm_deployment_events(
+        self, deployment_id: int, *, limit: int = 100,
+    ) -> list[dict]:
+        """Return recent lifecycle observations for one deployment."""
+        conn = self._new_conn()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM litellm_deployment_events WHERE deployment_id=? "
+                "ORDER BY event_id DESC LIMIT ?",
+                (deployment_id, max(1, min(int(limit), 1000))),
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    def get_litellm_deployment_telemetry(
+        self, *, deployment_id: int | None = None, limit: int = 100,
+    ) -> list[dict]:
+        """Return deployment rows enriched with last activity and event count."""
+        conn = self._new_conn()
+        try:
+            where = "WHERE ld.id=?" if deployment_id is not None else ""
+            params: tuple[object, ...] = (deployment_id,) if deployment_id is not None else ()
+            rows = conn.execute(
+                "SELECT ld.*, lg.status AS generation_status, "
+                "(SELECT COUNT(*) FROM litellm_deployment_events e "
+                " WHERE e.deployment_id=ld.id) AS event_count, "
+                "(SELECT e.event FROM litellm_deployment_events e "
+                " WHERE e.deployment_id=ld.id ORDER BY e.event_id DESC LIMIT 1) AS last_event, "
+                "(SELECT e.active_requests FROM litellm_deployment_events e "
+                " WHERE e.deployment_id=ld.id ORDER BY e.event_id DESC LIMIT 1) AS last_active_requests, "
+                "(SELECT e.active_streams FROM litellm_deployment_events e "
+                " WHERE e.deployment_id=ld.id ORDER BY e.event_id DESC LIMIT 1) AS last_active_streams "
+                "FROM litellm_deployments ld "
+                "JOIN litellm_generations lg ON lg.generation=ld.generation "
+                f"{where} ORDER BY ld.id DESC LIMIT ?",
+                (*params, max(1, min(int(limit), 1000))),
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    def record_litellm_request_attribution(
+        self,
+        *,
+        request_id: str,
+        generation: int | None,
+        agent_binding_id: int | None,
+        logical_model_id: str | None,
+        requested_provider_ids: list[str] | tuple[str, ...],
+        allowed_deployments: list[str] | tuple[str, ...],
+        reported_deployment_id: str | None,
+        actual_provider_id: str | None,
+        actual_endpoint_id: str | None,
+        attribution_source: str,
+        trusted: bool,
+        status_code: int | None,
+    ) -> dict:
+        """Record one response's physical-deployment attribution.
+
+        ``trusted`` is set by the router only after the response identity is
+        present in the binding snapshot's allowed deployment set.  This table
+        intentionally retains both the requested candidate set and the
+        observed identity so operators can audit conservative admission.
+        """
+        if not request_id.strip():
+            raise ValueError("LiteLLM attribution requires a request ID")
+        if not attribution_source.strip():
+            raise ValueError("LiteLLM attribution requires a source")
+        conn = self._new_conn()
+        try:
+            cursor = conn.execute(
+                "INSERT INTO litellm_request_attributions ("
+                "request_id, generation, agent_binding_id, logical_model_id, "
+                "requested_provider_ids_json, allowed_deployments_json, "
+                "reported_deployment_id, actual_provider_id, actual_endpoint_id, "
+                "attribution_source, trusted, status_code, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    request_id,
+                    generation,
+                    agent_binding_id,
+                    logical_model_id,
+                    json.dumps(sorted(set(requested_provider_ids)), separators=(",", ":")),
+                    json.dumps(sorted(set(allowed_deployments)), separators=(",", ":")),
+                    reported_deployment_id,
+                    actual_provider_id,
+                    actual_endpoint_id,
+                    attribution_source,
+                    int(trusted),
+                    status_code,
+                    _utcnow(),
+                ),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM litellm_request_attributions WHERE attribution_id=?",
+                (int(cursor.lastrowid or 0),),
+            ).fetchone()
+            return dict(row) if row is not None else {}
+        finally:
+            conn.close()
+
+    def get_litellm_request_attributions(
+        self, *, request_id: str | None = None, limit: int = 100,
+    ) -> list[dict]:
+        """Return recent physical-deployment attribution observations."""
+        conn = self._new_conn()
+        try:
+            if request_id:
+                rows = conn.execute(
+                    "SELECT * FROM litellm_request_attributions "
+                    "WHERE request_id=? ORDER BY attribution_id DESC LIMIT ?",
+                    (request_id, max(1, min(int(limit), 1000))),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM litellm_request_attributions "
+                    "ORDER BY attribution_id DESC LIMIT ?",
+                    (max(1, min(int(limit), 1000)),),
+                ).fetchall()
+            return [dict(row) for row in rows]
         finally:
             conn.close()
 

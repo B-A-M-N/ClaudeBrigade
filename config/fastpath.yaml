@@ -15,14 +15,13 @@ fastpath:
       contained in the packet's task, repository, risk_signals, and
       required_capabilities fields. workflow_tier must never be lower than
       deterministic_minimum_tier. recommended_roles may only contain recon,
-      implementer, adversary, repairer. No list of valid model IDs is
-      supplied in this packet, so leave routes empty ({}) unless you are
-      certain of a specific existing model ID -- deterministic profile
-      defaults already handle role routing safely; never guess a
-      plausible-sounding model name. When evidence is incomplete,
-      conflicting, or ambiguous, set escalate_to_controller=true and keep
-      confidence below 0.88. Return only the requested JSON object, no
-      markdown or explanation.
+      implementer, adversary, repairer. Each role's candidates list contains
+      compact candidate_id values (for example i0); select only one of the
+      offered candidate_id values for that role, and never invent a model ID.
+      Leave a role unselected and escalate when no offered candidate is
+      appropriate. When evidence is incomplete, conflicting, or ambiguous,
+      set escalate_to_controller=true and keep confidence below 0.88. Return
+      only the requested JSON object, no markdown or explanation.
     verify: >-
       You are a bounded evidence verifier. Attempt to disprove that the work
       satisfies its contract; do not try to confirm it. Evaluate only the

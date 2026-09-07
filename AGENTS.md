@@ -14,10 +14,10 @@ This document describes the essential knowledge for an agent to work effectively
 **ClaudeBrigade** is a loopback model router for Claude Code. It runs a FastAPI server on `127.0.0.1:8787` that Claude Code connects to. The router:
 
 - Routes the active main-thread model through a registry-backed, immutable controller binding; Anthropic passthrough is explicit configuration
-- Routes **role aliases** (`anthropic-brigade-recon`, `anthropic-brigade-implementer`, `anthropic-brigade-adversary`, `anthropic-brigade-repairer`) through a controlled pipeline:
+- Routes **role aliases** (`anthropic-brigade-recon`, `anthropic-brigade-implementer`, `anthropic-brigade-adversary`, `anthropic-brigade-repairer`) and compiled native model slots through a controlled pipeline:
   - Direct-Anthropic backends (e.g., LongCat at `api.longcat.chat/anthropic`)
   - LiteLLM proxy backends (local or remote models via Ollama, OpenRouter, etc.)
-- Maintains **immutable agent bindings** per epoch via SQLite state
+- Maintains **immutable agent, slot, and native-sidecar bindings** per epoch via SQLite state
 - Runs an MCP control server for management tools
 - Includes `integrations/freeinference-litellm/`, a reusable local BYOK LiteLLM kit that discovers the user's FreeInference models
 - Gives mutating native agents isolated Git shadow worktrees and integrates
@@ -26,11 +26,12 @@ This document describes the essential knowledge for an agent to work effectively
 **Key architectural components:**
 - `router/enhanced_router/` — FastAPI app, routing logic, state, registry, backends, LiteLLM supervisor, MCP control
 - `config/` — YAML configs for models, profiles, workflows, providers,
-  sidecars, fastpath, and generated discovered model catalogs
+  native model slots, sidecar agents, coprocessors, fastpath, and generated
+  discovered model catalogs
 - `hooks/` — Claude Code hooks for guardrails, audit, session lifecycle, completion
 - `agents/` — Agent definition files (injected via `--agents` flag at launch)
 - `bin/` — Launcher scripts, including `claude-brigade-config` for credentials,
-  catalogs, saved sidecars, and inference profiles
+  catalogs, saved sidecars/coprocessors, and inference profiles
 - `tests/` — pytest coverage for routing, state, hooks, provider admission,
   fastpath, LiteLLM, and shadow-worktree integration (run the suite for the
   current count)
@@ -78,6 +79,9 @@ ruff format router/enhanced_router/
 ```bash
 claude-brigade-doctor                    # health check
 claude-brigade-config                     # interactive credentials/catalogs/profiles/sidecars
+claude-brigade-config certify-report --report REPORT.json --provider PROVIDER --model MODEL --endpoint ENDPOINT
+                                         # explicitly publish sanitized route-certification evidence
+claude-brigade status                     # read-only Rich orchestration/package view
 claude-brigade-router-stop               # stop background router
 cat ~/.cache/claude-brigade/router.log   # router logs (rotated at 10MB, 5 backups)
 CLAUDE_CONFIG_DIR=~/.claude-brigade claude doctor
@@ -92,7 +96,7 @@ CLAUDE_CONFIG_DIR=~/.claude-brigade claude auth status --text
 ~/.config/claude-brigade/profiles.yaml
 ~/.config/claude-brigade/workflows.yaml
 ~/.config/claude-brigade/providers.yaml     # provider limits and deadlines
-~/.config/claude-brigade/sidecars.yaml      # independent sidecar policies
+~/.config/claude-brigade/sidecars.yaml      # native sidecars + coprocessors
 ~/.config/claude-brigade/discovered_models.yaml # generated catalog metadata
 
 # Provider keys (LONGCAT_API_KEY, OPENROUTER_API_KEY, etc.)
@@ -131,8 +135,8 @@ CLAUDE_CONFIG_DIR=~/.claude-brigade claude auth status --text
 
 - **`models.yaml`** — Model definitions: `display_name`, `backend` (`direct-anthropic` | `litellm`), `upstream_model`/`litellm_model`, `api_base`/`api_base_env`/`api_key_env`, `capabilities`, `allowed_roles`, `enabled`
 - **`providers.yaml`** — Provider-wide admission limits; FreeInference defaults to `max_concurrency: 4` across controller, agents, and transports
-- **`fastpath.yaml`** — Optional DiffusionGemma route/verify sidecar; advisory and read-only, never an authority for endpoints, merges, or completion
-- **`sidecars.yaml`** — Independent bounded sidecar model/provider policies
+- **`fastpath.yaml`** — Optional DiffusionGemma route/verify coprocessor; advisory and read-only, never an authority for endpoints, merges, or completion
+- **`sidecars.yaml`** — Independently configured native sidecar workers plus bounded coprocessor policies; native sidecar public aliases are individually routable through normal provider admission
 - **`discovered_models.yaml`** — Generated non-secret provider catalog metadata
 - **`profiles.yaml`** — Maps 4 roles (`recon`, `implementer`, `adversary`, `repairer`) to model IDs
 - **`workflows.yaml`** — Maps workflow names (`normal`, `cross-cutting`, `high-risk`, `trivial`) to `default_profile`
@@ -181,9 +185,17 @@ pass deterministic `git apply --check` before application; yellow candidates
 - FreeInference is local BYOK. The provider key stays in the router process.
 - `FREEINFERENCE_MAX_CONCURRENCY` defaults to `4` and applies to controller,
   visible agents, direct provider streams, and LiteLLM provider traffic.
+- Each task snapshots its workflow `resource_policy` into the run. MCP action
+  planning may be advisory, but claim-time admission must enforce the
+  run-wide ceilings for workers, mutators, reviewers, coprocessors,
+  worktrees, reserved tokens, and deadlines in addition to provider limits.
 - FreeInference endpoint `auto` selection chooses the freshest eligible,
   token-weighted cache winner after certification. Context limits are not
   bundled; provider catalog metadata is authoritative when supplied.
+- Provider reservations persist the selected logical model and re-check its
+  provider-configured health freshness when queued work is promoted. Stale or
+  confirmed-unhealthy routes expire instead of silently consuming a provider
+  slot; missing health remains configurable for development mode.
 - Fixed routes pin one endpoint. Explicit `managed-group` routes pin a logical
   LiteLLM deployment group and policy while LiteLLM chooses an equivalent
   physical deployment.
@@ -258,8 +270,9 @@ Key invariants (enforced by unique indexes):
 
 ### Role Aliases (public-facing)
 - `anthropic-brigade-{recon,implementer,adversary,repairer}`
-- Stable aliases are exposed by the registry manifest; model-qualified aliases
-  are declared in profile specialist metadata.
+- Stable aliases are exposed by the registry manifest; native worker names and
+  public aliases are semantic identities, while backing model/provider/endpoint
+  routes remain separate bound configuration.
 
 ### Agent Types (internal)
 - `brigade-recon`, `brigade-implementer`, `brigade-adversary`, `brigade-repairer`, `controller-direct`
@@ -333,7 +346,7 @@ Bindings store `catalog_generation`. If that generation is fully drained (no dep
 Internal headers (`x-enhanced-token`, `x-brigade-run-id`) are stripped in `sanitize_upstream_headers()`. **Do not rely on them reaching upstream.**
 
 ### 6. Role Alias vs Controller Model
-The four `anthropic-brigade-*` aliases are role-routed. Main-thread model IDs are resolved through the registry and pinned as controller bindings; only models explicitly configured as `anthropic-passthrough` reach Anthropic.
+The four `anthropic-brigade-*` aliases remain role-routed. Profiles may additionally compile `main`, `background`, `haiku`, `sonnet`, `opus`, and `fable` into native model lanes, with an optional concrete `custom` route. `background` projects through `ANTHROPIC_SMALL_FAST_MODEL`; `custom` is never emitted as a fake native alias. Named sidecar workers use separately configured native identities and models. Main-thread model IDs are resolved through the registry and pinned as controller bindings; only models explicitly configured as `anthropic-passthrough` reach Anthropic.
 
 ### 7. Mutation Detection in Hooks
 Read-only Bash authorization uses a narrow observational allowlist; regex

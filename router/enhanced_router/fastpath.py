@@ -272,17 +272,42 @@ class FastpathPolicyValidator:
         verification: FastpathVerification,
         *,
         packet: dict[str, Any],
-        deterministic_failed: bool = False,
+        deterministic_failed: bool | None = None,
     ) -> FastpathVerification:
         """Validate advisory verification output before it reaches state."""
         if "truncation_marker" in packet or packet.get("diff_truncated"):
             raise ValueError("truncated fastpath evidence cannot produce a passing decision")
-        if deterministic_failed and verification.decision == "pass":
+
+        raw_checks = packet.get("deterministic_checks")
+        if not isinstance(raw_checks, dict):
+            raise ValueError("fastpath packet is missing authoritative deterministic checks")
+
+        def normalize(value: Any) -> str:
+            if isinstance(value, str) and value in {"pass", "fail", "unknown"}:
+                return value
+            if isinstance(value, bool):
+                return "pass" if value else "fail"
+            if isinstance(value, dict):
+                candidate = value.get("result", value.get("status", value.get("outcome")))
+                if candidate in {"pass", "fail", "unknown"}:
+                    return str(candidate)
+                if isinstance(candidate, bool):
+                    return "pass" if candidate else "fail"
+            return "unknown"
+
+        expected_checks = {
+            str(name): normalize(value) for name, value in raw_checks.items()
+        }
+        if set(verification.checks) != set(expected_checks):
+            raise ValueError("fastpath verification must report every deterministic check exactly once")
+        if verification.checks != expected_checks:
+            raise ValueError("fastpath verification changed an authoritative deterministic result")
+        # ``deterministic_failed`` is retained as a source-compatible argument,
+        # but is intentionally ignored.  The packet is the only authority.
+        if any(value == "fail" for value in expected_checks.values()) and verification.decision == "pass":
             raise ValueError("fastpath cannot override a failed deterministic check")
-        if any(value == "unknown" for value in verification.checks.values()) and verification.decision == "pass":
+        if any(value == "unknown" for value in expected_checks.values()) and verification.decision == "pass":
             raise ValueError("unknown deterministic checks require escalation")
-        if any(value == "fail" for value in verification.checks.values()) and verification.decision == "pass":
-            raise ValueError("fastpath cannot mark failed checks as pass")
         if verification.requires_full_adversary and verification.decision == "pass":
             raise ValueError("verification requiring a full adversary cannot pass")
         if packet.get("security_sensitive") or packet.get("persistence_changed"):
@@ -306,7 +331,8 @@ class FastpathClient:
                  system_prompts: dict[str, str] | None = None,
                  max_output_tokens: int = 256,
                  strict_schema: bool = False,
-                 disable_thinking: bool = False) -> None:
+                 disable_thinking: bool = False,
+                 request_lane: str = "fastpath") -> None:
         self.api_base = api_base.rstrip("/")
         self.model = model
         self.api_key_env = api_key_env
@@ -317,6 +343,8 @@ class FastpathClient:
         self.max_output_tokens = max_output_tokens
         self.strict_schema = strict_schema
         self.disable_thinking = disable_thinking
+        self.request_lane = request_lane
+        self.last_usage: dict[str, Any] = {}
 
     async def request(self, mode: Literal["route", "verify"], packet: dict[str, Any]) -> dict[str, Any]:
         prompt = json.dumps(packet, separators=(",", ":"), ensure_ascii=False)
@@ -359,7 +387,34 @@ class FastpathClient:
             request_id=f"fastpath:{mode}",
             extra_headers={"X-Brigade-Fastpath": mode},
             timeout_seconds=self.limits.timeout_seconds,
+            request_lane=self.request_lane,
         )
+        raw_usage = payload.get("usage")
+        if isinstance(raw_usage, dict):
+            def _integer(*names: str) -> int:
+                for name in names:
+                    value = raw_usage.get(name)
+                    if value is not None:
+                        try:
+                            return int(value)
+                        except (TypeError, ValueError):
+                            continue
+                return 0
+
+            usage: dict[str, Any] = {
+                "input_tokens": _integer("input_tokens", "prompt_tokens"),
+                "output_tokens": _integer("output_tokens", "completion_tokens"),
+                "total_tokens": _integer("total_tokens"),
+            }
+            raw_cost = raw_usage.get("cost", raw_usage.get("estimated_cost"))
+            if raw_cost is not None:
+                try:
+                    usage["estimated_cost"] = float(raw_cost)
+                except (TypeError, ValueError):
+                    pass
+            self.last_usage = usage
+        else:
+            self.last_usage = {}
         choices = payload.get("choices")
         content = choices[0].get("message", {}).get("content") if isinstance(choices, list) and choices else None
         if not isinstance(content, str):

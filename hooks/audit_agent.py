@@ -6,15 +6,17 @@ import hashlib
 import logging
 import os
 import pathlib
+import re
 import sys
 from datetime import datetime, timezone
+from typing import Any
 
 LOGGER = logging.getLogger(__name__)
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from workspace_fingerprint import fingerprint  # noqa: E402
 from ledger_io import append_jsonl  # noqa: E402
 from _shared import record_ledger, resolve_session_dir, read_active_epoch_id  # noqa: E402
-from enhanced_router.base import agent_role, mutating_agents  # noqa: E402
+from enhanced_router.base import agent_capabilities, agent_role  # noqa: E402
 
 
 def _role(agent_type: str) -> str:
@@ -25,15 +27,65 @@ class WorkspaceIsolationError(RuntimeError):
     """Raised when a mutating native agent is not in an owned shadow."""
 
 
+def _structured_result(data: dict) -> dict | None:
+    """Extract the worker's declared JSON result without trusting prose."""
+    candidates = [
+        data.get("structured_result"),
+        data.get("result"),
+        data.get("output"),
+        data.get("summary"),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            return candidate
+        if not isinstance(candidate, str):
+            continue
+        text = candidate.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _result_contract_valid(phase: dict | None, result: dict | None) -> bool | None:
+    """Perform the durable envelope check; controller still adjudicates value."""
+    if not phase or not phase.get("result_contract_json"):
+        return None
+    if result is None:
+        return False
+    try:
+        contract = json.loads(str(phase["result_contract_json"]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    schema_id = str(contract.get("schema_id") or "") if isinstance(contract, dict) else ""
+    required_by_schema = {
+        "qwen_grounding_v1": {"status", "complexity"},
+        "kimi_completion_v1": {"completion"},
+        "minimax_completion_review_v1": {"completion"},
+        "glm_critical_gate_v1": {"verdict"},
+    }
+    required = required_by_schema.get(schema_id, set())
+    return required.issubset(result)
+
+
 def _execution_workspace(state: object, run_id: str, epoch_id: str, execution_id: str,
-                         cwd: pathlib.Path, agent_type: str) -> str | None:
+                         cwd: pathlib.Path, agent_type: str,
+                         capability_snapshot: dict | None = None) -> str | None:
     """Register the actual Claude worktree used by this execution.
 
     Claude Code owns native ``isolation: worktree`` creation.  The hook does
     not create a second worktree; it records the child worktree and lets the
     router integrate its changeset when the child terminates.
     """
-    if agent_type not in mutating_agents():
+    snapshot = capability_snapshot or {
+        "can_mutate": agent_capabilities(agent_type).can_mutate,
+    }
+    if not bool(snapshot.get("can_mutate")):
         return None
     from enhanced_router.shadow_worktree import ShadowWorktreeManager
 
@@ -204,10 +256,12 @@ def _fastpath_merge_advice(
 ) -> str | None:
     """Ask the optional DiffusionGemma verifier for merge-risk advice.
 
-    This is deliberately advisory.  A PASS does not authorize integration;
-    the deterministic ``git apply --check`` in ``integrate_green`` remains the
-    authority.  FAIL/ESCALATE only turns an otherwise green candidate into a
-    controller-review yellow candidate.
+    This is deliberately advisory and asynchronous.  A PASS does not
+    authorize integration; the deterministic ``git apply --check`` in
+    ``integrate_green`` remains the authority.  The request is queued before
+    integration and never holds the hook open for model latency.  A completed
+    result is persisted as a follow-up verification; it can create a later
+    controller-review finding, but cannot silently rewrite canonical state.
     """
     import urllib.error
     import urllib.request
@@ -240,12 +294,13 @@ def _fastpath_merge_advice(
         data=json.dumps(packet, separators=(",", ":")).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
+            "X-Brigade-Fastpath-Async": "1",
             "X-Enhanced-Token": os.environ.get("ENHANCED_ROUTER_TOKEN", ""),
         },
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=0.35) as response:
+        with urllib.request.urlopen(request, timeout=0.15) as response:
             payload = json.loads(response.read(16_384).decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, ValueError, OSError):
         return None
@@ -253,13 +308,16 @@ def _fastpath_merge_advice(
     return decision if decision in {"pass", "fail", "escalate"} else None
 
 
-def _close_execution(run_id: str, agent_id: str, status: str, summary: str) -> None:
+def _close_execution(
+    run_id: str, agent_id: str, status: str, summary: str, lifecycle_data: dict | None = None,
+) -> None:
     from enhanced_router.registry import get_registry
     from enhanced_router.state import get_state
 
     state = get_state()
     executions = state.get_agent_executions(run_id, status="started") + state.get_agent_executions(run_id, status="running")
     execution = next((item for item in executions if item.get("claude_agent_id") == agent_id), None)
+    changeset_id: str | None = None
     if execution:
         try:
             changeset_id = _finalize_changeset(state, run_id, str(execution["epoch_id"]), execution, status)
@@ -270,7 +328,27 @@ def _close_execution(run_id: str, agent_id: str, status: str, summary: str) -> N
             if status == "completed":
                 status = "failed"
                 summary = f"{summary}\nchangeset integration failed: {exc}".strip()
-        state.update_agent_execution(execution["execution_id"], status=status, result_summary=summary[:2_000])
+        structured = _structured_result(lifecycle_data or {})
+        phase = next(
+            (item for item in state.get_workflow_phases(run_id, str(execution["epoch_id"]))
+             if item.get("phase_id") == execution.get("phase_id")),
+            None,
+        )
+        schema_valid = _result_contract_valid(phase, structured)
+        update_kwargs: dict[str, Any] = {
+            "status": status,
+            "result_summary": summary[:2_000],
+        }
+        if structured is not None:
+            update_kwargs.update({
+                "result_json": json.dumps(structured, sort_keys=True, separators=(",", ":")),
+                "schema_valid": schema_valid,
+                "verdict": structured.get("verdict", structured.get("status", structured.get("completion"))),
+                "confidence": structured.get("confidence"),
+            })
+        elif phase and phase.get("result_contract_json"):
+            update_kwargs["schema_valid"] = False
+        state.update_agent_execution(execution["execution_id"], **update_kwargs)
         try:
             state.finish_spawn_assignment(
                 run_id, str(execution["epoch_id"]), agent_id, status,
@@ -288,6 +366,20 @@ def _close_execution(run_id: str, agent_id: str, status: str, summary: str) -> N
         state.complete_phase_if_ready(
             run_id, str(execution["epoch_id"]), str(execution["phase_id"])
         )
+    # Objective changeset signals can strengthen the workflow tier after a
+    # real mutation.  This runs after the child execution is terminal and its
+    # claim/reservation has been closed, so escalation cannot race the worker
+    # lifecycle.  Applying escalation pauses further mutation and appends the
+    # compensating review/repair closure; the controller must acknowledge it.
+    if execution and changeset_id and status == "completed":
+        try:
+            state.auto_escalate_after_changeset(
+                run_id,
+                str(execution["epoch_id"]),
+                changeset_id,
+            )
+        except Exception as exc:
+            LOGGER.warning("unable to evaluate changeset escalation: %s", exc)
     for reservation in state.get_provider_reservations(active_only=True):
         if reservation.get("execution_id") in {execution.get("execution_id") if execution else None, f"pending:{agent_id}"}:
             state.release_provider_reservation(reservation["reservation_id"], "released")
@@ -325,7 +417,6 @@ def main() -> int:
     }
     if event == "SubagentStart" and run_id:
         try:
-            from enhanced_router.registry import get_registry
             from enhanced_router.state import get_state
             state = get_state()
             epoch = state.get_active_epoch(run_id)
@@ -348,6 +439,13 @@ def main() -> int:
                     "SubagentStart has no uniquely claimed native action; refusing to bind"
                 )
             model_id = str(claim["model_id"])
+            capability_snapshot: dict = {}
+            try:
+                capability_snapshot = json.loads(
+                    str(claim.get("capability_snapshot_json") or "{}")
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                capability_snapshot = {}
             spawn_intent = {
                 "action_id": claim["action_id"],
                 "intent_id": claim.get("intent_id"),
@@ -358,6 +456,7 @@ def main() -> int:
             execution_id = f"exec:{agent_id}"
             workspace_id = _execution_workspace(
                 state, run_id, epoch_id, execution_id, cwd, agent_type,
+                capability_snapshot,
             )
             attached = state.attach_spawned_agent(  # type: ignore[attr-defined]
                 run_id=run_id,
@@ -369,9 +468,15 @@ def main() -> int:
                 execution_id=execution_id,
                 workspace_id=workspace_id,
                 phase_id=phase.get("phase_id") if phase else None,
-                provider_id=(
-                    get_registry().get_model(model_id).provider_id
-                    if model_id != "unknown" else None
+                # The claimed action is authoritative for the exact route.
+                # Never reconstruct provider identity from the model registry:
+                # the same logical model may be served by multiple providers.
+                provider_id=str(claim.get("provider_id") or "") or None,
+                endpoint_id=str(claim.get("endpoint_id") or "auto"),
+                route_digest=str(claim.get("route_digest") or "") or None,
+                candidate_index=(
+                    int(claim["candidate_index"])
+                    if claim.get("candidate_index") is not None else None
                 ),
                 spawn_call_id=str(claim.get("spawn_call_id") or "") or None,
                 claim_token=str(claim.get("claim_token") or "") or None,
@@ -414,7 +519,9 @@ def main() -> int:
             status = "completed"
         if run_id:
             try:
-                _close_execution(run_id, agent_id, status, str(data.get("summary") or ""))
+                _close_execution(
+                    run_id, agent_id, status, str(data.get("summary") or ""), data,
+                )
             except Exception as exc:
                 LOGGER.warning("unable to close authoritative execution: %s", exc)
         marker.unlink(missing_ok=True)

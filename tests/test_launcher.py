@@ -288,6 +288,25 @@ def test_bootstrap_loads_freeinference_concurrency_override(tmp_path: Path):
     assert "FREEINFERENCE_MAX_CONCURRENCY" in result.provider_keys
 
 
+def test_bootstrap_does_not_report_empty_credential_slots_as_loaded(tmp_path: Path):
+    from enhanced_router.bootstrap_env import load_providers_env
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    providers = config_dir / "providers.env"
+    providers.write_text(
+        "CLINE_API_KEY=\n"
+        "FREEINFERENCE_API_KEY=real-value\n",
+        encoding="utf-8",
+    )
+    providers.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+    result = load_providers_env(config_dir)
+
+    assert "FREEINFERENCE_API_KEY" in result.provider_keys
+    assert "CLINE_API_KEY" not in result.provider_keys
+
+
 def test_bootstrap_accepts_freeinference_kit_endpoint_aliases(tmp_path: Path):
     from enhanced_router.bootstrap_env import load_providers_env
 
@@ -321,6 +340,7 @@ def test_bootstrap_accepts_legacy_provider_catalog_settings(tmp_path: Path):
         "NVIDIA_API_BASE=https://integrate.api.nvidia.com/v1\n"
         "FREEMODEL_CC_API_KEY=key\n"
         "FREEMODEL_CC_API_BASE=https://api.freemodel.dev/v1\n"
+        "INFERX_API_KEY=key\n"
         "MODELSCOPE_API_KEY=key\n"
         "MODELSCOPE_API_BASE=https://api-inference.modelscope.cn/v1\n"
         "UNOROUTER_API_KEY=key\n"
@@ -338,6 +358,7 @@ def test_bootstrap_accepts_legacy_provider_catalog_settings(tmp_path: Path):
     # Unsupported legacy providers are accepted for migration but are not
     # exported into the router process until a Brigade provider definition
     # explicitly consumes them.
+    assert "INFERX_API_KEY" not in result.provider_env
     assert "MODELSCOPE_API_KEY" not in result.provider_env
 
 

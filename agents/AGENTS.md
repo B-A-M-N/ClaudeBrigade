@@ -16,11 +16,22 @@ registry and lifecycle authority supplied by the router/hooks.
 - YAML frontmatter must parse through `enhanced_router.agents_json`.
 - Stable role agents are `brigade-recon`, `brigade-implementer`,
   `brigade-adversary`, `brigade-repairer`, and `controller-direct`.
+- Native sidecar identities such as `brigade-grounder`,
+  `brigade-reviewer`, and `brigade-critical-architect` are separate named
+  workers. Their independent provider/model/endpoint route is selected by the
+  active sidecar manifest; they do not consume the Claude Code native slots
+  and are not replacements for stable role lanes.
+- Native sidecars also expose a stable semantic `worker_id` (for example
+  `grounder`, `implementation-worker`, or `critical-gate`). Do not derive
+  workflow authority or lifecycle identity from a model name; the YAML sidecar
+  key is only a backwards-compatible configuration selector.
 - Read-only agents must not receive mutation tools. Mutators must request
   `isolation: worktree`; the router still verifies the actual child workspace.
 - The `model` field is a public router alias, not provider infrastructure
-  identity. Model-qualified identities declared in profile registry metadata
-  may be projected from a stable role template at launch.
+  identity. Native agent names are capability/role identities and must not
+  contain a backing-model name. Slot projections use native aliases (`main`,
+  `sonnet`, `haiku`, `opus`, `fable`); sidecar workers use separately rendered
+  public route aliases while their semantic `worker_id` remains model-neutral.
 - `controller-append.md` must preserve the cooperative MCP claim/spawn
   protocol and must not promise hidden fan-out or untracked authority.
 

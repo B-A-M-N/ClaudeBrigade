@@ -58,6 +58,35 @@ async def test_freeinference_shared_request_limit_is_four() -> None:
 
 
 @pytest.mark.asyncio
+async def test_controller_lane_reserve_keeps_one_request_available() -> None:
+    manager = ProviderAdmissionManager({
+        "freeinference": ProviderLimits(max_concurrency=4, controller_reserve=1),
+    })
+    for request_id in ("worker-1", "worker-2", "worker-3"):
+        await manager.acquire_request("freeinference", request_id, lane="worker")
+
+    queued_worker = asyncio.create_task(
+        manager.acquire_request("freeinference", "worker-4", deadline=monotonic() + 0.05, lane="worker")
+    )
+    await manager.acquire_request("freeinference", "controller", lane="controller")
+    with pytest.raises(AdmissionTimeout):
+        await queued_worker
+    assert manager.snapshot("freeinference")["active_requests"] == 4
+
+
+@pytest.mark.asyncio
+async def test_transport_failures_open_provider_circuit() -> None:
+    manager = ProviderAdmissionManager(
+        {"freeinference": ProviderLimits(max_concurrency=4)}
+    )
+
+    await manager.record_transport_failure(("freeinference",), "request-1")
+    assert manager.snapshot("freeinference")["circuit"]["state"] == "degraded"  # type: ignore[index]
+    await manager.record_transport_failure(("freeinference",), "request-2")
+    assert manager.snapshot("freeinference")["circuit"]["state"] == "open"  # type: ignore[index]
+
+
+@pytest.mark.asyncio
 async def test_queued_provider_does_not_block_other_provider() -> None:
     manager = ProviderAdmissionManager({
         "a": ProviderLimits(max_concurrency=1, queue_timeout_seconds=1),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 
@@ -11,6 +12,7 @@ import yaml
 from enhanced_router.config_models import ModelCapabilities, ModelEndpointSpec, ModelSpec
 from enhanced_router.litellm_config import (
     config_digest,
+    deployment_filter_enabled,
     generate_litellm_config,
     write_litellm_config,
 )
@@ -192,8 +194,14 @@ class TestGenerateLiteLLMConfig:
         params = parsed["model_list"][0]["litellm_params"]
         assert params["api_base"] == "http://127.0.0.1:11434"
 
-    def test_api_key_via_env_var(self, litellm_model_with_key):
+    def test_api_key_via_env_var(self, litellm_model_with_key, monkeypatch):
         """API key uses os.environ/ syntax, never materialized."""
+        # The application may materialize named keyring slots into process
+        # environment variables. Exercise the unslotted legacy path without
+        # inheriting the developer shell's credential state.
+        for name in tuple(os.environ):
+            if name.startswith("BRIGADE_KEYRING_"):
+                monkeypatch.delenv(name, raising=False)
         models = {"test-key": litellm_model_with_key}
         config = generate_litellm_config(models)
         parsed = yaml.safe_load(config)
@@ -238,6 +246,17 @@ class TestGenerateLiteLLMConfig:
         assert "model_list" in parsed
         assert "general_settings" in parsed
         assert len(parsed["model_list"]) == 2
+
+    def test_deployment_filter_callback_is_explicitly_opt_in(self, litellm_model, monkeypatch):
+        monkeypatch.delenv("BRIGADE_LITELLM_DISPATCH_FILTER", raising=False)
+        disabled = yaml.safe_load(generate_litellm_config({"model": litellm_model}))
+        assert "callbacks" not in disabled["litellm_settings"]
+
+        monkeypatch.setenv("BRIGADE_LITELLM_DISPATCH_FILTER", "1")
+        enabled = yaml.safe_load(generate_litellm_config({"model": litellm_model}))
+        assert enabled["litellm_settings"]["callbacks"] == [
+            "brigade_litellm_dispatch.proxy_handler_instance"
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +314,20 @@ class TestConfigDigest:
         """
         models = {"m": litellm_model}
         assert config_digest(models, referenced_ids=set()) == config_digest(models)
+
+    def test_dispatch_filter_toggle_changes_digest(self, litellm_model, monkeypatch):
+        monkeypatch.delenv("BRIGADE_LITELLM_DISPATCH_FILTER", raising=False)
+        disabled = config_digest({"m": litellm_model})
+        monkeypatch.setenv("BRIGADE_LITELLM_DISPATCH_FILTER", "1")
+        enabled = config_digest({"m": litellm_model})
+        assert disabled != enabled
+
+    def test_dispatch_filter_explicit_value_overrides_environment(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("BRIGADE_LITELLM_DISPATCH_FILTER", "1")
+        assert deployment_filter_enabled(False) is False
+        assert deployment_filter_enabled(True) is True
 
 
 # ---------------------------------------------------------------------------

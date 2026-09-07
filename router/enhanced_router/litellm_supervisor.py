@@ -29,7 +29,9 @@ import logging
 import os
 import pathlib
 import signal
+import shutil
 import sys
+import tempfile
 import time
 from typing import Any
 
@@ -58,6 +60,30 @@ class LiteLLMUnhealthyError(RuntimeError):
 
 class LiteLLMCrashError(RuntimeError):
     """Raised when a LiteLLM child process exits unexpectedly."""
+
+
+def _install_dispatch_filter_module(config_dir: pathlib.Path) -> pathlib.Path:
+    """Install the pinned-version callback beside a generated config.
+
+    LiteLLM resolves custom callback module names relative to the config file.
+    Copying the source atomically keeps blue-green generations self-contained
+    and avoids making the child depend on the parent process's import path.
+    """
+    source = pathlib.Path(__file__).with_name("litellm_dispatch_filter.py")
+    target = config_dir / "brigade_litellm_dispatch.py"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=".brigade_litellm_dispatch.", suffix=".py.tmp", dir=str(config_dir)
+    )
+    os.close(fd)
+    try:
+        shutil.copyfile(source, temporary_name)
+        os.chmod(temporary_name, 0o600)
+        os.replace(temporary_name, target)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+    return target
 
 
 def _find_free_port(start: int = 18000) -> int:
@@ -273,6 +299,65 @@ class LiteLLMSupervisor:
             "oldest_request_started_at": min(starts) if starts else None,
         }
 
+    def deployment_telemetry(self) -> dict[str, Any]:
+        """Return an in-process snapshot suitable for health/MCP responses."""
+        result: dict[str, Any] = {
+            "lifecycle_state": self._lifecycle_state,
+            "active_generation": self._active_generation,
+            "active_port": self._active_port,
+            "active_pid": self._active_pid,
+            "draining_generation": self._draining_generation,
+            "crash_count": self._crash_count,
+            "last_crash_at": self._last_crash_at or None,
+            "request_activity": {},
+        }
+        generations = set(self._request_activity)
+        if self._active_generation is not None:
+            generations.add(self._active_generation)
+        if self._draining_generation is not None:
+            generations.add(self._draining_generation)
+        result["request_activity"] = {
+            str(generation): self.generation_activity(generation)
+            for generation in sorted(generations)
+        }
+        return result
+
+    def _record_deployment_event(
+        self,
+        deployment_id: int | None,
+        generation: int,
+        event: str,
+        *,
+        status: str | None = None,
+        pid: int | None = None,
+        port: int | None = None,
+        reason: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Best-effort durable lifecycle telemetry; never blocks routing."""
+        if deployment_id is None:
+            return
+        activity = self.generation_activity(generation)
+        try:
+            self._state.record_litellm_deployment_event(
+                deployment_id=deployment_id,
+                generation=generation,
+                event=event,
+                status=status,
+                pid=pid,
+                port=port,
+                active_requests=int(activity["active_requests"] or 0),
+                active_streams=int(activity["active_streams"] or 0),
+                reason=reason,
+                metadata=metadata,
+            )
+        except Exception:
+            LOGGER.exception(
+                "failed to persist LiteLLM deployment telemetry gen=%s event=%s",
+                generation,
+                event,
+            )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -330,6 +415,8 @@ class LiteLLMSupervisor:
         from enhanced_router.litellm_config import write_litellm_config
 
         write_litellm_config(config_text, config_path)
+        if "brigade_litellm_dispatch.proxy_handler_instance" in config_text:
+            _install_dispatch_filter_module(self._config_dir)
 
         # Find a free port
         port = _find_free_port(18000 if not self._active_port else self._active_port + 1)
@@ -341,11 +428,30 @@ class LiteLLMSupervisor:
         dep_id = self._state.register_litellm_deployment(
             generation, port, pid
         )
+        self._record_deployment_event(
+            dep_id,
+            generation,
+            "spawned",
+            status="starting",
+            pid=pid,
+            port=port,
+            reason=reason or "initial",
+            metadata={"registry_hash": registry_hash, "config_digest": digest},
+        )
 
         # Health probe
         healthy = await _health_probe(port, api_key=self._litellm_key)
         if not healthy:
             self._state.update_litellm_deployment(dep_id, status="failed")
+            self._record_deployment_event(
+                dep_id,
+                generation,
+                "health_failed",
+                status="failed",
+                pid=pid,
+                port=port,
+                reason="health probe exhausted",
+            )
             # Clean up the process tracking entry
             self._processes.pop(generation, None)
             # Terminate the failed child
@@ -362,6 +468,14 @@ class LiteLLMSupervisor:
             )
 
         self._state.update_litellm_deployment(dep_id, status="active")
+        self._record_deployment_event(
+            dep_id,
+            generation,
+            "healthy",
+            status="active",
+            pid=pid,
+            port=port,
+        )
 
         # Activate — retire previous active generation
         old_active = self._state.get_active_litellm_generation()
@@ -566,6 +680,16 @@ class LiteLLMSupervisor:
             self._state.update_litellm_deployment(
                 dep_id, status="dead", termination_reason=reason
             )
+            self._record_deployment_event(
+                dep_id,
+                generation,
+                "exited",
+                status="dead",
+                pid=pid,
+                port=self._active_port if self._active_pid == pid else None,
+                reason=reason,
+                metadata={"returncode": returncode},
+            )
             # Clear tracking state if this was the active child
             if self._active_pid == pid:
                 self._active_generation = None
@@ -593,6 +717,16 @@ class LiteLLMSupervisor:
         self._state.update_litellm_deployment(
             dep_id, status="failed", termination_reason=f"exit_code_{returncode}"
         )
+        self._record_deployment_event(
+            dep_id,
+            generation,
+            "crashed",
+            status="failed",
+            pid=pid,
+            port=self._active_port if self._active_pid == pid else None,
+            reason=f"exit_code_{returncode}",
+            metadata={"returncode": returncode, "crash_count": self._crash_count},
+        )
         # Clear active tracking so bindings fail with 503 instead of stale state
         if self._active_pid == pid:
             self._active_generation = None
@@ -619,6 +753,10 @@ class LiteLLMSupervisor:
                     config_text=config_text,
                     reason="automatic crash recovery",
                     referenced_ids=referenced_ids,
+                )
+                LOGGER.info(
+                    "LiteLLM automatic crash recovery succeeded generation=%s",
+                    self._active_generation,
                 )
                 return
             except Exception as exc:

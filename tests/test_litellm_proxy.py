@@ -206,6 +206,45 @@ class TestSanitizeUpstreamHeaders:
 
 
 class TestResolvedRoute:
+    def test_managed_group_attribution_requires_allowed_deployment(self, monkeypatch):
+        import enhanced_router.backends as backends
+        import enhanced_router.registry as registry_module
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(
+            registry_module,
+            "get_registry",
+            lambda: SimpleNamespace(
+                get_model=lambda _model_id: SimpleNamespace(
+                    endpoints={
+                        "free": SimpleNamespace(provider_id="freeinference"),
+                    },
+                    provider_id="freeinference",
+                ),
+            ),
+        )
+        route = ResolvedRoute(
+            kind=BackendType.LITELLM,
+            model_id="grouped",
+            provider_ids=("freeinference", "openrouter"),
+            allowed_deployments=("free",),
+        )
+
+        trusted = backends._route_with_reported_deployment(
+            route, {"x-litellm-deployment-id": "free"},
+        )
+        assert trusted.endpoint_id == "free"
+        assert trusted.provider_id == "freeinference"
+        assert trusted.deployment_identity_trusted is True
+        assert trusted.deployment_attribution_source == "validated_response_header"
+
+        unknown = backends._route_with_reported_deployment(
+            route, {"x-litellm-deployment-id": "not-approved"},
+        )
+        assert unknown.endpoint_id is None
+        assert unknown.deployment_identity_trusted is False
+        assert unknown.reported_deployment_id == "not-approved"
+
     @pytest.mark.asyncio
     async def test_anthropic_passthrough_uses_shared_admission_lane(self):
         from types import SimpleNamespace

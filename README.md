@@ -9,7 +9,7 @@ The launcher scripts are named `claude-brigade` and friends by default. For back
 ```text
 ordinary task
   -> active Claude Code main model: controller
-     -> visible, model-qualified native agents when evidence or mutation is needed
+     -> visible, model-neutral native agents when evidence or mutation is needed
      -> controller reviews the stable diff and adjudicates findings
      -> controller runs final verification and a workspace-hash gate
 
@@ -49,8 +49,8 @@ be pasted into the hidden prompt, and are saved in the OS credential store
 when available.
 
 It keeps the Claude Code controller/native-agent inference profile and the
-bounded sidecar profile independent. You can save, edit, delete, and reuse
-named profiles. Model selection searches the currently loaded catalog, and
+independently routed native-sidecar profile independent. You can save, edit,
+delete, and reuse named profiles. Model selection searches the currently loaded catalog, and
 `claude-brigade-config refresh` updates provider-backed catalogs when a usable
 credential is available.
 
@@ -58,6 +58,20 @@ Inference profiles support ordered model/provider fallback per role. Key
 rotation is a separate control: save multiple named keys for the same
 provider, and requests rotate between those slots without changing the model
 or provider route. These controls can be used independently or together.
+
+To publish an explicitly reviewed, sanitized FreeInference contract report as
+route-specific certification evidence:
+
+```bash
+claude-brigade-config certify-report \
+  --report reports/deepseek-v4-flash.json \
+  --provider freeinference \
+  --model deepseek-v4-flash \
+  --endpoint openai
+```
+
+This command does not run inference, modify YAML, or grant a role. Discovery
+and successful transport responses never certify a route automatically.
 
 ## Local FreeInference BYOK
 
@@ -97,6 +111,18 @@ FREEINFERENCE_MAX_CONCURRENCY=4 claude-brigade
 The provider key remains in the router/LiteLLM process. Claude Code receives
 only a per-run local router token, so a FreeInference-only session does not
 require Anthropic authentication.
+
+For LiteLLM `1.93.0`, the managed-group deployment filter can be enabled after
+the child has been certified with the local contract harness:
+
+```bash
+BRIGADE_LITELLM_DISPATCH_FILTER=1 claude-brigade
+```
+
+The filter only narrows LiteLLM's healthy deployment candidates to the
+immutable Brigade policy carried with the request. Provider admission remains
+conservative across all allowed candidates until live benchmarks prove that
+reservation reduction is safe.
 
 For a standalone local LiteLLM integration kit, see
 [`integrations/freeinference-litellm`](integrations/freeinference-litellm/README.md).
@@ -192,20 +218,20 @@ workflows:
 
 ## Enforced controls
 
-- Only the generated, model-qualified native agents in the launch manifest are
-  spawnable from the main controller.
+- Only generated, model-neutral native agents and explicitly selected native
+  sidecars in the launch manifest are spawnable from the main controller.
 - Agent definitions are injected with native `--agents` session configuration,
   which outranks project-level agent files and prevents accidental name
   collisions or role replacement.
 - Native Agent calls remain visible and are admitted cooperatively through
   `get_runnable_actions`; the router cannot replay a denied Agent call.
-- Only implementer/repairer executions and the exceptional `controller-direct`
-  path may use file-write tools, and mutating executions require the active
-  workspace mutation lease.
+- Only executions with an explicit mutation capability and the exceptional
+  `controller-direct` path may use file-write tools, and mutating executions
+  require the active workspace mutation lease.
 - Read-only roles are blocked from obvious mutating shell commands. This is a guardrail, not an operating-system sandbox.
 - Agent start/stop lifecycle evidence is recorded without prompts or source content.
-- Cross-cutting completion requires recon plus one completed fresh adversary.
-- High-risk completion requires recon plus two separately spawned adversaries.
+- Nontrivial completion requires current-generation grounding, completion
+  signoff, any required independent review, and the final critical gate.
 - The final completion hook checks role lifecycles, unresolved findings, `git diff --check`, and a SHA-256 fingerprint of tracked changes plus untracked files.
 
 ### Cooperative native-agent scheduling
@@ -299,10 +325,14 @@ separate from multiple credential slots within one provider.
 
 ### `sidecars.yaml`
 
-Defines bounded, read-only sidecar calls independently from the controller and
-native-agent inference profile. A sidecar selects its own model, endpoint,
-mode, timeout, packet/output bounds, and prompt. Sidecars cannot mutate files
-or workflow authority and are displayed explicitly as sidecars in status.
+Defines independently routed native sidecar workers plus bounded coprocessor
+policies. Native sidecars select their own model, endpoint, tools, worktree
+policy, lifecycle role, and prompt; coprocessors remain read-only structured
+calls with timeout and packet/output bounds. Neither lane bypasses MCP
+scheduling or provider admission. The bundled `post-edit-sentinel`
+coprocessor is invoked by the `PostToolBatch` hook only for semantic edit
+checkpoints. Its result is injected as explicitly non-authoritative evidence;
+the controller must independently assess it before making a workflow decision.
 
 ### `workflows.yaml`
 

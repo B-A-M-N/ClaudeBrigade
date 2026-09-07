@@ -71,6 +71,26 @@ def test_agent_spawn_requires_a_cooperative_action_claim(tmp_path, monkeypatch):
     assert "get_runnable_actions" in denied_reasons[0]
 
 
+def test_native_worker_cannot_spawn_nested_agents(monkeypatch):
+    denied_reasons = []
+    monkeypatch.setattr("guard_tool.lookup_agent_type", lambda data: "brigade-reviewer")
+    monkeypatch.setattr("guard_tool.deny", lambda reason: denied_reasons.append(reason))
+    monkeypatch.setattr(
+        "sys.stdin",
+        io_string_stream(json.dumps({
+            "tool_name": "Agent",
+            "tool_input": {"subagent_type": "brigade-recon"},
+            "session_id": "nested-agent-test",
+            "agent_id": "worker-1",
+        })),
+    )
+
+    guard_tool_main()
+
+    assert len(denied_reasons) == 1
+    assert "cannot spawn nested agents" in denied_reasons[0]
+
+
 def test_completion_guard_mutation_triggered_gate(tmp_path, monkeypatch):
     session_id = "test-session-mutation"
     cache_dir = tmp_path / ".cache" / "claude-brigade"

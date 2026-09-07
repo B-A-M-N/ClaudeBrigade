@@ -98,14 +98,17 @@ def read_jsonl_cached(path: Path) -> list[dict]:
     # Determine if we can use the cache
     if cache_state is not None:
         cache_mtime = cache_state.get("mtime")
-        cache_size = cache_state.get("size")
         cache_offset = cache_state.get("offset")
         cached_records = cache_state.get("records", [])
 
         # Cache is valid if: mtime matches and size >= cached offset
         # (mtime mismatch covers rotation/truncation; size < offset covers truncation)
-        if (cache_mtime == current_mtime and
-            current_size >= cache_offset):
+        if (
+            cache_mtime == current_mtime
+            and isinstance(cache_offset, int)
+            and cache_offset >= 0
+            and current_size >= cache_offset
+        ):
             # Use cache and tail from offset
             tail_records = _read_jsonl_tail(path, cache_offset)
             combined = cached_records + tail_records

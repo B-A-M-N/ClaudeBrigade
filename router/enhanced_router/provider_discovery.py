@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -59,15 +61,55 @@ def normalize_model(provider_id: str, endpoint_id: str, payload: dict[str, Any])
 
 
 def discover_openai_models(
-    *, provider_id: str, endpoint_id: str, base_url: str, api_key: str, timeout: float = 30.0
+    *,
+    provider_id: str,
+    endpoint_id: str,
+    catalog_url: str,
+    api_key: str,
+    timeout: float = 30.0,
+    max_attempts: int = 1,
+    retryable_statuses: tuple[int, ...] = (408, 429, 500, 502, 503, 504, 529),
+    max_backoff_seconds: float = 5.0,
 ) -> list[DiscoveredEndpoint]:
-    response = httpx.get(
-        f"{base_url.rstrip('/')}/models",
-        headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
-        timeout=timeout,
-        follow_redirects=False,
-    )
-    response.raise_for_status()
+    """Fetch an OpenAI-compatible catalog with bounded transient retries.
+
+    Explicit catalog URLs are used exactly as configured.  Only transport
+    failures and the configured transient HTTP statuses advance the retry
+    loop; authentication and endpoint/path errors remain immediate failures so
+    the CLI can show the real problem instead of masking it with retries.
+    """
+    attempts = max(1, int(max_attempts))
+    retryable = set(retryable_statuses)
+    response: httpx.Response | None = None
+    for attempt in range(attempts):
+        try:
+            response = httpx.get(
+                catalog_url,
+                headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+                timeout=timeout,
+                follow_redirects=False,
+            )
+            response.raise_for_status()
+            break
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status not in retryable or attempt + 1 >= attempts:
+                raise
+            retry_after = exc.response.headers.get("retry-after")
+            try:
+                delay = float(retry_after) if retry_after is not None else None
+            except ValueError:
+                delay = None
+            ceiling = min(max_backoff_seconds, 0.5 * (2**attempt))
+            delay = max(0.1, min(delay if delay is not None else ceiling, max_backoff_seconds))
+            time.sleep(random.uniform(0.0, delay))
+        except httpx.RequestError:
+            if attempt + 1 >= attempts:
+                raise
+            ceiling = min(max_backoff_seconds, 0.5 * (2**attempt))
+            time.sleep(random.uniform(0.0, max(0.1, ceiling)))
+    if response is None:
+        raise RuntimeError("provider catalog request produced no response")
     payload = response.json()
     entries = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(entries, list):

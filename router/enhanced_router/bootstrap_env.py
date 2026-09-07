@@ -76,6 +76,11 @@ ALLOWED_PROVIDER_KEYS = frozenset({
     "FREEMODEL_CC_API_BASE",
     "MODELSCOPE_API_KEY",
     "MODELSCOPE_API_BASE",
+    # Preserve credentials from Crush/other local provider catalogs even when
+    # the provider is not currently enabled in providers.yaml.  This remains
+    # a router-only compatibility slot and is not exported without a matching
+    # active provider definition.
+    "INFERX_API_KEY",
     "UNOROUTER_API_KEY",
     "UNOROUTER_API_BASE",
     "LOGFLARE_API_KEY",
@@ -147,7 +152,11 @@ def load_providers_env(config_dir: Path) -> BootstrapResult:
 
     # Filter to keys the router needs
     router_env = {k: v for k, v in parsed.items() if k in PROVIDER_KEYS_FOR_ROUTER}
-    provider_keys = list(router_env.keys())
+    # A declared-but-empty ``KEY=`` slot is not a loaded credential.  Keep the
+    # empty value in ``provider_env`` for compatibility with the strict parser,
+    # but do not report it as loaded to the CLI, audit log, or router health
+    # diagnostics.
+    provider_keys = [key for key, value in router_env.items() if value]
 
     return BootstrapResult(router_env, tuple(provider_keys))
 

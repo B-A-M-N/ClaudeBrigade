@@ -210,6 +210,18 @@ else
     fi
   done
 
+  # Apply schema-aware provider defaults to the active user file. This fills
+  # newly introduced router-owned metadata (such as discovery URLs) without
+  # replacing operator-owned endpoints, limits, additions, or removals.
+  if [[ -f "$CONFIG_DIR/providers.yaml" ]]; then
+    "$APP_DIR/venv/bin/python" -c 'from enhanced_router.provider_config import migrate_provider_config; import sys; migrate_provider_config(sys.argv[1], sys.argv[2])' \
+      "$CONFIG_DIR/providers.yaml" "$SOURCE_DIR/config/providers.yaml"
+  fi
+  if [[ -f "$CONFIG_DIR/workflows.yaml" ]]; then
+    "$APP_DIR/venv/bin/python" -c 'from enhanced_router.workflow_config import migrate_workflow_config; import sys; migrate_workflow_config(sys.argv[1], sys.argv[2])' \
+      "$CONFIG_DIR/workflows.yaml" "$SOURCE_DIR/config/workflows.yaml"
+  fi
+
   # Router token: generate only if missing
   if [[ ! -f "$CONFIG_DIR/router.token" ]]; then
     python3 - <<'PY' > "$CONFIG_DIR/router.token"
@@ -260,6 +272,14 @@ print(secrets.token_urlsafe(32))
 PY
     chmod 600 "$CONFIG_DIR/litellm.token"
   fi
+fi
+
+# Add newly declared native sidecar workers and coprocessors by identifier on
+# both first-install and upgrade paths. Existing operator definitions, legacy
+# bounded `sidecars` entries, and provider limits remain authoritative.
+if [[ -f "$CONFIG_DIR/sidecars.yaml" ]]; then
+  "$APP_DIR/venv/bin/python" -c 'from enhanced_router.sidecar_config import migrate_sidecar_config; import sys; migrate_sidecar_config(sys.argv[1], sys.argv[2])' \
+    "$CONFIG_DIR/sidecars.yaml" "$SOURCE_DIR/config/sidecars.yaml"
 fi
 
 # ---- Write install-info.json metadata --------------------------------------

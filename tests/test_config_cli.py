@@ -22,6 +22,8 @@ from enhanced_router.config_cli import (
     _profile_model,
     _rank_query_matches,
     _referencing_configs,
+    _choose_toggle,
+    configure_global_coprocessor_lane,
     configure_inference,
     configure_launch_preset,
     configure_sidecar_profile,
@@ -127,6 +129,52 @@ def test_choose_returns_directly_for_short_lists(monkeypatch):
     options = [("a", "A"), ("b", "B")]
     monkeypatch.setattr(builtins, "input", lambda prompt="": "2")
     assert _choose("Pick", options) == "b"
+
+
+def test_choose_toggle_preserves_current_state_and_returns_explicit_choice(monkeypatch):
+    seen: list[tuple[str, list[tuple[str, str]], int]] = []
+
+    def fake_choose(label, options, default=1):
+        seen.append((label, options, default))
+        return "off" if default == 1 else "on"
+
+    monkeypatch.setattr(config_cli, "_choose", fake_choose)
+    assert _choose_toggle("Coprocessor", True) is False
+    assert _choose_toggle("Coprocessor", False) is True
+    assert [item[2] for item in seen] == [1, 2]
+    assert seen[0][1][0][0] == "on"
+    assert seen[0][1][1][0] == "off"
+
+
+def test_configure_coprocessor_can_disable_without_reselecting_route(tmp_path: Path, monkeypatch):
+    _write(tmp_path / "sidecars.yaml", {
+        "coprocessors": {"reviewer": {"model_id": "model-a", "enabled": True}},
+    })
+    saved: dict = {}
+    monkeypatch.setattr(config_cli, "_choose_or_create_id", lambda *args, **kwargs: "reviewer")
+    monkeypatch.setattr(config_cli, "_choose_toggle", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        config_cli, "_write_yaml", lambda _path, raw, **_kwargs: saved.update(raw)
+    )
+
+    config_cli.configure_coprocessor(tmp_path, object())
+
+    assert saved["coprocessors"]["reviewer"]["enabled"] is False
+
+
+def test_configure_fastpath_can_disable_without_reselecting_route(tmp_path: Path, monkeypatch):
+    _write(tmp_path / "fastpath.yaml", {
+        "fastpath": {"model_id": "diffusiongemma", "enabled": True},
+    })
+    saved: dict = {}
+    monkeypatch.setattr(config_cli, "_choose_toggle", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        config_cli, "_write_yaml", lambda _path, raw, **_kwargs: saved.update(raw)
+    )
+
+    config_cli.configure_fastpath(tmp_path, object())
+
+    assert saved["fastpath"]["enabled"] is False
 
 
 def test_choose_page_number_stays_absolute_across_pages(monkeypatch):
@@ -340,6 +388,16 @@ def test_profile_model_reads_back_legacy_and_canonical_fallback_shapes():
     assert _profile_model(canonical, "recon") == ("m1", "ep1", ["f1", "f2"])
 
 
+def test_credential_configured_reads_locked_legacy_provider_file(tmp_path: Path):
+    """Catalog refresh can see credentials before router startup materializes them."""
+    path = tmp_path / "providers.env"
+    path.write_text(
+        "OPENROUTER_API_KEY=redacted-test-value\n", encoding="utf-8"
+    )
+    path.chmod(0o600)
+    assert config_cli._credential_configured("OPENROUTER_API_KEY", tmp_path)
+
+
 def test_configure_inference_writes_fallback_entries_as_dicts(tmp_path: Path, monkeypatch):
     config_dir = _two_certified_model_config_dir(tmp_path)
     monkeypatch.setenv("TEST_PROBE_API_KEY", "fake-key-for-config-check")
@@ -375,7 +433,7 @@ def test_configure_inference_writes_fallback_entries_as_dicts(tmp_path: Path, mo
     saved = yaml.safe_load((config_dir / "profiles.yaml").read_text())
     recon = saved["profiles"][profile_id]["recon"]
     assert recon["model"] == "model-a"
-    assert recon["endpoint"] == "auto"
+    assert recon["endpoint"] == "default"
     assert recon["fallback_models"] == [{"model": "model-b", "endpoint": "auto"}]
     # Profile was saved without editing controller (dashboard option 1 was not chosen).
     # The controller field is optional; the profile still functions with roles only.
@@ -406,6 +464,19 @@ def test_configure_sidecar_profile_writes_bounded_sidecar_ids(tmp_path: Path, mo
     assert "fastpath" not in entry
 
 
+def test_configure_global_coprocessor_lane_writes_master_switch(tmp_path: Path, monkeypatch):
+    config_dir = _minimal_config_dir(tmp_path)
+    registry, _ = _load_registry(config_dir)
+    monkeypatch.setattr(config_cli, "_choose", lambda *args, **kwargs: "off")
+
+    configure_global_coprocessor_lane(config_dir, registry)
+
+    saved = yaml.safe_load((config_dir / "sidecars.yaml").read_text())
+    assert saved["coprocessors_enabled"] is False
+    reloaded, _ = _load_registry(config_dir)
+    assert reloaded.coprocessors_enabled is False
+
+
 @pytest.mark.skip(reason="Numbered-toggle UI replaces typed-ID entry; unknown sidecar ID ValueError can no longer be raised at this stage. Toggle rejection path is covered by test_configure_sidecar_profile_writes_bounded_sidecar_ids.")
 def test_configure_sidecar_profile_rejects_unknown_sidecar_id(tmp_path: Path, monkeypatch):
     """Superseded by numbered-toggle UI -- kept as a documented skip."""
@@ -433,6 +504,8 @@ def test_configure_launch_preset_pairs_inference_and_sidecar_profiles(tmp_path: 
             return "hybrid"
         if label == "Sidecar profile":
             return "lightweight"
+        if label == "Workflow composition":
+            return "(automatic task tier)"
         raise AssertionError(f"unexpected _choose call: {label}")
 
     monkeypatch.setattr(config_cli, "_prompt", fake_prompt)
@@ -711,7 +784,6 @@ def test_generate_route_choices_returns_multiple_routes_for_one_model(tmp_path: 
     _write(tmp_path / "fastpath.yaml", {"fastpath": {"enabled": False, "model_id": "none"}})
     _write(tmp_path / "sidecars.yaml", {"sidecars": {}})
 
-    import os
     monkeypatch = __import__('pytest').MonkeyPatch()
     monkeypatch.setenv("TEST_KEY_A", "key")
     monkeypatch.setenv("TEST_KEY_X", "key")
@@ -763,6 +835,18 @@ def test_route_choice_route_key_uniqueness():
     assert same_key.route_key() == rc1.route_key()
 
 
+def test_route_key_includes_provider_model_and_endpoint():
+    from enhanced_router.config_cli import RouteChoice, RouteKey
+
+    route = RouteChoice(
+        model_id="same-model", endpoint_id="openai", provider_id="provider-a",
+        provider_name="A", model_name="Same", backend="litellm",
+        credential_configured=True, availability="public", certified=True,
+    )
+    assert route.route_key() == RouteKey("provider-a", "same-model", "openai")
+    assert route.route_key() != RouteKey("provider-b", "same-model", "openai")
+
+
 def test_rank_route_matches_prioritizes_exact_id():
     from enhanced_router.config_cli import _rank_route_matches, RouteChoice
 
@@ -778,8 +862,76 @@ def test_rank_route_matches_prioritizes_exact_id():
                      backend="litellm", credential_configured=True, availability="public", certified=True),
     ]
     ranked = _rank_route_matches("longcat", choices)
-    assert [rc.model_id for rc in ranked] == ["longcat", "longcat-2", "zzz-vendor/foo-longcat"]
+    assert [rc.model_id for rc in ranked] == ["longcat", "zzz-vendor/foo-longcat", "longcat-2"]
     assert _rank_route_matches("", choices) == choices
+
+
+def test_rank_route_matches_tokenizes_punctuation_and_free_filter():
+    from enhanced_router.config_cli import _rank_route_matches, RouteChoice
+
+    free = RouteChoice(
+        model_id="openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+        endpoint_id="openai", provider_id="openrouter", provider_name="OpenRouter",
+        model_name="NVIDIA: Nemotron 3 Ultra (free)", backend="litellm",
+        credential_configured=True, availability="public", certified=False,
+        context_tokens=1_000_000, is_free=True,
+    )
+    paid = free.__class__(
+        **{**free.__dict__, "model_id": "openrouter/nvidia/nemotron-3-ultra-550b-a55b",
+           "model_name": "NVIDIA: Nemotron 3 Ultra", "is_free": False},
+    )
+    assert _rank_route_matches("Nemotron 3 Ultra :free", [paid, free]) == [free]
+    assert _rank_route_matches("free:true ctx:>=500k", [paid, free]) == [free]
+
+
+def test_single_real_endpoint_creates_one_picker_route(tmp_path: Path, monkeypatch):
+    config_dir = _two_certified_model_config_dir(tmp_path)
+    _write(config_dir / "models.yaml", {
+        "models": {
+            "one-model": {
+                "display_name": "One Model", "backend": "litellm",
+                "provider_id": "testprovider", "api_key_env": "TEST_PROBE_API_KEY",
+                "litellm_model": "openai/one-model",
+                "endpoints": {
+                    "openai": {
+                        "backend": "litellm", "provider_id": "testprovider",
+                        "litellm_model": "openai/one-model", "api_base": "https://example.invalid/v1",
+                    },
+                },
+                "capabilities": {"tools": True, "controller_eligible": True},
+                "allowed_roles": ["recon"],
+            },
+        },
+    })
+    monkeypatch.setenv("TEST_PROBE_API_KEY", "key")
+    registry, _ = _load_registry(config_dir)
+    choices = config_cli.generate_route_choices(registry, role="recon")
+    one_model = [choice for choice in choices if choice.model_id == "one-model"]
+    assert [(choice.model_id, choice.endpoint_id) for choice in one_model] == [("one-model", "openai")]
+
+
+def test_provider_summary_counts_logical_models_not_routes():
+    from enhanced_router.config_cli import RouteChoice, eligible_providers
+
+    choices = [
+        RouteChoice("m", "openai", "p", "Provider", "Model", "litellm", True, "public", True),
+        RouteChoice("m", "anthropic", "p", "Provider", "Model", "direct-anthropic", True, "public", True),
+    ]
+    summary = eligible_providers(choices)[0]
+    assert summary.logical_model_count == 1
+    assert summary.route_count == 2
+
+
+def test_second_route_row_returns_exact_route(monkeypatch):
+    from enhanced_router.config_cli import RouteChoice, choose_route
+
+    choices = [
+        RouteChoice("m", "openai", "p", "Provider", "Model", "litellm", True, "public", True),
+        RouteChoice("m", "anthropic", "p", "Provider", "Model", "direct-anthropic", True, "public", True),
+    ]
+    monkeypatch.setattr(builtins, "input", lambda prompt="": "2")
+    selected = choose_route(choices, provider_id="p", purpose="recon")
+    assert selected is choices[1]
 
 
 def test_nav_result_navigation_check():
@@ -838,14 +990,10 @@ def test_choose_nav_selects_by_number(monkeypatch):
 
 
 def test_choose_nav_back_on_blank(monkeypatch):
-    """When _choose_nav has a single navigation action and blank input is given,
-    it should return that navigation action."""
+    """Blank input preserves the picker until an explicit command is given."""
     from enhanced_router.config_cli import _choose_nav, ChoiceControls, NavigationAction
 
-    # With only allow_back=True, default_nav is set to BACK.
-    # Mock _prompt to return the default (which is "1"), making the selection
-    # land on option "a" — testing blank works correctly.
-    responses = iter([""])
+    responses = iter(["", "b"])
     monkeypatch.setattr(builtins, "input", lambda prompt="": next(responses))
 
     result = _choose_nav(
@@ -853,9 +1001,8 @@ def test_choose_nav_back_on_blank(monkeypatch):
         [("a", "A")],
         ChoiceControls(allow_back=True, allow_cancel=True),
     )
-    # With allow_back=True AND allow_cancel=True, there's no single default_nav
-    # and blank triggers the ValueError path. But we test that it doesn't crash.
-    assert result.value == "a" or result.action is not None
+    assert result.value is None
+    assert result.action == NavigationAction.BACK
 
 
 def test_configure_launch_setup_creates_launch_preset(tmp_path: Path, monkeypatch):
@@ -872,13 +1019,14 @@ def test_configure_launch_setup_creates_launch_preset(tmp_path: Path, monkeypatc
 
     # Mock the sub-wizards so they return instantly. The orchestrator calls
     # configure_inference -> returns "test-profile", then
-    # configure_sidecar_profile -> returns "test-sidecars", then
+    # configure_sidecar_lane -> opens the launch-bundle option and the mocked
+    # configure_sidecar_profile returns "test-sidecars", then
     # create preset "3" (both profiles exist now).
     monkeypatch.setattr(config_cli, "configure_inference", lambda cd, r: "test-profile")
     monkeypatch.setattr(config_cli, "configure_sidecar_profile", lambda cd, r: "test-sidecars")
 
-    # Only outer-loop inputs: 1=main models, 2=sidecars, 3=create preset
-    responses = iter(["1", "2", "3"])
+    # Inputs: 1=main models, 2=sidecar lane, 3=launch bundle, 3=create preset
+    responses = iter(["1", "2", "3", "3"])
     monkeypatch.setattr(builtins, "input", lambda prompt="": next(responses))
     monkeypatch.setattr(config_cli, "_prompt", lambda label, default=None: default or "")
 
@@ -929,8 +1077,6 @@ def test_staged_grants_not_applied_on_cancel(tmp_path: Path, monkeypatch):
     model = registry.get_model("vendor/uncertified-model")
     assert "recon" not in model.allowed_roles
 
-    from enhanced_router.config_cli import _apply_staged_grants
-    grants = [{"model_id": "vendor/uncertified-model", "role": "recon", "controller": False}]
     # Not calling _apply_staged_grants -- simulating cancellation
     # Verify grant was NOT applied
     model = registry.get_model("vendor/uncertified-model")

@@ -15,6 +15,19 @@ from dataclasses import asdict, dataclass, field, replace
 from time import monotonic
 
 
+REQUEST_LANES = frozenset({
+    "controller", "critical", "verification", "worker", "feedback", "fastpath",
+})
+_LANE_PRIORITY = {
+    "controller": 0,
+    "critical": 1,
+    "verification": 2,
+    "worker": 3,
+    "feedback": 4,
+    "fastpath": 5,
+}
+
+
 class AdmissionTimeout(TimeoutError):
     """A call waited longer than its configured admission deadline."""
 
@@ -26,6 +39,9 @@ class ProviderLimits:
     max_inflight_requests: int = 4
     max_queued_agents: int = 8
     queue_timeout_seconds: float = 20.0
+    controller_reserve: int = 0
+    max_worker_concurrency: int | None = None
+    priority_policy: str = "fifo"
 
     def __post_init__(self) -> None:
         if self.max_concurrency is not None:
@@ -33,6 +49,16 @@ class ProviderLimits:
                 raise ValueError("max_concurrency must be positive")
             object.__setattr__(self, "max_active_agents", self.max_concurrency)
             object.__setattr__(self, "max_inflight_requests", self.max_concurrency)
+        if self.controller_reserve >= self.max_active_agents:
+            raise ValueError("controller_reserve must be below max_active_agents")
+        if self.max_worker_concurrency is None:
+            object.__setattr__(
+                self,
+                "max_worker_concurrency",
+                max(1, self.max_active_agents - self.controller_reserve),
+            )
+        if self.max_worker_concurrency is not None and self.max_worker_concurrency > self.max_active_agents:
+            raise ValueError("max_worker_concurrency cannot exceed max_active_agents")
 
 
 def apply_concurrency_env_override(
@@ -58,6 +84,7 @@ def apply_concurrency_env_override(
         max_concurrency=override,
         max_active_agents=override,
         max_inflight_requests=override,
+        max_worker_concurrency=max(1, override - limits.controller_reserve),
     )
 
 
@@ -66,6 +93,8 @@ class _Waiter:
     item_id: str
     deadline: float
     future: asyncio.Future[None]
+    lane: str = "worker"
+    enqueued_at: float = 0.0
 
 
 @dataclass
@@ -74,6 +103,8 @@ class _GroupWaiter:
     item_id: str
     deadline: float
     future: asyncio.Future[None]
+    lane: str = "worker"
+    enqueued_at: float = 0.0
 
 
 @dataclass
@@ -81,6 +112,7 @@ class _ProviderState:
     limits: ProviderLimits
     active_agents: set[str] = field(default_factory=set)
     active_requests: set[str] = field(default_factory=set)
+    request_lanes: dict[str, str] = field(default_factory=dict)
     agent_queue: deque[_Waiter] = field(default_factory=deque)
     request_queue: deque[_Waiter] = field(default_factory=deque)
     circuit_state: str = "healthy"
@@ -126,7 +158,16 @@ class ProviderAdmissionManager:
             deadline,
         )
 
-    async def acquire_request(self, provider_id: str, request_id: str, deadline: float | None = None) -> None:
+    async def acquire_request(
+        self,
+        provider_id: str,
+        request_id: str,
+        deadline: float | None = None,
+        *,
+        lane: str = "worker",
+    ) -> None:
+        if lane not in REQUEST_LANES:
+            raise ValueError(f"unknown provider request lane: {lane}")
         state = self._state(provider_id)
         await self._admit_circuit(state, request_id)
         try:
@@ -138,6 +179,7 @@ class ProviderAdmissionManager:
                 state.limits.max_inflight_requests,
                 None,
                 deadline,
+                lane=lane,
             )
         except BaseException:
             async with self._lock:
@@ -150,6 +192,8 @@ class ProviderAdmissionManager:
         provider_ids: tuple[str, ...] | list[str],
         request_id: str,
         deadline: float | None = None,
+        *,
+        lane: str = "worker",
     ) -> None:
         """Reserve one request slot from every possible group provider.
 
@@ -161,10 +205,12 @@ class ProviderAdmissionManager:
         it never holds one provider while waiting on another.
         """
         ordered = tuple(sorted(set(provider_ids)))
+        if lane not in REQUEST_LANES:
+            raise ValueError(f"unknown provider request lane: {lane}")
         if not ordered:
             return
         if len(ordered) == 1:
-            await self.acquire_request(ordered[0], request_id, deadline)
+            await self.acquire_request(ordered[0], request_id, deadline, lane=lane)
             return
         limits = [self._state(provider_id).limits for provider_id in ordered]
         end = deadline if deadline is not None else monotonic() + min(
@@ -176,6 +222,8 @@ class ProviderAdmissionManager:
             item_id=request_id,
             deadline=end,
             future=loop.create_future(),
+            lane=lane,
+            enqueued_at=monotonic(),
         )
         async with self._lock:
             self._group_queue.append(waiter)
@@ -226,7 +274,7 @@ class ProviderAdmissionManager:
                 if state.circuit_state == "half-open" and state.half_open_probe not in {None, waiter.item_id}:
                     ready = False
                     break
-                if len(state.active_requests) >= state.limits.max_inflight_requests:
+                if not self._request_capacity_available(state, waiter.lane):
                     ready = False
                     break
             if not ready:
@@ -234,6 +282,7 @@ class ProviderAdmissionManager:
             self._group_queue.remove(waiter)
             for state in states:
                 state.active_requests.add(waiter.item_id)
+                state.request_lanes[waiter.item_id] = waiter.lane
                 if state.circuit_state == "half-open":
                     state.half_open_probe = waiter.item_id
             if not waiter.future.done():
@@ -286,21 +335,54 @@ class ProviderAdmissionManager:
         """
         async with self._lock:
             state = self._state(provider_id)
-            if status_code in {429, 502, 503, 529}:
-                state.circuit_failures += 1
-                if state.circuit_state == "half-open" or state.circuit_failures >= 2:
-                    delay = retry_after_seconds if retry_after_seconds is not None else min(30.0, 2.0 ** state.circuit_failures)
-                    state.circuit_state = "open"
-                    state.circuit_open_until = monotonic() + max(1.0, delay)
-                    state.half_open_probe = None
-                else:
-                    state.circuit_state = "degraded"
+            if status_code in {408, 429, 500, 502, 503, 504, 529}:
+                self._record_circuit_failure(
+                    state,
+                    retry_after_seconds=retry_after_seconds,
+                )
                 return
             if 200 <= status_code < 300:
                 state.circuit_failures = 0
                 state.circuit_state = "healthy"
                 state.circuit_open_until = None
                 state.half_open_probe = None
+
+    async def record_transport_failure(
+        self,
+        provider_ids: tuple[str, ...] | list[str],
+        request_id: str,
+    ) -> None:
+        """Feed a connection/timeout failure into provider circuit state.
+
+        A request can fail before an HTTP response exists (DNS failure,
+        refused connection, TLS failure, read timeout, or remote protocol
+        reset). Those failures are provider health signals too. For a managed
+        group the physical provider is unknown, so all reserved candidates are
+        conservatively marked; admission already reserved all of them.
+        """
+        del request_id  # retained for a stable call-site/correlation contract
+        async with self._lock:
+            for provider_id in sorted(set(provider_ids)):
+                self._record_circuit_failure(self._state(provider_id))
+
+    @staticmethod
+    def _record_circuit_failure(
+        state: _ProviderState,
+        *,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        state.circuit_failures += 1
+        if state.circuit_state == "half-open" or state.circuit_failures >= 2:
+            delay = (
+                retry_after_seconds
+                if retry_after_seconds is not None
+                else min(30.0, 2.0 ** state.circuit_failures)
+            )
+            state.circuit_state = "open"
+            state.circuit_open_until = monotonic() + max(1.0, delay)
+            state.half_open_probe = None
+        else:
+            state.circuit_state = "degraded"
 
     async def _acquire(
         self,
@@ -311,14 +393,21 @@ class ProviderAdmissionManager:
         capacity: int,
         max_queue: int | None,
         deadline: float | None,
+        *,
+        lane: str = "agent",
     ) -> None:
         async with self._lock:
             if queue is state.request_queue and self._group_queue:
                 self._pump_group_queue()
             if item_id in active:
                 return
-            if not queue and len(active) < capacity:
+            if not queue and (
+                (lane == "agent" and len(active) < capacity)
+                or (lane != "agent" and self._request_capacity_available(state, lane))
+            ):
                 active.add(item_id)
+                if queue is state.request_queue:
+                    state.request_lanes[item_id] = lane
                 return
             if max_queue is not None and len(queue) >= max_queue:
                 raise AdmissionTimeout(f"provider queue is full for {item_id}")
@@ -327,6 +416,8 @@ class ProviderAdmissionManager:
                 item_id=item_id,
                 deadline=deadline if deadline is not None else monotonic() + state.limits.queue_timeout_seconds,
                 future=loop.create_future(),
+                lane=lane,
+                enqueued_at=monotonic(),
             )
             queue.append(waiter)
 
@@ -348,14 +439,54 @@ class ProviderAdmissionManager:
                     pass
             raise AdmissionTimeout(f"provider admission timed out for {item_id}") from exc
 
+    @staticmethod
+    def _request_capacity_available(state: _ProviderState, lane: str) -> bool:
+        if len(state.active_requests) >= state.limits.max_inflight_requests:
+            return False
+        if lane in {"controller", "critical", "verification"}:
+            return True
+        worker_count = sum(
+            current_lane not in {"controller", "critical", "verification"}
+            for current_lane in state.request_lanes.values()
+        )
+        return worker_count < int(state.limits.max_worker_concurrency or state.limits.max_inflight_requests)
+
     def _pump(self, state: _ProviderState, queue: deque[_Waiter], active: set[str], capacity: int) -> None:
         while queue and len(active) < capacity:
-            waiter = queue.popleft()
+            # Preserve FIFO within a lane, but do not let queued workers
+            # consume the controller reserve or block a critical request.
+            candidates = [
+                candidate for candidate in queue
+                if queue is not state.request_queue
+                or self._request_capacity_available(state, candidate.lane)
+            ]
+            if not candidates:
+                return
+            if queue is state.request_queue and state.limits.priority_policy == "strict":
+                # Priority is strict among currently eligible lanes, while a
+                # five-second age bonus prevents a permanently queued worker
+                # from starving under a sustained controller stream.
+                now = monotonic()
+                waiter = min(
+                    candidates,
+                    key=lambda candidate: (
+                        _LANE_PRIORITY.get(candidate.lane, 99)
+                        - (1 if now - candidate.enqueued_at >= 5.0 else 0),
+                        candidate.enqueued_at,
+                    ),
+                )
+            else:
+                waiter = candidates[0]
+            if waiter is None:
+                return
+            queue.remove(waiter)
             if waiter.future.cancelled() or waiter.deadline <= monotonic():
                 if not waiter.future.done():
                     waiter.future.set_exception(AdmissionTimeout(f"provider admission timed out for {waiter.item_id}"))
                 continue
             active.add(waiter.item_id)
+            if queue is state.request_queue:
+                state.request_lanes[waiter.item_id] = waiter.lane
             if not waiter.future.done():
                 waiter.future.set_result(None)
 
@@ -372,6 +503,7 @@ class ProviderAdmissionManager:
             for state in self._states.values():
                 if request_id in state.active_requests:
                     state.active_requests.remove(request_id)
+                    state.request_lanes.pop(request_id, None)
                     if state.half_open_probe == request_id:
                         state.half_open_probe = None
                     self._pump_group_queue()
@@ -392,6 +524,7 @@ class ProviderAdmissionManager:
                 if state is None or request_id not in state.active_requests:
                     continue
                 state.active_requests.remove(request_id)
+                state.request_lanes.pop(request_id, None)
                 if state.half_open_probe == request_id:
                     state.half_open_probe = None
             self._pump_group_queue()
@@ -437,14 +570,28 @@ class ProviderAdmissionManager:
         queued_groups = sum(
             provider_id in waiter.provider_ids for waiter in self._group_queue
         )
+        limits = asdict(state.limits)
+        # Keep the long-standing JSON shape for providers that use the
+        # default policy; emit the lane controls when an operator configures
+        # a non-default reserve or priority policy.
+        if limits.get("controller_reserve") == 0:
+            limits.pop("controller_reserve", None)
+        if limits.get("max_worker_concurrency") == state.limits.max_active_agents:
+            limits.pop("max_worker_concurrency", None)
+        if limits.get("priority_policy") == "fifo":
+            limits.pop("priority_policy", None)
         return {
             "provider_id": provider_id,
             "active_agents": len(state.active_agents),
             "active_requests": len(state.active_requests),
+            "active_request_lanes": {
+                lane: sum(current == lane for current in state.request_lanes.values())
+                for lane in sorted(set(state.request_lanes.values()))
+            },
             "queued_agents": len(state.agent_queue),
             "queued_requests": len(state.request_queue),
             "queued_group_requests": queued_groups,
-            "limits": asdict(state.limits),
+            "limits": limits,
             "circuit": {
                 "state": state.circuit_state,
                 "open_until_monotonic": state.circuit_open_until,

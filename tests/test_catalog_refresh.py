@@ -10,11 +10,12 @@ import pathlib
 import time
 from unittest import mock
 
+import httpx
 import pytest
 import yaml
 
 from enhanced_router.config_cli import refresh_catalogs
-from enhanced_router.provider_discovery import DiscoveredEndpoint
+from enhanced_router.provider_discovery import DiscoveredEndpoint, discover_openai_models
 from enhanced_router.registry import ModelRegistry
 
 
@@ -61,6 +62,56 @@ def _registry_with_providers(config_dir: pathlib.Path, provider_ids: list[str]) 
     return reg
 
 
+def test_discovery_requests_explicit_catalog_url_exactly_once(monkeypatch):
+    response = mock.Mock()
+    response.json.return_value = {"data": []}
+    response.raise_for_status.return_value = None
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        return response
+
+    with mock.patch("enhanced_router.provider_discovery.httpx.get", side_effect=fake_get):
+        discover_openai_models(
+            provider_id="acme", endpoint_id="openai",
+            catalog_url="https://example.test/v1/models", api_key="key",
+        )
+
+    assert calls == ["https://example.test/v1/models"]
+    assert all(not url.endswith("/models/models") for url in calls)
+
+
+def test_discovery_retries_transient_provider_failure(monkeypatch):
+    request = httpx.Request("GET", "https://example.test/v1/models")
+    responses = [
+        httpx.Response(503, request=request),
+        httpx.Response(200, request=request, json={"data": []}),
+    ]
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        return responses.pop(0)
+
+    monkeypatch.setattr("enhanced_router.provider_discovery.httpx.get", fake_get)
+    monkeypatch.setattr("enhanced_router.provider_discovery.random.uniform", lambda *_: 0.0)
+    monkeypatch.setattr("enhanced_router.provider_discovery.time.sleep", lambda *_: None)
+
+    discover_openai_models(
+        provider_id="acme",
+        endpoint_id="openai",
+        catalog_url="https://example.test/v1/models",
+        api_key="key",
+        max_attempts=2,
+    )
+
+    assert calls == [
+        "https://example.test/v1/models",
+        "https://example.test/v1/models",
+    ]
+
+
 class TestFetchDiscoveredEntries:
     def test_discovery_url_overrides_endpoint_lookup(self, config_dir, monkeypatch):
         reg = _registry_with_providers(config_dir, ["acme"])
@@ -78,7 +129,7 @@ class TestFetchDiscoveredEntries:
         with mock.patch("enhanced_router.provider_discovery.discover_openai_models", side_effect=fake_discover):
             reg.fetch_discovered_entries("acme")
 
-        assert captured["base_url"] == "https://catalog.acme.invalid/v1"
+        assert captured["catalog_url"] == "https://catalog.acme.invalid/v1"
 
     def test_falls_back_to_endpoint_when_no_discovery_url(self, config_dir, monkeypatch):
         reg = _registry_with_providers(config_dir, ["acme"])
@@ -93,7 +144,27 @@ class TestFetchDiscoveredEntries:
         with mock.patch("enhanced_router.provider_discovery.discover_openai_models", side_effect=fake_discover):
             reg.fetch_discovered_entries("acme")
 
-        assert captured["base_url"] == "https://acme.example.invalid/v1"
+        assert captured["catalog_url"] == "https://acme.example.invalid/v1/models"
+
+    def test_fallback_endpoint_does_not_duplicate_models_suffix(self, config_dir, monkeypatch):
+        reg = _registry_with_providers(config_dir, ["acme"])
+        reg._providers["acme"] = reg._providers["acme"].model_copy(
+            update={"endpoints": {"openai": "https://acme.example.invalid/v1/models"}}
+        )
+        monkeypatch.setenv("ACME_API_KEY", "test-key")
+        captured = {}
+
+        def fake_discover(**kwargs):
+            captured.update(kwargs)
+            return []
+
+        with mock.patch(
+            "enhanced_router.provider_discovery.discover_openai_models",
+            side_effect=fake_discover,
+        ):
+            reg.fetch_discovered_entries("acme")
+
+        assert captured["catalog_url"] == "https://acme.example.invalid/v1/models"
 
     def test_fetch_does_not_mutate_registry_state(self, config_dir, monkeypatch):
         reg = _registry_with_providers(config_dir, ["acme"])
@@ -105,6 +176,33 @@ class TestFetchDiscoveredEntries:
             reg.fetch_discovered_entries("acme")
         assert "acme/model-x" not in reg.models
         assert not (config_dir / "discovered_models.yaml").exists()
+
+    def test_fetch_reads_keyring_before_router_materializes_credentials(
+        self, config_dir, monkeypatch
+    ):
+        reg = _registry_with_providers(config_dir, ["acme"])
+        monkeypatch.delenv("ACME_API_KEY", raising=False)
+        monkeypatch.setattr(
+            "enhanced_router.credential_store.resolve_loaded",
+            lambda *_args: None,
+        )
+        monkeypatch.setattr(
+            "enhanced_router.credential_store.resolve",
+            lambda *_args: "keyring-test-value",
+        )
+        captured = {}
+
+        def fake_discover(**kwargs):
+            captured.update(kwargs)
+            return []
+
+        with mock.patch(
+            "enhanced_router.provider_discovery.discover_openai_models",
+            side_effect=fake_discover,
+        ):
+            reg.fetch_discovered_entries("acme")
+
+        assert captured["api_key"] == "keyring-test-value"
 
 
 class TestApplyDiscoveredEntries:

@@ -3,7 +3,6 @@
 import json
 import sys
 import pathlib
-from pathlib import Path
 
 # Add hooks directory to path to import ledger_io
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "hooks"))
@@ -243,7 +242,7 @@ def test_cache_file_created_and_updated(tmp_path):
     append_jsonl(ledger_path, record1)
 
     # First read should create cache
-    result1 = read_jsonl_cached(ledger_path)
+    read_jsonl_cached(ledger_path)
     assert cache_path.exists()
 
     cache_data = json.loads(cache_path.read_text(encoding="utf-8"))

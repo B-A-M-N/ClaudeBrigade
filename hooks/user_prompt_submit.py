@@ -110,11 +110,24 @@ def main() -> int:
             or os.environ.get("CLAUDE_BRIGADE_PROFILE")
             or "hybrid"
         )
+        selected_workflow = None
+        launch_preset_id = run_row.get("launch_preset_id") if run_row else None
+        if launch_preset_id:
+            try:
+                from enhanced_router.registry import get_registry
+                selected_workflow = get_registry().get_launch_preset(
+                    str(launch_preset_id)
+                ).workflow_id
+            except (KeyError, ValueError):
+                # The run remains safe: the minimum task tier is still used.
+                # Invalid preset references are reported by registry
+                # validation rather than silently changing an active epoch.
+                selected_workflow = None
         contract = state.begin_task(
             run_id=run_id,
             session_id=session,
             cwd=str(cwd),
-            workflow_id=minimum_tier,
+            workflow_id=selected_workflow or minimum_tier,
             profile_id=profile_id,
             signals=features.risk_signals,
             prompt=prompt,

@@ -11,15 +11,19 @@ mixin's normal method resolution order.
 
 from __future__ import annotations
 
+from enhanced_router.repository_base import RepositoryMixin
+
 import sqlite3
 from datetime import datetime, timezone
+
+from enhanced_router.model_health_state import evaluate_model_health
 
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-class ProviderReservationRepository:
+class ProviderReservationRepository(RepositoryMixin):
     """Mixin providing provider-reservation persistence methods.
 
     Requires a host class that provides ``_new_conn() -> sqlite3.Connection``
@@ -43,41 +47,28 @@ class ProviderReservationRepository:
         reason: str = "",
         enqueue: bool = True,
         model_id: str | None = None,
+        health_max_age_seconds: float | None = None,
+        allow_untested_models: bool | None = None,
+        lane_limit: int | None = None,
     ) -> dict:
         """Reserve a provider-wide native-agent slot durably.
 
         This complements the in-process request admission manager.  A queued
         native agent is not spawned until this record becomes ``reserved``.
 
-        When *model_id* is given and *enqueue* is False, an unhealthy model
-        (its latest health record showing reachable/authenticated/compatible
-        not all true) refuses the immediate reservation the same way an
-        exhausted capacity slot does -- model_health_state was previously
-        only consulted for /v1/models listing and recommend()'s scoring, not
-        at actual admission time. A model with no health record yet
-        (untested) is not blocked here; only a confirmed-unhealthy one is.
-        Reservations aren't per-model rows, so a caller that enqueues
-        (enqueue=True) is not re-checked against health when later admitted
-        by admit_provider_agents -- this only gates the immediate-or-refuse
-        decision, not the queue.
+        When *model_id* is given, the latest model-health record is checked at
+        both queue time and promotion time.  A model with no health record is
+        admitted only when *allow_untested_models* permits it.  Stale or
+        failed records never remain silently queued until a provider slot
+        happens to become available.
         """
         if max_active < 1:
             raise ValueError("max_active must be positive")
-        if model_id is not None and not enqueue:
-            health = self.get_model_health(model_id)
-            if health is not None and not (
-                health.get("reachable") and health.get("authenticated") and health.get("compatible")
-            ):
-                return {
-                    "reservation_id": reservation_id,
-                    "run_id": run_id,
-                    "epoch_id": epoch_id,
-                    "provider_id": provider_id,
-                    "execution_id": execution_id,
-                    "lane": lane,
-                    "state": "unavailable",
-                    "reason": f"model {model_id!r} failed its latest health check",
-                }
+        health_max_age_seconds, allow_untested_models = self._provider_health_policy(
+            provider_id,
+            health_max_age_seconds=health_max_age_seconds,
+            allow_untested_models=allow_untested_models,
+        )
         conn = self._new_conn()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -87,10 +78,52 @@ class ProviderReservationRepository:
             if existing:
                 conn.commit()
                 return dict(existing)
+            if model_id is not None:
+                health_row = conn.execute(
+                    "SELECT status, reachable, authenticated, compatible, checked_at "
+                    "FROM model_health WHERE model_id=? ORDER BY checked_at DESC LIMIT 1",
+                    (model_id,),
+                ).fetchone()
+                health = evaluate_model_health(
+                    health_row,
+                    max_age_seconds=health_max_age_seconds,
+                    allow_untested=allow_untested_models,
+                )
+                if not bool(health["admissible"]):
+                    conn.rollback()
+                    return {
+                        "reservation_id": reservation_id,
+                        "run_id": run_id,
+                        "epoch_id": epoch_id,
+                        "provider_id": provider_id,
+                        "execution_id": execution_id,
+                        "lane": lane,
+                        "model_id": model_id,
+                        "state": "unavailable",
+                        "reason": f"model {model_id!r} is {health['status']}: {health['reason']}",
+                    }
             active = conn.execute(
                 "SELECT COUNT(*) FROM provider_reservations WHERE provider_id=? AND state='reserved'",
                 (provider_id,),
             ).fetchone()[0]
+            lane_active = conn.execute(
+                "SELECT COUNT(*) FROM provider_reservations "
+                "WHERE provider_id=? AND lane=? AND state='reserved'",
+                (provider_id, lane),
+            ).fetchone()[0]
+            if lane_limit is not None and int(lane_active) >= lane_limit and not enqueue:
+                conn.rollback()
+                return {
+                    "reservation_id": reservation_id,
+                    "run_id": run_id,
+                    "epoch_id": epoch_id,
+                    "provider_id": provider_id,
+                    "execution_id": execution_id,
+                    "lane": lane,
+                    "model_id": model_id,
+                    "state": "unavailable",
+                    "reason": reason,
+                }
             if int(active) >= max_active and not enqueue:
                 conn.rollback()
                 return {
@@ -100,6 +133,7 @@ class ProviderReservationRepository:
                     "provider_id": provider_id,
                     "execution_id": execution_id,
                     "lane": lane,
+                    "model_id": model_id,
                     "state": "unavailable",
                     "reason": reason,
                 }
@@ -107,9 +141,10 @@ class ProviderReservationRepository:
             now = _utcnow()
             conn.execute(
                 "INSERT INTO provider_reservations (reservation_id, run_id, epoch_id, provider_id, execution_id,"
-                " lane, state, queued_at, admitted_at, deadline_at, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " lane, state, queued_at, admitted_at, deadline_at, reason, model_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (reservation_id, run_id, epoch_id, provider_id, execution_id, lane, status, now,
-                 now if status == "reserved" else None, deadline_at, reason),
+                 now if status == "reserved" else None, deadline_at, reason, model_id),
             )
             conn.commit()
             row = conn.execute("SELECT * FROM provider_reservations WHERE reservation_id=?", (reservation_id,)).fetchone()
@@ -121,8 +156,37 @@ class ProviderReservationRepository:
         finally:
             conn.close()
 
-    def provider_agent_capacity_available(self, provider_id: str, max_active: int) -> bool:
+    def provider_agent_capacity_available(
+        self,
+        provider_id: str,
+        max_active: int,
+        lane: str = "worker",
+        lane_limit: int | None = None,
+    ) -> bool:
         """Return whether a native Agent may be spawned immediately."""
+        return self.provider_agent_capacity_remaining(
+            provider_id,
+            max_active,
+            lane=lane,
+            lane_limit=lane_limit,
+        ) > 0
+
+    def provider_agent_capacity_remaining(
+        self,
+        provider_id: str,
+        max_active: int,
+        lane: str = "worker",
+        lane_limit: int | None = None,
+    ) -> int:
+        """Return immediate capacity for a provider/lane.
+
+        Runnable-action waves use this to avoid advertising more work than a
+        provider can admit.  Claims still perform the authoritative atomic
+        reservation, so this helper is an optimization for scheduling and
+        never replaces claim-time admission.
+        """
+        if max_active < 1:
+            return 0
         conn = self._new_conn()
         try:
             active = conn.execute(
@@ -130,13 +194,40 @@ class ProviderReservationRepository:
                 "WHERE provider_id=? AND state='reserved'",
                 (provider_id,),
             ).fetchone()[0]
-            return int(active) < max_active
+            remaining = max(0, int(max_active) - int(active))
+            if lane_limit is None:
+                return remaining
+            lane_active = conn.execute(
+                "SELECT COUNT(*) FROM provider_reservations "
+                "WHERE provider_id=? AND lane=? AND state='reserved'",
+                (provider_id, lane),
+            ).fetchone()[0]
+            return max(0, min(remaining, int(lane_limit) - int(lane_active)))
         finally:
             conn.close()
 
-    def admit_provider_agents(self, provider_id: str, max_active: int) -> list[dict]:
+    def admit_provider_agents(
+        self,
+        provider_id: str,
+        max_active: int,
+        *,
+        health_max_age_seconds: float | None = None,
+        allow_untested_models: bool | None = None,
+    ) -> list[dict]:
+        """Promote queued reservations whose model route is still admissible.
+
+        Health is checked in the same ``BEGIN IMMEDIATE`` transaction that
+        promotes the reservation.  A stale/unhealthy candidate is terminally
+        expired and skipped, allowing a later healthy candidate to use the
+        newly available slot without being blocked by FIFO poison.
+        """
+        health_max_age_seconds, allow_untested_models = self._provider_health_policy(
+            provider_id,
+            health_max_age_seconds=health_max_age_seconds,
+            allow_untested_models=allow_untested_models,
+        )
         conn = self._new_conn()
-        admitted: list[dict] = []
+        admitted_ids: list[str] = []
         try:
             conn.execute("BEGIN IMMEDIATE")
             active = int(conn.execute(
@@ -145,23 +236,76 @@ class ProviderReservationRepository:
             ).fetchone()[0])
             capacity = max(0, max_active - active)
             rows = conn.execute(
-                "SELECT reservation_id FROM provider_reservations WHERE provider_id=? AND state='queued'"
-                " ORDER BY queued_at, reservation_id LIMIT ?", (provider_id, capacity),
+                "SELECT reservation_id, model_id FROM provider_reservations "
+                "WHERE provider_id=? AND state='queued' "
+                "ORDER BY queued_at, reservation_id", (provider_id,),
             ).fetchall()
             now = _utcnow()
             for row in rows:
+                if len(admitted_ids) >= capacity:
+                    break
+                model_id = row[1]
+                if model_id:
+                    health_row = conn.execute(
+                        "SELECT status, reachable, authenticated, compatible, checked_at "
+                        "FROM model_health WHERE model_id=? ORDER BY checked_at DESC LIMIT 1",
+                        (model_id,),
+                    ).fetchone()
+                    health = evaluate_model_health(
+                        health_row,
+                        max_age_seconds=health_max_age_seconds,
+                        allow_untested=allow_untested_models,
+                    )
+                    if not bool(health["admissible"]):
+                        conn.execute(
+                            "UPDATE provider_reservations SET state='expired', released_at=?, "
+                            "reason=? WHERE reservation_id=? AND state='queued'",
+                            (now, f"model {model_id!r} is {health['status']}: {health['reason']}", row[0]),
+                        )
+                        continue
                 conn.execute(
                     "UPDATE provider_reservations SET state='reserved', admitted_at=? WHERE reservation_id=?",
                     (now, row[0]),
                 )
+                admitted_ids.append(str(row[0]))
             conn.commit()
-            for row in rows:
-                item = conn.execute("SELECT * FROM provider_reservations WHERE reservation_id=?", (row[0],)).fetchone()
+            result_rows = []
+            for reservation_id in admitted_ids:
+                item = conn.execute("SELECT * FROM provider_reservations WHERE reservation_id=?", (reservation_id,)).fetchone()
                 if item:
-                    admitted.append(dict(item))
-            return admitted
+                    result_rows.append(dict(item))
+            return result_rows
         finally:
             conn.close()
+
+    def _provider_health_policy(
+        self,
+        provider_id: str,
+        *,
+        health_max_age_seconds: float | None,
+        allow_untested_models: bool | None,
+    ) -> tuple[float, bool]:
+        """Resolve provider health policy without making registry admission mandatory."""
+        if health_max_age_seconds is None or allow_untested_models is None:
+            try:
+                from enhanced_router.registry import get_registry
+
+                provider = get_registry().providers.get(provider_id)
+            except Exception:
+                provider = None
+            if provider is not None:
+                if health_max_age_seconds is None:
+                    health_max_age_seconds = float(
+                        getattr(provider, "health_max_age_seconds", 900.0)
+                    )
+                if allow_untested_models is None:
+                    allow_untested_models = bool(
+                        getattr(provider, "allow_untested_models", True)
+                    )
+        return (
+            float(health_max_age_seconds if health_max_age_seconds is not None else 900.0),
+            bool(True if allow_untested_models is None else allow_untested_models),
+        )
 
     def release_provider_reservation(self, reservation_id: str, state: str = "released") -> dict | None:
         if state not in {"released", "expired", "cancelled"}:

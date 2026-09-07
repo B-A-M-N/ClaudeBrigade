@@ -19,6 +19,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Literal
+from weakref import WeakKeyDictionary
 
 from pydantic import BaseModel
 import httpx
@@ -219,6 +220,16 @@ class ResolvedRoute:
     provider_ids: tuple[str, ...] = ()
     deployment_policy_digest: str | None = None
     controller_binding_id: int | None = None
+    # Router-owned bounded work can declare a lower-priority request lane
+    # without being mistaken for a native controller request.
+    request_lane: str = "worker"
+    # Managed-group attribution is populated only after LiteLLM reports a
+    # physical deployment and the router validates it against the immutable
+    # allowed deployment set.  It is telemetry, never an authority for route
+    # selection or admission.
+    deployment_attribution_source: str | None = None
+    reported_deployment_id: str | None = None
+    deployment_identity_trusted: bool = False
 
 
 # Compatibility exports for callers that only need the four stable role
@@ -378,35 +389,85 @@ def _remove_local_router_credential(headers: dict[str, str]) -> None:
 # Proxy implementations
 # ---------------------------------------------------------------------------
 
-# Shared external upstream HTTP client (lazily initialized per event loop).
-_client: Any = None
+# Shared external upstream clients, one per event loop.  An AsyncClient owns
+# loop-bound transports; a single process-global client can otherwise be
+# reused after a TestClient/server restart and fail with cross-loop or closed
+# transport errors.  Weak keys let retired event loops release their client
+# references even if application shutdown was interrupted.
+_clients_by_loop: WeakKeyDictionary[Any, Any] = WeakKeyDictionary()
+_retired_clients_by_loop: WeakKeyDictionary[Any, list[Any]] = WeakKeyDictionary()
+
+
+def _new_upstream_client() -> Any:
+    """Create a provider-neutral HTTP client with bounded connection pools.
+
+    OpenRouter, NVIDIA NIM, FreeInference, and other OpenAI/Anthropic
+    compatible gateways all use this transport layer.  The client is shared
+    per event loop so healthy keep-alive connections are reused, but a broken
+    pool can be replaced without closing a client that may still serve an
+    unrelated in-flight stream.
+    """
+    import httpx
+
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(
+            connect=30.0, read=90.0, write=120.0, pool=30.0
+        ),
+        follow_redirects=False,
+        limits=httpx.Limits(
+            max_connections=100,
+            max_keepalive_connections=20,
+            keepalive_expiry=30.0,
+        ),
+    )
 
 
 def get_upstream_client() -> Any:
-    global _client
-    if _client is None:
-        import httpx
+    loop = asyncio.get_running_loop()
+    client = _clients_by_loop.get(loop)
+    if client is None or bool(getattr(client, "is_closed", False)):
+        client = _new_upstream_client()
+        _clients_by_loop[loop] = client
+    return client
 
-        _client = httpx.AsyncClient(
-            timeout=httpx.Timeout(
-                connect=30.0, read=90.0, write=120.0, pool=30.0
-            ),
-            follow_redirects=False,
-            limits=httpx.Limits(
-                max_connections=100,
-                max_keepalive_connections=20,
-                keepalive_expiry=30.0,
-            ),
-        )
-    return _client
+
+def recycle_upstream_client(client: Any) -> Any:
+    """Replace a client after a connection/pool failure.
+
+    Do not close the old client synchronously: another request on the same
+    event loop may still be streaming through it.  Retired clients are closed
+    during application shutdown, after all request handlers have drained.
+    The failed request receives a fresh pool on its next attempt.
+    """
+    loop = asyncio.get_running_loop()
+    current = _clients_by_loop.get(loop)
+    if current is client:
+        _clients_by_loop.pop(loop, None)
+        retired = _retired_clients_by_loop.setdefault(loop, [])
+        if client not in retired:
+            retired.append(client)
+    return get_upstream_client()
 
 
 async def close_upstream_client() -> None:
-    """Close the module-level HTTPX client if it was created."""
-    global _client
-    if _client is not None:
-        await _client.aclose()
-        _client = None
+    """Close every loop-owned HTTPX client created by this process."""
+    clients: list[Any] = list(_clients_by_loop.values())
+    for retired in _retired_clients_by_loop.values():
+        clients.extend(retired)
+    _clients_by_loop.clear()
+    _retired_clients_by_loop.clear()
+    seen: set[int] = set()
+    for client in clients:
+        if id(client) in seen:
+            continue
+        seen.add(id(client))
+        try:
+            if not bool(getattr(client, "is_closed", False)):
+                await client.aclose()
+        except Exception:
+            # Shutdown must continue releasing state and provider permits;
+            # a stale transport is not allowed to mask the real teardown.
+            LOGGER.warning("failed to close an upstream HTTP client", exc_info=True)
 
 
 
@@ -664,7 +725,7 @@ async def _send_with_provider_retry(
         provider = get_registry().providers.get(resolved.provider_id or "")
         if provider is not None:
             max_attempts = max(1, provider.retry.max_attempts)
-            retryable = set(provider.retry.retryable_statuses)
+            retryable = {int(status) for status in provider.retry.retryable_statuses}
             max_backoff = provider.retry.max_backoff_seconds
     except (ImportError, AttributeError, RuntimeError):
         pass
@@ -679,12 +740,20 @@ async def _send_with_provider_retry(
             raise
         except (httpx.HTTPError, TimeoutError) as exc:
             last_error = exc
+            await _provider_admission.record_transport_failure(
+                _provider_ids_for_route(resolved), request_id or "transport-failure",
+            )
             if attempt + 1 >= max_attempts:
                 raise
             if not await _provider_admission.retry_allowed(
                 _provider_ids_for_route(resolved), request_id or "retry",
             ):
                 raise AdmissionTimeout("provider circuit opened during retry")
+            # A failed keep-alive connection, TLS session, or pool can remain
+            # cached by HTTPX.  Retry the same immutable route through a new
+            # pool so OpenRouter/NIM/FreeInference outages do not poison every
+            # subsequent request on this event loop.
+            client = recycle_upstream_client(client)
             ceiling = min(max_backoff, 0.5 * (2**attempt))
             delay = random.uniform(0.0, max(0.1, ceiling))
             _, _, wall_seconds = _provider_stream_deadlines(resolved)
@@ -702,6 +771,7 @@ async def _send_with_provider_retry(
                 _provider_ids_for_route(resolved), request_id or "retry",
             ):
                 raise AdmissionTimeout("provider circuit opened during retry")
+            client = recycle_upstream_client(client)
             ceiling = min(max_backoff, retry_after or 0.5 * (2**attempt))
             delay = random.uniform(0.0, max(0.1, ceiling))
             _, _, wall_seconds = _provider_stream_deadlines(resolved)
@@ -711,6 +781,82 @@ async def _send_with_provider_retry(
             continue
         await _record_provider_response(resolved, request_id, response)
         return response
+
+    raise RuntimeError("provider request exhausted its retry budget") from last_error
+
+
+async def _request_non_streaming_with_provider_retry(
+    client: Any,
+    request_builder: Any,
+    resolved: "ResolvedRoute",
+    started_at: float,
+    request_id: str | None,
+) -> tuple[Any, bytes]:
+    """Send and fully read a non-streaming request with bounded retries.
+
+    A successful response header is not enough for a JSON request: gateways
+    can reset the connection while the body is being read.  In that case no
+    model output has been exposed to the caller, so replaying the immutable
+    request is safe and materially more reliable for flaky free gateways.
+    Streaming requests intentionally stay on ``_send_with_provider_retry``;
+    once bytes are yielded they are never replayed.
+    """
+    max_attempts = 1
+    max_backoff = 15.0
+    try:
+        from enhanced_router.registry import get_registry
+
+        provider = get_registry().providers.get(resolved.provider_id or "")
+        if provider is not None:
+            max_attempts = max(1, provider.retry.max_attempts)
+            max_backoff = provider.retry.max_backoff_seconds
+    except (ImportError, AttributeError, RuntimeError):
+        pass
+
+    response: Any | None = None
+    last_error: BaseException | None = None
+    for attempt in range(max_attempts):
+        response = None
+        try:
+            # Keep the common send seam authoritative.  It owns response
+            # status retries and transport retry telemetry; this helper adds
+            # only the extra retry that is safe before a non-streaming body
+            # has been exposed.
+            response = await _send_with_provider_retry(
+                client, request_builder, resolved, started_at, request_id
+            )
+            content = await _read_with_deadline(response, resolved, started_at)
+            return response, content
+        except asyncio.CancelledError:
+            raise
+        except (httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout, TimeoutError, asyncio.TimeoutError) as exc:
+            last_error = exc
+            if response is not None:
+                try:
+                    await response.aclose()
+                except Exception:
+                    LOGGER.debug("failed to close failed non-stream response", exc_info=True)
+                response = None
+            await _provider_admission.record_transport_failure(
+                _provider_ids_for_route(resolved), request_id or "transport-failure",
+            )
+            if attempt + 1 >= max_attempts:
+                raise
+            if not await _provider_admission.retry_allowed(
+                _provider_ids_for_route(resolved), request_id or "retry",
+            ):
+                raise AdmissionTimeout("provider circuit opened during retry")
+            client = recycle_upstream_client(client)
+            ceiling = min(max_backoff, 0.5 * (2**attempt))
+            delay = random.uniform(0.0, max(0.1, ceiling))
+            _, _, wall_seconds = _provider_stream_deadlines(resolved)
+            if time.perf_counter() - started_at + delay >= wall_seconds:
+                raise TimeoutError("provider retry budget exceeded request wall deadline") from exc
+            await asyncio.sleep(delay)
+        except Exception:
+            if response is not None:
+                await response.aclose()
+            raise
 
     raise RuntimeError("provider request exhausted its retry budget") from last_error
 
@@ -726,6 +872,7 @@ async def post_openai_compatible_json(
     request_id: str,
     extra_headers: dict[str, str] | None = None,
     timeout_seconds: float | None = None,
+    request_lane: str = "worker",
 ) -> dict[str, Any]:
     """Send one bounded non-streaming OpenAI-compatible request.
 
@@ -744,6 +891,7 @@ async def post_openai_compatible_json(
         api_key_env=api_key_env,
         provider_id=provider_id,
         endpoint_id=endpoint_id or "openai-chat",
+        request_lane=request_lane,
     )
     headers = {
         "authorization": f"Bearer {key}",
@@ -762,35 +910,37 @@ async def post_openai_compatible_json(
     client = get_upstream_client()
     upstream_response: Any | None = None
     try:
-        send = _send_with_provider_retry(
-            client,
-            lambda: client.build_request(
-                request.method,
-                str(request.url),
-                headers=dict(request.headers),
-                content=body,
-            ),
-            route,
-            started_at,
-            admission_id,
-        )
         if timeout_seconds is not None:
-            upstream_response = await asyncio.wait_for(
-                send,
+            upstream_response, content = await asyncio.wait_for(
+                _request_non_streaming_with_provider_retry(
+                    client,
+                    lambda: client.build_request(
+                        request.method,
+                        str(request.url),
+                        headers=dict(request.headers),
+                        content=body,
+                    ),
+                    route,
+                    started_at,
+                    admission_id,
+                ),
                 timeout=max(0.001, timeout_seconds - (time.perf_counter() - started_at)),
             )
         else:
-            upstream_response = await send
+            upstream_response, content = await _request_non_streaming_with_provider_retry(
+                client,
+                lambda: client.build_request(
+                    request.method,
+                    str(request.url),
+                    headers=dict(request.headers),
+                    content=body,
+                ),
+                route,
+                started_at,
+                admission_id,
+            )
         if upstream_response is None:
             raise RuntimeError("OpenAI-compatible upstream returned no response")
-        read = _read_with_deadline(upstream_response, route, started_at)
-        if timeout_seconds is not None:
-            content = await asyncio.wait_for(
-                read,
-                timeout=max(0.001, timeout_seconds - (time.perf_counter() - started_at)),
-            )
-        else:
-            content = await read
         upstream_response.raise_for_status()
     finally:
         try:
@@ -932,7 +1082,12 @@ def _route_with_reported_deployment(
             "managed deployment identity is unknown or ambiguous model=%s reported=%s",
             resolved.model_id, reported,
         )
-        return resolved
+        return replace(
+            resolved,
+            reported_deployment_id=reported,
+            deployment_attribution_source="response_header_unknown",
+            deployment_identity_trusted=False,
+        )
     provider_id = resolved.provider_id
     try:
         from enhanced_router.registry import get_registry
@@ -943,7 +1098,51 @@ def _route_with_reported_deployment(
             provider_id = endpoint.provider_id or spec.provider_id
     except (KeyError, AttributeError, RuntimeError):
         pass
-    return replace(resolved, endpoint_id=endpoint_id, provider_id=provider_id)
+    return replace(
+        resolved,
+        endpoint_id=endpoint_id,
+        provider_id=provider_id,
+        reported_deployment_id=reported,
+        deployment_attribution_source="validated_response_header",
+        deployment_identity_trusted=True,
+    )
+
+
+def _record_litellm_attribution(
+    resolved: "ResolvedRoute",
+    request_id: str | None,
+    response: Any,
+) -> None:
+    """Persist validated physical-deployment attribution for a response.
+
+    Response headers are useful telemetry only after the reported deployment
+    is checked against the binding's immutable allow-list.  Unknown or absent
+    identities remain explicitly untrusted and never reduce admission.
+    """
+    if not request_id or not resolved.allowed_deployments:
+        return
+    observed = _route_with_reported_deployment(
+        resolved, getattr(response, "headers", {})
+    )
+    try:
+        from enhanced_router.state import get_state
+
+        get_state().record_litellm_request_attribution(
+            request_id=request_id,
+            generation=resolved.catalog_generation,
+            agent_binding_id=resolved.agent_binding_id,
+            logical_model_id=resolved.model_id,
+            requested_provider_ids=list(resolved.provider_ids),
+            allowed_deployments=list(resolved.allowed_deployments),
+            reported_deployment_id=observed.reported_deployment_id,
+            actual_provider_id=observed.provider_id if observed.deployment_identity_trusted else None,
+            actual_endpoint_id=observed.endpoint_id if observed.deployment_identity_trusted else None,
+            attribution_source=observed.deployment_attribution_source or "not_reported",
+            trusted=observed.deployment_identity_trusted,
+            status_code=int(getattr(response, "status_code", 0) or 0),
+        )
+    except Exception:
+        LOGGER.exception("failed to persist LiteLLM deployment attribution")
 
 
 async def _acquire_provider_request(
@@ -962,10 +1161,15 @@ async def _acquire_provider_request(
     except Exception:
         LOGGER.debug("request could not be correlated to an execution", exc_info=True)
     try:
+        lane = (
+            "controller"
+            if resolved.controller_binding_id is not None
+            else str(getattr(resolved, "request_lane", "worker") or "worker")
+        )
         if len(provider_ids) > 1:
-            await _provider_admission.acquire_request_group(provider_ids, request_id)
+            await _provider_admission.acquire_request_group(provider_ids, request_id, lane=lane)
         elif provider_ids:
-            await _provider_admission.acquire_request(next(iter(provider_ids)), request_id)
+            await _provider_admission.acquire_request(next(iter(provider_ids)), request_id, lane=lane)
     except AdmissionTimeout as exc:
         raise RuntimeError(f"provider request admission timed out: {exc}") from exc
     if resolved.catalog_generation is not None and _litellm_supervisor is not None:
@@ -1020,6 +1224,7 @@ async def _record_provider_response(
     if not request_id:
         return
     reported = _route_with_reported_deployment(resolved, getattr(response, "headers", {}))
+    _record_litellm_attribution(resolved, request_id, response)
     provider_id = reported.provider_id
     # With several managed providers and no trusted deployment identity, do
     # not attribute a failure to every provider.  The request reservation is
@@ -1075,15 +1280,27 @@ async def proxy_anthropic_passthrough(
         )
         if admission_id is None:
             raise RuntimeError("Anthropic passthrough admission did not return a request ID")
-        upstream_response = await _send_with_provider_retry(
-            client,
-            lambda: client.build_request(
-                request.method, url, headers=headers, content=body
-            ),
-            admission_route,
-            started_at,
-            admission_id,
-        )
+        if is_streaming:
+            upstream_response = await _send_with_provider_retry(
+                client,
+                lambda: client.build_request(
+                    request.method, url, headers=headers, content=body
+                ),
+                admission_route,
+                started_at,
+                admission_id,
+            )
+            content = None
+        else:
+            upstream_response, content = await _request_non_streaming_with_provider_retry(
+                client,
+                lambda: client.build_request(
+                    request.method, url, headers=headers, content=body
+                ),
+                admission_route,
+                started_at,
+                admission_id,
+            )
     except Exception as exc:
         await _release_provider_request(admission_route, admission_id)
         return JSONResponse(
@@ -1107,7 +1324,8 @@ async def proxy_anthropic_passthrough(
         )
 
     try:
-        content = await _read_with_deadline(upstream_response, admission_route, started_at)
+        if content is None:
+            raise RuntimeError("non-streaming upstream response had no body")
     finally:
         await upstream_response.aclose()
         await _release_provider_request(admission_route, admission_id)
@@ -1191,15 +1409,27 @@ async def proxy_anthropic_passthrough_worker(
         )
         if admission_id is None:
             raise RuntimeError("Anthropic passthrough admission did not return a request ID")
-        upstream_response = await _send_with_provider_retry(
-            client,
-            lambda: client.build_request(
-                request.method, url, headers=headers, content=body
-            ),
-            admission_route,
-            started_at,
-            admission_id,
-        )
+        if is_streaming:
+            upstream_response = await _send_with_provider_retry(
+                client,
+                lambda: client.build_request(
+                    request.method, url, headers=headers, content=body
+                ),
+                admission_route,
+                started_at,
+                admission_id,
+            )
+            content = None
+        else:
+            upstream_response, content = await _request_non_streaming_with_provider_retry(
+                client,
+                lambda: client.build_request(
+                    request.method, url, headers=headers, content=body
+                ),
+                admission_route,
+                started_at,
+                admission_id,
+            )
     except Exception as exc:
         await _release_provider_request(admission_route, admission_id)
         LOGGER.warning(
@@ -1227,7 +1457,8 @@ async def proxy_anthropic_passthrough_worker(
         )
 
     try:
-        content = await _read_with_deadline(upstream_response, admission_route, started_at)
+        if content is None:
+            raise RuntimeError("non-streaming upstream response had no body")
     finally:
         await upstream_response.aclose()
         await _release_provider_request(admission_route, admission_id)
@@ -1390,13 +1621,23 @@ async def proxy_direct_anthropic(
     except RuntimeError as exc:
         return JSONResponse(status_code=429, content={"error": {"type": "provider_queue_timeout", "message": str(exc)}})
     try:
-        upstream_response = await _send_with_provider_retry(
-            client,
-            lambda: client.build_request(request.method, url, headers=cleaned, content=body),
-            resolved,
-            started_at,
-            admission_id,
-        )
+        if is_streaming:
+            upstream_response = await _send_with_provider_retry(
+                client,
+                lambda: client.build_request(request.method, url, headers=cleaned, content=body),
+                resolved,
+                started_at,
+                admission_id,
+            )
+            content = None
+        else:
+            upstream_response, content = await _request_non_streaming_with_provider_retry(
+                client,
+                lambda: client.build_request(request.method, url, headers=cleaned, content=body),
+                resolved,
+                started_at,
+                admission_id,
+            )
     except Exception as exc:
         await _release_provider_request(resolved, admission_id)
         LOGGER.warning(
@@ -1424,7 +1665,8 @@ async def proxy_direct_anthropic(
         )
 
     try:
-        content = await _read_with_deadline(upstream_response, resolved, started_at)
+        if content is None:
+            raise RuntimeError("non-streaming upstream response had no body")
     finally:
         await upstream_response.aclose()
         await _release_provider_request(resolved, admission_id)
@@ -1488,6 +1730,19 @@ async def proxy_litellm_messages(
     # Replace model with LiteLLM model-group name
     model_name = resolved.litellm_model_name or f"brigade-{resolved.model_id}"
     payload["model"] = model_name
+    if resolved.allowed_deployments:
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        # This is consumed only by the optional LiteLLM deployment filter.
+        # Admission remains conservative across every allowed provider until
+        # that child callback is explicitly enabled and certified.
+        metadata["brigade_route_policy"] = {
+            "allowed_deployments": list(resolved.allowed_deployments),
+            "provider_ids": list(resolved.provider_ids),
+            "policy_digest": resolved.deployment_policy_digest,
+        }
+        payload["metadata"] = metadata
 
     # Build headers: from the request, sanitized, plus LiteLLM auth
     raw_headers = dict(request.headers)
@@ -1511,13 +1766,23 @@ async def proxy_litellm_messages(
     except RuntimeError as exc:
         return JSONResponse(status_code=429, content={"error": {"type": "provider_queue_timeout", "message": str(exc)}})
     try:
-        upstream_response = await _send_with_provider_retry(
-            client,
-            lambda: client.build_request(request.method, url, headers=headers, content=body),
-            resolved,
-            started_at,
-            admission_id,
-        )
+        if is_streaming:
+            upstream_response = await _send_with_provider_retry(
+                client,
+                lambda: client.build_request(request.method, url, headers=headers, content=body),
+                resolved,
+                started_at,
+                admission_id,
+            )
+            content = None
+        else:
+            upstream_response, content = await _request_non_streaming_with_provider_retry(
+                client,
+                lambda: client.build_request(request.method, url, headers=headers, content=body),
+                resolved,
+                started_at,
+                admission_id,
+            )
     except Exception as exc:
         await _release_provider_request(resolved, admission_id)
         LOGGER.error(
@@ -1545,7 +1810,8 @@ async def proxy_litellm_messages(
         )
 
     try:
-        content = await _read_with_deadline(upstream_response, resolved, started_at)
+        if content is None:
+            raise RuntimeError("non-streaming upstream response had no body")
     finally:
         await upstream_response.aclose()
         await _release_provider_request(resolved, admission_id)

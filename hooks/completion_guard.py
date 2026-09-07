@@ -16,8 +16,8 @@ from typing import Any
 # directory from which Claude Code invokes it.
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from workspace_fingerprint import fingerprint, repository_root, clear_fingerprint_cache
-from ledger_io import append_jsonl, read_jsonl, read_jsonl_cached
-from enhanced_router.base import implementation_agents
+from ledger_io import append_jsonl, read_jsonl_cached
+from enhanced_router.base import agent_role, implementation_agents
 
 LOGGER = logging.getLogger(__name__)
 
@@ -113,6 +113,48 @@ def completed_agents(session_dir: pathlib.Path, active_epoch_id: str) -> Counter
     return completed
 
 
+def _event_role(record: dict[str, Any], identity: str | None = None) -> str:
+    """Resolve the durable role for a lifecycle record.
+
+    Native sidecar names are configuration identities, not workflow roles.
+    Hooks therefore prefer the role persisted by the lifecycle hook and only
+    fall back to the registry-backed compatibility resolver for old ledger
+    rows that predate explicit role metadata.
+    """
+    details = record.get("details")
+    if isinstance(details, dict) and details.get("role"):
+        return str(details["role"])
+    if record.get("role"):
+        return str(record["role"])
+    candidate = identity or str(record.get("agent_type") or record.get("subagent_type") or "")
+    try:
+        return str(agent_role(candidate))
+    except Exception:
+        return "recon"
+
+
+def completed_roles(session_dir: pathlib.Path, active_epoch_id: str) -> Counter[str]:
+    """Count completed native lifecycles by role, not static agent name."""
+    starts: dict[str, tuple[str, str]] = {}
+    completed: Counter[str] = Counter()
+    log = session_dir / "agents.jsonl"
+    for record in read_jsonl_cached(log):
+        if str(record.get("epoch_id", "")) != active_epoch_id:
+            continue
+        agent_id = str(record.get("agent_id", ""))
+        identity = str(record.get("agent_type") or record.get("subagent_type") or "unknown")
+        event = record.get("event")
+        role = _event_role(record, identity)
+        if event == "SubagentStart":
+            starts[agent_id] = (identity, role)
+        elif event == "SubagentStop":
+            started = starts.get(agent_id)
+            if started is not None and started[0] == identity:
+                completed[started[1]] += 1
+                starts.pop(agent_id, None)
+    return completed
+
+
 def validate_ledger_sequence(parsed: dict[str, str], session_dir: pathlib.Path, active_epoch_id: str) -> str | None:
     tier = parsed["Workflow-Tier"]
     implementation_agent = parsed["Implementation-Agent"]
@@ -120,17 +162,19 @@ def validate_ledger_sequence(parsed: dict[str, str], session_dir: pathlib.Path, 
         return f"Unknown implementation agent: {implementation_agent}"
 
     completed = completed_agents(session_dir, active_epoch_id)
+    completed_by_role = completed_roles(session_dir, active_epoch_id)
+    implementation_role = _event_role({"agent_type": implementation_agent}, implementation_agent)
     if completed[implementation_agent] < 1:
         return f"No completed {implementation_agent} lifecycle is recorded for this session"
 
     if tier == "trivial" and implementation_agent != "controller-direct":
         return "Trivial tier must use the controlled controller-direct mutation path"
-    if tier in {"normal", "cross-cutting", "high-risk"} and implementation_agent == "brigade-repairer":
-        if completed["brigade-implementer"] < 1:
+    if tier in {"normal", "cross-cutting", "high-risk"} and implementation_role == "repairer":
+        if completed_by_role["implementer"] < 1 and completed_by_role["controller"] < 1:
             return "A repairer cannot be the only implementation lifecycle; initial implementer evidence is missing"
 
-    if tier in {"cross-cutting", "high-risk"} and completed["brigade-recon"] < 1:
-        return f"{tier} work requires a completed brigade-recon lifecycle"
+    if tier in {"cross-cutting", "high-risk"} and completed_by_role["recon"] < 1:
+        return f"{tier} work requires a completed recon lifecycle"
 
     # Read events from the active epoch only
     ledger_events = read_epoch_ledger(session_dir, active_epoch_id)
@@ -145,11 +189,12 @@ def validate_ledger_sequence(parsed: dict[str, str], session_dir: pathlib.Path, 
 
     for idx, evt in enumerate(ledger_events):
         ev_type = evt.get("event")
-        agent_type = (
+        agent_type = str(
             evt.get("subagent_type") or
             evt.get("agent_type") or
             (evt.get("details", {}) if isinstance(evt.get("details"), dict) else {}).get("agent_type")
         )
+        event_role = _event_role(evt, agent_type)
         status = evt.get("status")
 
         if ev_type == "Mutation":
@@ -164,23 +209,23 @@ def validate_ledger_sequence(parsed: dict[str, str], session_dir: pathlib.Path, 
         # Agent type already guarantees correct model routing; skip resolved_model checks.
 
         elif ev_type == "SubagentStop":
-            if agent_type == "brigade-recon":
+            if event_role == "recon":
                 recon_stops.append(idx)
-            elif agent_type == "brigade-adversary":
+            elif event_role == "adversary":
                 if not impl_starts:
                     adv_design_stops.append(idx)
                 else:
                     adv_impl_stops.append(idx)
-            elif agent_type in {"brigade-repairer", "controller-direct"} and impl_starts:
+            elif (event_role == "repairer" or agent_type == "controller-direct") and impl_starts:
                 repair_stops.append(idx)
         elif ev_type == "SubagentStart":
-            if agent_type in {"brigade-implementer", "controller-direct"}:
+            if event_role == "implementer" or agent_type == "controller-direct":
                 impl_starts.append(idx)
 
     # 1. Recon phase sequence check
     if tier in {"cross-cutting", "high-risk"}:
         if not recon_stops or (impl_starts and recon_stops[0] > impl_starts[0]):
-            return "Sequence violation: brigade-recon must complete before implementation begins"
+            return "Sequence violation: recon must complete before implementation begins"
 
     # 2. Adversary phase sequence check
     if tier == "high-risk":
@@ -326,9 +371,15 @@ def main() -> int:
     if active.exists() and any(f for f in active.iterdir() if f.suffix == ".json"):
         return block_with_retry_guard("A subagent is still active; wait for it before accepting completion", session_dir, stop_hook_active, message)
 
-    agent_error = validate_ledger_sequence(parsed, session_dir, active_epoch_id)
-    if agent_error:
-        return block_with_retry_guard(agent_error, session_dir, stop_hook_active, message)
+    # Once an authenticated run exists, SQLite phase/capability state is the
+    # authority.  The JSONL sequence checker remains a compatibility fallback
+    # for pre-state sessions and direct unit callers; it must not reject a
+    # valid named native sidecar merely because its filename is not one of the
+    # historical role names.
+    if not run_id:
+        agent_error = validate_ledger_sequence(parsed, session_dir, active_epoch_id)
+        if agent_error:
+            return block_with_retry_guard(agent_error, session_dir, stop_hook_active, message)
 
     try:
         root = repository_root(cwd)

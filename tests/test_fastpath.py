@@ -67,6 +67,34 @@ def test_packet_builder_bounds_diff_and_marks_truncation():
     assert len(packet["diff"].splitlines()) == 400
 
 
+def test_verification_must_match_authoritative_deterministic_checks():
+    verification = FastpathVerification.model_validate({
+        "decision": "pass",
+        "checks": {"tests": "pass"},
+        "requires_full_adversary": False,
+        "confidence": 0.99,
+    })
+    with pytest.raises(ValueError, match="authoritative"):
+        FastpathPolicyValidator().validate_verification(
+            verification,
+            packet={"deterministic_checks": {"tests": "fail"}},
+        )
+
+
+def test_verification_cannot_omit_a_deterministic_check():
+    verification = FastpathVerification.model_validate({
+        "decision": "escalate",
+        "checks": {"tests": "pass"},
+        "requires_full_adversary": True,
+        "confidence": 0.1,
+    })
+    with pytest.raises(ValueError, match="every deterministic check"):
+        FastpathPolicyValidator().validate_verification(
+            verification,
+            packet={"deterministic_checks": {"tests": "pass", "lint": "pass"}},
+        )
+
+
 def test_fastpath_cannot_lower_deterministic_tier():
     proposal = FastpathRouteProposal.model_validate({
         "workflow_tier": "normal",
@@ -161,6 +189,7 @@ async def test_request_defaults_to_json_object_and_no_reasoning_effort(monkeypat
     assert payload["response_format"] == {"type": "json_object"}
     assert "reasoning_effort" not in payload
     assert payload["max_tokens"] == 256
+    assert captured["request_lane"] == "fastpath"
 
 
 @pytest.mark.asyncio

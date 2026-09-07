@@ -11,7 +11,11 @@ import uuid
 
 from ledger_io import append_jsonl
 
-from enhanced_router.base import authorized_subagents, mutating_agents
+from enhanced_router.base import (
+    AgentCapabilities,
+    agent_capabilities,
+    authorized_subagents,
+)
 
 # ---------------------------------------------------------------------------
 # Shell-structure-aware mutation detector
@@ -170,6 +174,90 @@ def _role_for_agent(agent_type: str, subagent_type: str) -> str:
     return "implementer" if "code" in value or "test" in value else "recon"
 
 
+def _execution_capabilities(data: dict, agent_type: str) -> AgentCapabilities:
+    """Read the immutable capability snapshot attached at native spawn."""
+    fallback = agent_capabilities(agent_type)
+    run_id = os.environ.get("CLAUDE_BRIGADE_RUN_ID") or data.get("run_id")
+    agent_id = str(data.get("agent_id") or "")
+    if not run_id or not agent_id:
+        return fallback
+    try:
+        from enhanced_router.state import get_state
+
+        state = get_state()
+        epoch = state.get_active_epoch(str(run_id))
+        if not epoch:
+            return fallback
+        execution = next(
+            (
+                item for item in state.get_agent_executions(
+                    str(run_id), epoch_id=epoch["epoch_id"]
+                )
+                if item.get("claude_agent_id") == agent_id
+                and item.get("status") in {"started", "running", "streaming", "verifying"}
+            ),
+            None,
+        )
+        raw = json.loads(str((execution or {}).get("capability_snapshot_json") or "{}"))
+        if not isinstance(raw, dict) or not raw:
+            return fallback
+        return AgentCapabilities(
+            roles=tuple(str(item) for item in raw.get("roles", fallback.roles)),
+            tools=tuple(str(item) for item in raw.get("tools", fallback.tools)),
+            disallowed_tools=tuple(str(item) for item in raw.get("disallowed_tools", fallback.disallowed_tools)),
+            can_mutate=bool(raw.get("can_mutate", False)),
+            isolation=str(raw.get("isolation", fallback.isolation)),
+            may_spawn_agents=bool(raw.get("may_spawn_agents", fallback.may_spawn_agents)),
+            may_integrate=bool(raw.get("may_integrate", fallback.may_integrate)),
+            may_adjudicate=bool(raw.get("may_adjudicate", fallback.may_adjudicate)),
+            counts_as_implementation=bool(raw.get("counts_as_implementation", fallback.counts_as_implementation)),
+        )
+    except Exception:
+        return fallback
+
+
+def _enforce_execution_limits(data: dict, agent_type: str) -> bool:
+    """Deny a worker tool call once its persisted deadline/budget is spent."""
+    run_id = os.environ.get("CLAUDE_BRIGADE_RUN_ID") or data.get("run_id")
+    agent_id = str(data.get("agent_id") or "")
+    if not run_id or not agent_id or agent_type in {"unknown", "controller", "controller-direct"}:
+        return True
+    try:
+        from enhanced_router.state import get_state
+
+        state = get_state()
+        epoch = state.get_active_epoch(str(run_id))
+        if not epoch:
+            return True
+        execution = next(
+            (
+                item for item in state.get_agent_executions(
+                    str(run_id), epoch_id=epoch["epoch_id"]
+                )
+                if item.get("claude_agent_id") == agent_id
+                and item.get("status") in {"started", "running", "streaming", "verifying"}
+            ),
+            None,
+        )
+        if execution is None:
+            return True
+        result = state.enforce_execution_limits(
+            str(execution["execution_id"]),
+            run_id=str(run_id),
+            epoch_id=str(epoch["epoch_id"]),
+        )
+        if result.get("allowed"):
+            return True
+        deny(
+            f"Tool call blocked: native execution limit reached ({result.get('reason')}). "
+            "The execution was terminalized; the controller must re-plan or retry it."
+        )
+        return False
+    except Exception as exc:
+        deny(f"Tool call blocked: unable to validate execution budget ({exc}).")
+        return False
+
+
 def _ensure_mutation_lease(data: dict, agent_type: str, cwd: pathlib.Path) -> bool:
     """Require the current execution to own the workspace writer lease."""
     run_id = os.environ.get("CLAUDE_BRIGADE_RUN_ID") or data.get("run_id")
@@ -187,6 +275,12 @@ def _ensure_mutation_lease(data: dict, agent_type: str, cwd: pathlib.Path) -> bo
         epoch = state.get_active_epoch(str(run_id))
         if not epoch:
             deny("Mutation blocked: no active Brigade task epoch.")
+            return False
+        if bool(epoch.get("mutation_paused")) or str(epoch.get("escalation_state") or "") == "escalated":
+            deny(
+                "Mutation blocked: workflow escalation is awaiting controller "
+                "acknowledgment before mutation can resume."
+            )
             return False
         role = "controller" if agent_type in {"unknown", "controller-direct"} else _role_for_agent(agent_type, "")
         active_phases = [
@@ -226,7 +320,8 @@ def _ensure_mutation_lease(data: dict, agent_type: str, cwd: pathlib.Path) -> bo
             ),
             None,
         )
-        if agent_type in mutating_agents() and owned_shadow is None:
+        capabilities = _execution_capabilities(data, agent_type)
+        if capabilities.can_mutate and owned_shadow is None:
             deny(
                 "Mutation blocked: mutating executions must own an active shadow worktree; "
                 "canonical or unregistered workspaces are not writable."
@@ -285,6 +380,20 @@ def _reserve_agent_slot(data: dict, subagent_type: str, session_id: str) -> bool
                 "action, and invoke the matching native agent."
             )
             return False
+        requested_model = str(tool_input.get("model") or "").strip()
+        if requested_model:
+            expected_models = {
+                str(claim.get("expected_model_alias") or "").strip(),
+                str(claim.get("native_slot") or "").strip(),
+                str(claim.get("public_model_alias") or "").strip(),
+                str(claim.get("model_id") or "").strip(),
+            } - {""}
+            if expected_models and requested_model not in expected_models:
+                deny(
+                    "Agent spawn blocked: per-invocation model override "
+                    f"'{requested_model}' does not match the claimed slot/sidecar model."
+                )
+                return False
         marker_dir = pathlib.Path(os.environ.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache")) / "claude-brigade" / "sessions" / session_id / "active"
         marker_dir.mkdir(parents=True, exist_ok=True)
         marker = marker_dir / f"spawn_{call_id}.json"
@@ -311,7 +420,20 @@ def main() -> int:
     agent_type = lookup_agent_type(data)
     session_id = str(data.get("session_id", "unknown"))
 
+    if not _enforce_execution_limits(data, agent_type):
+        return 0
+
     if tool == "Agent":
+        capabilities = _execution_capabilities(data, agent_type)
+        if (
+            agent_type not in {"unknown", "controller", "controller-direct"}
+            and not capabilities.may_spawn_agents
+        ):
+            deny(
+                f"{agent_type} cannot spawn nested agents; the main controller "
+                "owns Brigade worker admission."
+            )
+            return 0
         subagent_type = str((data.get("tool_input") or {}).get("subagent_type") or (data.get("tool_input") or {}).get("agent_type") or "")
         if subagent_type and subagent_type not in authorized_subagents():
             deny(f"Subagent role '{subagent_type}' is not in the authorized enhanced subagent allowlist.")
@@ -319,8 +441,20 @@ def main() -> int:
         if not _reserve_agent_slot(data, subagent_type, session_id):
             return 0
 
+    if tool == "Workflow":
+        capabilities = _execution_capabilities(data, agent_type)
+        if (
+            agent_type not in {"unknown", "controller", "controller-direct"}
+            and not capabilities.may_spawn_agents
+        ):
+            deny(
+                f"{agent_type} cannot run nested workflows; the main controller "
+                "owns Brigade workflow admission."
+            )
+            return 0
+
     if tool in {"Write", "Edit", "NotebookEdit"}:
-        if agent_type not in mutating_agents():
+        if not _execution_capabilities(data, agent_type).can_mutate:
             deny(f"{agent_type} is read-only. Delegate source mutation to an authorized implementation agent.")
             return 0
         cwd = pathlib.Path(str(data.get("cwd", "."))).resolve()
@@ -349,7 +483,7 @@ def main() -> int:
         except Exception:
             pass
 
-        if agent_type not in mutating_agents():
+        if not _execution_capabilities(data, agent_type).can_mutate:
             if not _is_read_only_shell(command):
                 deny(
                     f"Bash blocked for read-only role {agent_type}: command is not in "

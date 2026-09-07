@@ -13,6 +13,10 @@ from typing import Any
 import httpx
 
 
+HARNESS_VERSION = "fi-contract-v2"
+PROTOCOL_VERSION = "openai-chat-anthropic-messages-v1"
+
+
 def _status(response: httpx.Response, *, require_json: bool = False) -> str:
     if not 200 <= response.status_code < 300:
         return "fail"
@@ -104,6 +108,134 @@ def _tool_call_status(client: httpx.Client, model: str) -> str:
         return "fail"
 
 
+def _tool_calls(response: httpx.Response) -> list[dict[str, Any]] | None:
+    """Extract tool calls without retaining model content in a report."""
+    try:
+        payload = response.json()
+        message = payload["choices"][0]["message"]
+        calls = message.get("tool_calls") or []
+    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(calls, list) or not all(isinstance(call, dict) for call in calls):
+        return None
+    return calls
+
+
+def _tool_call_parallel_status(client: httpx.Client, model: str) -> str:
+    """Check whether the model can emit two independent tool calls."""
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": "Call both lookup and inspect."}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "description": "Look up an item",
+                        "parameters": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "inspect",
+                        "description": "Inspect an item",
+                        "parameters": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]},
+                    },
+                },
+            ],
+            "tool_choice": "required",
+            "max_tokens": 128,
+        },
+    )
+    if _status(response) != "pass":
+        return "fail"
+    calls = _tool_calls(response)
+    if not calls:
+        return "not_observed"
+    names = {
+        call.get("function", {}).get("name")
+        for call in calls
+        if isinstance(call.get("function"), dict)
+    }
+    return "pass" if {"lookup", "inspect"}.issubset(names) else "not_observed"
+
+
+def _tool_result_continuation_status(client: httpx.Client, model: str) -> str:
+    """Check the second request in a tool-call continuation loop."""
+    first = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": "Call lookup with id 1, then use its result."}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "Look up an item",
+                    "parameters": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]},
+                },
+            }],
+            "tool_choice": "required",
+            "max_tokens": 64,
+        },
+    )
+    if _status(first) != "pass":
+        return "fail"
+    calls = _tool_calls(first)
+    if not calls:
+        return "not_observed"
+    try:
+        first_payload = first.json()
+        assistant_message = dict(first_payload["choices"][0]["message"])
+    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+        return "fail"
+    tool_messages = []
+    for call in calls:
+        call_id = call.get("id")
+        if not isinstance(call_id, str) or not call_id:
+            return "fail"
+        tool_messages.append({"role": "tool", "tool_call_id": call_id, "content": "item-1"})
+    second = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": model,
+            "messages": [
+                {"role": "user", "content": "Call lookup with id 1, then use its result."},
+                assistant_message,
+                *tool_messages,
+            ],
+            "max_tokens": 64,
+        },
+    )
+    return "pass" if _status(second, require_json=True) == "pass" else "fail"
+
+
+def _cancellation_status(client: httpx.Client, model: str) -> str:
+    """Check that an early client close cleanly terminates a stream."""
+    try:
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": model,
+                "stream": True,
+                "messages": [{"role": "user", "content": "Reply with a long response."}],
+                "max_tokens": 128,
+            },
+        ) as response:
+            if not 200 <= response.status_code < 300:
+                return "fail"
+            for line in response.iter_lines():
+                if line:
+                    return "pass"
+            return "not_observed"
+    except httpx.HTTPError:
+        return "fail"
+
+
 def _structured_output_status(client: httpx.Client, model: str) -> str:
     response = client.post(
         "/v1/chat/completions",
@@ -132,7 +264,7 @@ def _structured_output_status(client: httpx.Client, model: str) -> str:
 
 
 def run_contract(model: str, *, base_url: str, local_key: str) -> dict[str, Any]:
-    """Run bounded nonstream, SSE, tool, structured-output and Anthropic checks."""
+    """Run bounded transport, tool-loop, structured-output and SSE checks."""
     headers = {
         "Authorization": f"Bearer {local_key}",
         "Content-Type": "application/json",
@@ -155,22 +287,28 @@ def run_contract(model: str, *, base_url: str, local_key: str) -> dict[str, Any]
             json={"model": model, "max_tokens": 8, "messages": [{"role": "user", "content": "Reply OK"}]},
         )
         tool_status = _tool_call_status(client, model)
+        parallel_tool_status = _tool_call_parallel_status(client, model)
+        continuation_status = _tool_result_continuation_status(client, model)
         structured_status = _structured_output_status(client, model)
+        cancellation_status = _cancellation_status(client, model)
 
     return {
+        "harness_version": HARNESS_VERSION,
+        "protocol_version": PROTOCOL_VERSION,
         "model": model,
         "tested_at": datetime.now(timezone.utc).isoformat(),
         "openai_nonstream": _status(openai, require_json=True),
         "openai_stream": stream_status,
         "anthropic_messages": _status(anthropic, require_json=True),
         "tool_call_single": tool_status,
-        "tool_call_parallel": "not_tested",
+        "tool_call_parallel": parallel_tool_status,
+        "tool_result_continuation": continuation_status,
         "structured_output": structured_status,
         "reasoning_content": "observed" if isinstance(openai_payload.get("choices"), list) else "not_observed",
         "image_input": "not_tested",
         "usage_accounting": _usage_status(openai_payload) if stream_usage is None else ("pass" if _usage_status(openai_payload) == "pass" else "partial"),
         "request_id_echo": "pass" if openai.headers.get("x-request-id") else "not_observed",
-        "cancellation": "not_tested",
+        "cancellation": cancellation_status,
         "error_mapping_429": "not_tested",
         "error_mapping_503": "not_tested",
     }

@@ -28,6 +28,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+from fnmatch import fnmatch
 
 
 class GitWorkspaceError(RuntimeError):
@@ -363,6 +364,42 @@ class ShadowWorktreeManager:
             ),
         )
 
+    def create_preserved_native_worktree(
+        self, *, run_id: str, name: str,
+    ) -> tuple[Path, WorkspaceBaseline]:
+        """Create the worktree returned by Claude Code's WorktreeCreate hook.
+
+        Claude Code owns the child session, but this method owns the important
+        filesystem invariant: the child starts from the canonical HEAD plus
+        the user's current tracked and untracked baseline.  Registration of
+        the execution-specific owner remains in ``SubagentStart`` once Claude
+        provides the child identity.
+        """
+        baseline = self.baseline()
+        safe_name = "".join(
+            character if character.isalnum() or character in "-_." else "-"
+            for character in name
+        ).strip("-") or "native"
+        path = self.worktree_root / run_id / f"{safe_name}-{uuid.uuid4().hex[:10]}"
+        self._require_clean_worktree_path(path)
+        added = self._run_git(
+            self.repo_path, "worktree", "add", "--detach", str(path), baseline.base_sha,
+        )
+        if not added.ok:
+            raise GitWorkspaceError(added.stderr.strip() or "unable to create native worktree")
+        try:
+            if baseline.dirty_patch:
+                applied = self._run_git(path, "apply", "--binary", input_bytes=baseline.dirty_patch)
+                if not applied.ok:
+                    raise GitWorkspaceError(
+                        applied.stderr.strip() or "unable to apply native worktree baseline"
+                    )
+            self._copy_untracked(baseline, path)
+        except Exception:
+            self.remove_shadow(path)
+            raise
+        return path, baseline
+
     def register_main(self, *, state: object, run_id: str, epoch_id: str) -> dict:
         """Register the canonical worktree and reject cross-run collisions."""
         baseline = self.baseline()
@@ -429,7 +466,36 @@ class ShadowWorktreeManager:
                 patch_parts.append(path_patch)
         patch = b"".join(patch_parts)
         allowed = {str(Path(item)) for item in allowed_files} if allowed_files is not None else None
-        unauthorized = [item for item in changed_files if allowed is not None and item not in allowed]
+        prohibited: set[str] = set()
+        package = None
+        execution = None
+        get_execution = getattr(state, "get_agent_execution", None)
+        if callable(get_execution):
+            execution_candidate = get_execution(workspace.execution_id)
+            execution = execution_candidate if isinstance(execution_candidate, dict) else None
+        package_id = str((execution or {}).get("package_id") or "")
+        if package_id:
+            get_package = getattr(state, "get_work_package", None)
+            package_candidate = get_package(package_id) if callable(get_package) else None
+            package = package_candidate if isinstance(package_candidate, dict) else None
+            if package is not None:
+                package_scope = [str(item) for item in package.get("path_scope", [])]
+                allowed = set(package_scope) if allowed is None and package_scope else allowed
+                prohibited = {str(item) for item in package.get("prohibited_paths", [])}
+
+        def matches(path: str, patterns: set[str]) -> bool:
+            return any(
+                path == pattern
+                or path.startswith(pattern.rstrip("/") + "/")
+                or fnmatch(path, pattern)
+                for pattern in patterns
+            )
+
+        unauthorized = [
+            item for item in changed_files
+            if (allowed is not None and not matches(item, allowed))
+            or matches(item, prohibited)
+        ]
         patch_check = self._run_git(
             self.repo_path, "apply", "--check", "--whitespace=error", input_bytes=patch,
         ) if patch else GitResult((), 0, "", "")
@@ -437,6 +503,8 @@ class ShadowWorktreeManager:
             "patch_nonempty": bool(patch),
             "diff_check": patch_check.ok,
             "unauthorized_files": unauthorized,
+            "package_id": package_id or None,
+            "package_contract_digest": (package or {}).get("contract_digest") if package else None,
             "changed_files": list(changed_files),
         }
         if unauthorized:
@@ -512,7 +580,7 @@ class ShadowWorktreeManager:
             escalate_red_candidate(
                 state, run_id=run_id, epoch_id=epoch_id, candidate_id=candidate_id,
                 changeset_id=changeset.changeset_id,
-                reason=validation.get("reason") or "changeset failed preflight validation",
+                reason=str(validation.get("reason") or "changeset failed preflight validation"),
                 evidence={"overlap": payload, "validation": validation},
             )
         return {"disposition": disposition, "overlap": payload, "validation": validation}

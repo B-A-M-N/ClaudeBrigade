@@ -24,10 +24,25 @@ import yaml
 from enhanced_router.config_models import ModelSpec
 
 
+def deployment_filter_enabled(explicit: bool | None = None) -> bool:
+    """Return whether the pinned LiteLLM deployment filter is enabled.
+
+    The setting is intentionally opt-in.  Keeping the decision in one helper
+    means config generation and generation change detection cannot disagree
+    when an operator toggles the callback between launches.
+    """
+    if explicit is not None:
+        return explicit
+    return os.environ.get(
+        "BRIGADE_LITELLM_DISPATCH_FILTER", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def generate_litellm_config(
     models: dict[str, ModelSpec],
     *,
     referenced_ids: set[str] | None = None,
+    enable_deployment_filter: bool | None = None,
 ) -> str:
     """Generate a LiteLLM proxy YAML configuration string.
 
@@ -55,6 +70,12 @@ def generate_litellm_config(
     for the proxy ``master_key``.  Never materializes secrets in the YAML.
     """
     model_list: list[dict[str, Any]] = []
+
+    # The callback is deliberately opt-in until the exact LiteLLM child
+    # version has been certified in the deployment environment.  This
+    # preserves conservative all-candidate admission when the child is
+    # upgraded independently of ClaudeBrigade.
+    enable_deployment_filter = deployment_filter_enabled(enable_deployment_filter)
 
     for model_id, spec in sorted(models.items()):
         if not spec.enabled:
@@ -126,6 +147,10 @@ def generate_litellm_config(
             ),
         },
     }
+    if enable_deployment_filter:
+        config["litellm_settings"]["callbacks"] = [
+            "brigade_litellm_dispatch.proxy_handler_instance"
+        ]
 
     return yaml.dump(config, default_flow_style=False, sort_keys=False)
 
@@ -150,7 +175,10 @@ def _credential_env_names(api_key_env: str | None) -> list[str | None]:
 
 
 def config_digest(
-    models: dict[str, ModelSpec], *, referenced_ids: set[str] | None = None
+    models: dict[str, ModelSpec],
+    *,
+    referenced_ids: set[str] | None = None,
+    enable_deployment_filter: bool | None = None,
 ) -> str:
     """Return a deterministic SHA-256 hex digest of the litellm-relevant config.
 
@@ -189,7 +217,20 @@ def config_digest(
                 "api_key_env": spec.api_key_env,
             }
         )
-    raw = json.dumps(entries, sort_keys=True, separators=(",", ":"))
+    raw = json.dumps(
+        {
+            "models": entries,
+            # A callback toggle changes the child behavior even when the
+            # model registry is unchanged, so it must create a new
+            # blue-green generation rather than silently reusing the old
+            # child.
+            "deployment_filter_enabled": deployment_filter_enabled(
+                enable_deployment_filter
+            ),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
