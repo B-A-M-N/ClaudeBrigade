@@ -5,32 +5,114 @@ profiles:
     implementer: kimi-k2.7-code
     adversary: glm-5.1
     repairer: glm-5-turbo
+    slots:
+      main: {model: glm-5.1, reserve_class: controller}
+      sonnet: {model: kimi-k2.7-code, reserve_class: worker}
+      haiku: {model: qwen3.6-35b, reserve_class: worker}
+      opus: {model: glm-5.1, reserve_class: worker}
+      fable: {model: glm-5.1, reserve_class: critical}
+      background: {model: deepseek-v4-flash, reserve_class: optional}
+    agents:
+      grounder:
+        template: brigade-grounder
+        slot: haiku
+        roles: [recon, grounding]
+        tools: [Read, Grep, Glob, Bash]
+        disallowed_tools: [Edit, Write, NotebookEdit, Agent, Workflow]
+        background: true
+        max_turns: 60
+        effort: medium
+      implementer:
+        template: brigade-implementer
+        slot: sonnet
+        roles: [implementer]
+        tools: [Read, Grep, Glob, Bash, Edit, Write]
+        isolation: worktree
+        can_mutate: true
+        counts_as_implementation: true
+        background: true
+        max_turns: 140
+        effort: high
+        permission_mode: acceptEdits
+      reviewer:
+        template: brigade-reviewer
+        slot: opus
+        roles: [adversary]
+        tools: [Read, Grep, Glob, Bash]
+        disallowed_tools: [Edit, Write, NotebookEdit, Agent, Workflow]
+        background: true
+        max_turns: 100
+        effort: high
+      repairer:
+        template: brigade-repairer
+        slot: opus
+        roles: [repairer]
+        tools: [Read, Grep, Glob, Bash, Edit, Write]
+        isolation: worktree
+        can_mutate: true
+        counts_as_implementation: true
+        background: true
+        max_turns: 120
+        effort: high
+        permission_mode: acceptEdits
+      critical-architect:
+        template: brigade-critical-architect
+        slot: fable
+        roles: [architect, adjudicator]
+        tools: [Read, Grep, Glob, Bash]
+        disallowed_tools: [Edit, Write, NotebookEdit, Agent, Workflow]
+        background: true
+        max_turns: 100
+        effort: high
+      fast-verifier:
+        template: brigade-fast-verifier
+        slot: haiku
+        roles: [verification]
+        tools: [Read, Grep, Glob, Bash]
+        disallowed_tools: [Edit, Write, NotebookEdit, Agent, Workflow]
+        background: true
+        max_turns: 60
+        effort: medium
+      critical-verifier:
+        template: brigade-critical-verifier
+        slot: fable
+        roles: [verification]
+        tools: [Read, Grep, Glob, Bash]
+        disallowed_tools: [Edit, Write, NotebookEdit, Agent, Workflow]
+        background: true
+        max_turns: 100
+        effort: high
     specialists:
       fast-scout:
         model: qwen3.6-35b
         roles: [recon]
         latency_class: fast
-        native_agent_name: brigade-fi-qwen-scout
-        public_model_alias: anthropic-brigade-fi-qwen-scout
+        template: brigade-grounder
+        native_agent_name: brigade-sidecar-scout
+        public_model_alias: anthropic-brigade-sidecar-scout
       broad-architect:
         model: minimax-m3
         roles: [recon, adversary]
         activation: long_context_or_multimodal
+        launchable: false
       coding-implementer:
         model: kimi-k2.7-code
         roles: [implementer]
-        native_agent_name: brigade-fi-kimi-implementer
-        public_model_alias: anthropic-brigade-fi-kimi-implementer
+        template: brigade-implementer
+        native_agent_name: brigade-sidecar-coding-worker
+        public_model_alias: anthropic-brigade-sidecar-coding-worker
       correctness-reviewer:
         model: glm-5.1
         roles: [adversary]
-        native_agent_name: brigade-fi-glm-adversary
-        public_model_alias: anthropic-brigade-fi-glm-adversary
+        template: brigade-reviewer
+        native_agent_name: brigade-sidecar-correctness-reviewer
+        public_model_alias: anthropic-brigade-sidecar-correctness-reviewer
       fast-repairer:
         model: glm-5-turbo
         roles: [repairer]
-        native_agent_name: brigade-fi-glm-fast-repairer
-        public_model_alias: anthropic-brigade-fi-glm-fast-repairer
+        template: brigade-repairer
+        native_agent_name: brigade-sidecar-fast-repairer
+        public_model_alias: anthropic-brigade-sidecar-fast-repairer
 
   longcat:
     controller_model: longcat-2

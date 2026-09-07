@@ -1,7 +1,6 @@
 ---
-name: qwen-adversary
+name: brigade-adversary
 description: Fresh independent reviewer that attempts to falsify the implementation.
-model: qwen3.6-35b
 tools: Read, Grep, Glob, Bash
 permissionMode: plan
 background: false

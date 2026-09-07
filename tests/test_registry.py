@@ -104,6 +104,46 @@ class TestModelRegistryLoad:
         assert "normal" in workflows
         assert workflows["normal"].default_profile == "default"
 
+    def test_sidecar_profile_route_override_is_authoritative(self, config_dir, valid_registry):
+        _write_config(config_dir, "sidecars.yaml", {
+            "sidecar_agents": {
+                "grounder": {
+                    "model_id": "model-a",
+                    "native_agent_name": "brigade-grounder",
+                    "public_model_alias": "anthropic-brigade-grounder",
+                    "roles": ["recon"],
+                    "description": "test grounder",
+                    "tools": ["Read", "Grep", "Glob", "Bash"],
+                },
+            },
+        })
+        _write_config(config_dir, "sidecar_profiles.yaml", {
+            "sidecar_profiles": {
+                "review-stack": {
+                    "sidecar_agent_ids": ["grounder"],
+                    "agent_route_overrides": {
+                        "grounder": {
+                            "primary": {
+                                "model": "model-b",
+                                "endpoint": "default",
+                                "provider_id": "provider-b",
+                            },
+                            "fallbacks": [{"model": "model-a", "provider_id": "provider-a"}],
+                        },
+                    },
+                },
+            },
+        })
+        valid_registry.load_sidecars()
+        valid_registry.load_sidecar_profiles()
+
+        resolved = valid_registry.resolve_sidecar_agents("review-stack")["grounder"]
+        assert resolved.model_id == "model-b"
+        assert resolved.provider_id == "provider-b"
+        assert resolved.endpoint == "default"
+        assert resolved.fallback_routes[0].model == "model-a"
+        assert resolved.fallback_routes[0].provider_id == "provider-a"
+
     def test_missing_models_file(self, tmp_path):
         reg = ModelRegistry(tmp_path / "nonexistent")
         with pytest.raises(FileNotFoundError):
@@ -154,9 +194,9 @@ class TestModelRegistryLookup:
         aliases = registry.role_model_aliases()
         bindings = registry.role_model_bindings()
 
-        assert aliases["anthropic-brigade-fi-qwen-scout"] == "recon"
-        assert bindings["brigade-fi-qwen-scout"] == "qwen3.6-35b"
-        assert registry.native_agent_name("glm-5.1", "adversary") == "brigade-fi-glm-adversary"
+        assert aliases["anthropic-brigade-sidecar-scout"] == "recon"
+        assert bindings["brigade-sidecar-scout"] == "qwen3.6-35b"
+        assert registry.native_agent_name("glm-5.1", "adversary") == "brigade-adversary"
 
     def test_specialist_manifest_profile_id_scopes_to_a_single_profile(self, config_dir):
         _write_config(config_dir, "models.yaml", {
@@ -531,6 +571,101 @@ class TestSidecarProfilesAndLaunchPresets:
         })
         reg.load_sidecar_profiles()
         assert set(reg.resolve_sidecars("lightweight")) == {"reviewer"}
+
+    def test_disabled_profile_coprocessor_lane_resolves_empty(self, config_dir):
+        reg = self._base_registry(config_dir)
+        _write_config(config_dir, "sidecar_profiles.yaml", {
+            "sidecar_profiles": {
+                "native-only": {
+                    "coprocessors_enabled": False,
+                    "sidecar_ids": ["reviewer"],
+                },
+            },
+        })
+        reg.load_sidecar_profiles()
+        assert reg.resolve_coprocessors("native-only") == {}
+        assert reg.resolve_feedback_monitor("native-only") is None
+
+    def test_global_coprocessor_lane_disabled_without_profile(self, config_dir):
+        reg = self._base_registry(config_dir)
+        _write_config(config_dir, "sidecars.yaml", {
+            "coprocessors_enabled": False,
+            "coprocessors": {
+                "reviewer": {
+                    "model_id": "model-b",
+                    "mode": "verify",
+                    "enabled": True,
+                },
+            },
+            "feedback_monitor": {
+                "enabled": True,
+                "coprocessor_id": "reviewer",
+            },
+        })
+        reg.load_sidecars()
+        assert reg.coprocessors_enabled is False
+        assert reg.resolve_coprocessors(None) == {}
+        assert reg.resolve_feedback_monitor(None) is None
+
+    def test_global_coprocessor_switch_does_not_disable_native_agents(self, config_dir):
+        reg = self._base_registry(config_dir)
+        _write_config(config_dir, "sidecars.yaml", {
+            "coprocessors_enabled": False,
+            "sidecar_agents": {
+                "grounder": {
+                    "model_id": "model-b",
+                    "native_agent_name": "brigade-grounder",
+                    "public_model_alias": "anthropic-brigade-grounder",
+                    "roles": ["recon"],
+                    "description": "read-only test grounder",
+                    "tools": ["Read", "Grep", "Glob", "Bash"],
+                },
+            },
+        })
+        reg.load_sidecars()
+        assert set(reg.resolve_sidecar_agents(None)) == {"grounder"}
+        assert reg.resolve_coprocessors(None) == {}
+
+    def test_disabled_coprocessor_does_not_run_feedback_monitor(self, config_dir):
+        reg = self._base_registry(config_dir)
+        _write_config(config_dir, "sidecars.yaml", {
+            "coprocessors_enabled": True,
+            "coprocessors": {
+                "disabled-reviewer": {
+                    "model_id": "model-b",
+                    "mode": "structured",
+                    "enabled": False,
+                },
+            },
+            "feedback_monitor": {
+                "enabled": True,
+                "coprocessor_id": "disabled-reviewer",
+                "checkpoints": ["post_tool_batch"],
+                "watched_tools": ["Edit"],
+            },
+        })
+        reg.load_sidecars()
+        assert reg.resolve_coprocessors(None) == {}
+        assert reg.resolve_feedback_monitor(None) is None
+
+    def test_disabled_individual_coprocessor_is_not_resolved(self, config_dir):
+        reg = self._base_registry(config_dir)
+        _write_config(config_dir, "sidecars.yaml", {
+            "coprocessors": {
+                "enabled-reviewer": {
+                    "model_id": "model-b",
+                    "mode": "verify",
+                    "enabled": True,
+                },
+                "disabled-reviewer": {
+                    "model_id": "model-b",
+                    "mode": "verify",
+                    "enabled": False,
+                },
+            },
+        })
+        reg.load_sidecars()
+        assert set(reg.resolve_coprocessors(None)) == {"enabled-reviewer"}
 
     def test_resolve_fastpath_prefers_profile_own_fastpath_over_global(self, config_dir):
         reg = self._base_registry(config_dir)

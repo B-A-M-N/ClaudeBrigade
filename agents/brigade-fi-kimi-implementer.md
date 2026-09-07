@@ -1,8 +1,7 @@
 ---
-name: brigade-fi-kimi-implementer
-description: Mutation-capable coding worker backed by the logical Kimi Code model.
+name: brigade-sidecar-coding-worker
+description: Mutation-capable coding worker selected by the active sidecar route.
 tools: Read, Grep, Glob, Bash, Edit, Write
-model: anthropic-brigade-fi-kimi-implementer
 maxTurns: 60
 effort: high
 permissionMode: acceptEdits

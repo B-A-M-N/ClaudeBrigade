@@ -1,7 +1,6 @@
 ---
-name: qwen-recon
+name: brigade-recon
 description: Read-only repository investigator for broad architecture and dependency mapping.
-model: qwen3.6-35b
 tools: Read, Grep, Glob, Bash
 permissionMode: plan
 background: false

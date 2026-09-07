@@ -1,7 +1,6 @@
 ---
-name: qwen-implementer
-description: Primary implementation worker that executes DeepSeek's explicit contract.
-model: qwen3.6-35b
+name: brigade-implementer
+description: Primary implementation worker that executes the controller's explicit contract.
 tools: Read, Grep, Glob, Bash, Edit, Write
 permissionMode: acceptEdits
 background: false

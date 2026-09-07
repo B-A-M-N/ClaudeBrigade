@@ -1,7 +1,6 @@
 ---
-name: qwen-repairer
-description: Repairs only findings that the main DeepSeek controller accepts.
-model: qwen3.6-35b
+name: brigade-repairer
+description: Repairs only findings that the main controller accepts.
 tools: Read, Grep, Glob, Bash, Edit, Write
 permissionMode: acceptEdits
 background: false

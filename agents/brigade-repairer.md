@@ -2,12 +2,12 @@
 name: brigade-repairer
 description: Applies only defects that the controller has explicitly accepted after adversarial review, then reruns targeted and regression verification.
 tools: Read, Grep, Glob, Bash, Edit, Write
-model: anthropic-brigade-repairer
+model: opus
 maxTurns: 100
 effort: high
 permissionMode: acceptEdits
 isolation: worktree
-background: false
+background: true
 color: orange
 ---
 

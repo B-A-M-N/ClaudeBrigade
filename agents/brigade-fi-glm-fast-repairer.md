@@ -1,8 +1,7 @@
 ---
-name: brigade-fi-glm-fast-repairer
-description: Bounded repair worker backed by the logical GLM Turbo model.
+name: brigade-sidecar-fast-repairer
+description: Bounded repair worker selected by the active sidecar route.
 tools: Read, Grep, Glob, Bash, Edit, Write
-model: anthropic-brigade-fi-glm-fast-repairer
 maxTurns: 30
 effort: high
 permissionMode: acceptEdits

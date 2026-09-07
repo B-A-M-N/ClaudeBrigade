@@ -1,8 +1,7 @@
 ---
-name: brigade-fi-qwen-scout
-description: Fast read-only Qwen scout routed through the logical Qwen model and selected endpoint.
+name: brigade-sidecar-scout
+description: Fast read-only scout routed through the selected sidecar endpoint.
 tools: Read, Grep, Glob
-model: anthropic-brigade-fi-qwen-scout
 maxTurns: 25
 effort: high
 permissionMode: plan

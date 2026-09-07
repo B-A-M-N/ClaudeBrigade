@@ -2,7 +2,7 @@
 name: brigade-recon
 description: Proactively maps repositories and gathers evidence before designs cross-cutting or high-risk changes.
 tools: Read, Grep, Glob
-model: anthropic-brigade-recon
+model: haiku
 maxTurns: 60
 effort: high
 permissionMode: plan

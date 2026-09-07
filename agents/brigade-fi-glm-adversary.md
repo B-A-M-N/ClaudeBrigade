@@ -1,8 +1,7 @@
 ---
-name: brigade-fi-glm-adversary
-description: Fresh independent reviewer backed by the logical GLM model.
+name: brigade-sidecar-correctness-reviewer
+description: Fresh independent sidecar reviewer selected by the active route.
 tools: Read, Grep, Glob
-model: anthropic-brigade-fi-glm-adversary
 maxTurns: 30
 effort: high
 permissionMode: plan

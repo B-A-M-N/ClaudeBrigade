@@ -7,6 +7,7 @@ overridden via environment variable.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -57,11 +58,6 @@ ALLOWED_SUBAGENTS: frozenset[str] = frozenset({
     "brigade-adversary",
     "brigade-repairer",
     "controller-direct",
-    "brigade-fi-qwen-scout",
-    "brigade-fi-minimax-architect",
-    "brigade-fi-kimi-implementer",
-    "brigade-fi-glm-adversary",
-    "brigade-fi-glm-fast-repairer",
 })
 
 #: Agent types allowed to mutate the workspace
@@ -70,8 +66,6 @@ MUTATORS: frozenset[str] = frozenset({
     "brigade-implementer",
     "brigade-repairer",
     "controller-direct",
-    "brigade-fi-kimi-implementer",
-    "brigade-fi-glm-fast-repairer",
 })
 
 #: Agent types considered "implementation" for completion-sequence validation.
@@ -79,12 +73,25 @@ IMPLEMENTATION_AGENTS: frozenset[str] = frozenset({
     "brigade-implementer",
     "brigade-repairer",
     "controller-direct",
-    "brigade-fi-kimi-implementer",
-    "brigade-fi-glm-fast-repairer",
 })
 
 
-def _registry_agent_manifest() -> dict[str, dict[str, str]]:
+@dataclass(frozen=True)
+class AgentCapabilities:
+    """Capability snapshot projected for one native worker identity."""
+
+    roles: tuple[str, ...] = ()
+    tools: tuple[str, ...] = ()
+    disallowed_tools: tuple[str, ...] = ()
+    can_mutate: bool = False
+    isolation: str = "none"
+    may_spawn_agents: bool = False
+    may_integrate: bool = False
+    may_adjudicate: bool = False
+    counts_as_implementation: bool = False
+
+
+def _registry_agent_manifest() -> dict[str, dict]:
     """Load configured specialist identities when a hook sees one.
 
     Static role names remain available during bootstrap and when the registry
@@ -94,7 +101,10 @@ def _registry_agent_manifest() -> dict[str, dict[str, str]]:
     try:
         from enhanced_router.registry import get_registry
 
-        return get_registry().specialist_manifest()
+        registry = get_registry()
+        if hasattr(registry, "native_worker_manifest"):
+            return registry.native_worker_manifest()
+        return registry.specialist_manifest()
     except Exception:
         return {}
 
@@ -106,7 +116,7 @@ def authorized_subagents() -> frozenset[str]:
 def mutating_agents() -> frozenset[str]:
     dynamic = {
         name for name, entry in _registry_agent_manifest().items()
-        if entry.get("role") in {"implementer", "repairer", "controller"}
+        if entry.get("can_mutate") is True
     }
     return MUTATORS | frozenset(dynamic)
 
@@ -114,9 +124,50 @@ def mutating_agents() -> frozenset[str]:
 def implementation_agents() -> frozenset[str]:
     dynamic = {
         name for name, entry in _registry_agent_manifest().items()
-        if entry.get("role") in {"implementer", "repairer", "controller"}
+        if entry.get("counts_as_implementation") is True
     }
     return IMPLEMENTATION_AGENTS | frozenset(dynamic)
+
+
+def agent_capabilities(agent_type: str) -> AgentCapabilities:
+    """Return the explicit capability policy for a native worker.
+
+    Unknown identities are read-only. Role-name substring matching is kept
+    only in ``agent_role`` for diagnostic compatibility and is never used as
+    the mutation authority boundary.
+    """
+    entry = _registry_agent_manifest().get(agent_type)
+    if entry is not None:
+        roles = tuple(str(item) for item in (entry.get("roles") or [entry.get("role", "recon")]))
+        return AgentCapabilities(
+            roles=roles,
+            tools=tuple(str(item) for item in entry.get("tools", ())),
+            disallowed_tools=tuple(str(item) for item in entry.get("disallowed_tools", ())),
+            can_mutate=bool(entry.get("can_mutate")),
+            isolation=str(entry.get("isolation") or "none"),
+            may_spawn_agents=bool(entry.get("may_spawn_agents")),
+            may_integrate=bool(entry.get("may_integrate")),
+            may_adjudicate=bool(entry.get("may_adjudicate")),
+            counts_as_implementation=bool(entry.get("counts_as_implementation")),
+        )
+    if agent_type == "controller-direct":
+        return AgentCapabilities(
+            roles=("controller",),
+            tools=("Read", "Grep", "Glob", "Bash", "Edit", "Write"),
+            can_mutate=True,
+            isolation="worktree",
+            counts_as_implementation=True,
+        )
+    if agent_type in MUTATORS:
+        role = agent_role(agent_type)
+        return AgentCapabilities(
+            roles=(role,),
+            tools=("Read", "Grep", "Glob", "Bash", "Edit", "Write"),
+            can_mutate=True,
+            isolation="worktree",
+            counts_as_implementation=True,
+        )
+    return AgentCapabilities(roles=(agent_role(agent_type),))
 
 
 def agent_role(agent_type: str) -> str:
@@ -125,7 +176,7 @@ def agent_role(agent_type: str) -> str:
         return "controller"
     entry = _registry_agent_manifest().get(agent_type)
     if entry is not None:
-        return entry["role"]
+        return str(entry.get("role") or (entry.get("roles") or ["recon"])[0])
     return next(
         (candidate for candidate in ("recon", "implementer", "adversary", "repairer")
          if candidate in agent_type),

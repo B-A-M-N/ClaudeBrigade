@@ -287,6 +287,46 @@ models:
     capabilities: {tools: true, mutation: true, reasoning: medium, local: false, controller_eligible: true, openai_chat_completions: true, tool_calls: true, prompt_cache: true, read_tool_certified: true, write_tool_certified: true, max_output_tokens: 131072}
     allowed_roles: [recon, implementer, adversary, repairer]
 
+  deepseek-v4-flash:
+    display_name: DeepSeek V4 Flash via FreeInference
+    provider_id: freeinference
+    backend: litellm
+    litellm_model: openai/deepseek-v4-flash
+    api_base: https://freeinference.org/v1
+    api_key_env: FREEINFERENCE_API_KEY
+    endpoint_policy: {mode: highest-cache-rate, default_endpoint: openai, minimum_requests: 5, minimum_input_tokens: 50000}
+    endpoints:
+      openai:
+        backend: litellm
+        provider_id: freeinference
+        protocol: openai-chat
+        litellm_model: openai/deepseek-v4-flash
+        api_base: https://freeinference.org/v1
+        api_key_env: FREEINFERENCE_API_KEY
+        certified: false
+    capabilities: {tools: true, mutation: true, reasoning: high, local: false, controller_eligible: true, openai_chat_completions: true, tool_calls: true, prompt_cache: true, read_tool_certified: true, write_tool_certified: true, max_output_tokens: 131072}
+    allowed_roles: [recon, implementer, adversary, repairer]
+
+  glm-5.2:
+    display_name: GLM-5.2 via FreeInference
+    provider_id: freeinference
+    backend: litellm
+    litellm_model: openai/glm-5.2
+    api_base: https://freeinference.org/v1
+    api_key_env: FREEINFERENCE_API_KEY
+    endpoint_policy: {mode: highest-cache-rate, default_endpoint: openai, minimum_requests: 5, minimum_input_tokens: 50000}
+    endpoints:
+      openai:
+        backend: litellm
+        provider_id: freeinference
+        protocol: openai-chat
+        litellm_model: openai/glm-5.2
+        api_base: https://freeinference.org/v1
+        api_key_env: FREEINFERENCE_API_KEY
+        certified: false
+    capabilities: {tools: true, mutation: false, reasoning: high, local: false, controller_eligible: true, openai_chat_completions: true, tool_calls: true, prompt_cache: true, read_tool_certified: true, write_tool_certified: false, max_output_tokens: 131072}
+    allowed_roles: [recon, adversary, repairer]
+
   qwen3.6-35b:
     display_name: Qwen3.6 35B via FreeInference
     provider_id: freeinference

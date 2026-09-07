@@ -1,4 +1,8 @@
 from pathlib import Path
+import json
+import os
+import subprocess
+import sys
 
 import pytest
 from enhanced_router.agents_json import _split_top_level_csv, render_agents
@@ -12,7 +16,7 @@ def test_agent_tool_allowlist_is_not_split_inside_parentheses():
 def test_bundle_agents_render_for_native_agents_flag():
     directory = Path(__file__).resolve().parents[1] / "agents"
     agents = render_agents(directory)
-    assert agents["brigade-implementer"]["model"] == "anthropic-brigade-implementer"
+    assert agents["brigade-implementer"]["model"] == "sonnet"
     assert agents["brigade-adversary"]["background"] is True
     assert "prompt" in agents["brigade-repairer"]
     # Verify tools field is properly parsed as a list
@@ -77,10 +81,41 @@ def test_required_roles_validation():
 def test_expected_models_validation():
     directory = Path(__file__).resolve().parents[1] / "agents"
     agents = render_agents(directory)
-    assert agents["brigade-recon"]["model"] == "anthropic-brigade-recon"
-    assert agents["brigade-implementer"]["model"] == "anthropic-brigade-implementer"
-    assert agents["brigade-adversary"]["model"] == "anthropic-brigade-adversary"
-    assert agents["brigade-repairer"]["model"] == "anthropic-brigade-repairer"
+    assert agents["brigade-recon"]["model"] == "haiku"
+    assert agents["brigade-implementer"]["model"] == "sonnet"
+    assert agents["brigade-adversary"]["model"] == "opus"
+    assert agents["brigade-repairer"]["model"] == "opus"
+
+
+def test_agents_json_subprocess_preserves_inference_profile_with_sidecar_option(tmp_path):
+    """The launcher-shaped invocation must retain both independent lanes."""
+    repo = Path(__file__).resolve().parents[1]
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(repo / "router"),
+        "BRIGADE_CONFIG_DIR": str(repo / "config"),
+        "BRIGADE_STATE_DIR": str(tmp_path),
+    }
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "enhanced_router.agents_json",
+            str(repo / "agents"),
+            "--inference-profile",
+            "freeinference",
+            "--sidecar-profile",
+            "",
+        ],
+        cwd=repo,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    rendered = json.loads(result.stdout)
+    assert rendered["brigade-implementer"]["model"] == "sonnet"
+    assert rendered["brigade-recon"]["model"] == "haiku"
 
 
 def test_missing_role_raises_value_error(tmp_path):

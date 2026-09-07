@@ -1,8 +1,7 @@
 ---
-name: brigade-fi-minimax-architect
-description: Read-only long-context architecture scout backed by the logical MiniMax model.
+name: brigade-sidecar-architect-scout
+description: Read-only long-context architecture scout selected by the sidecar route.
 tools: Read, Grep, Glob
-model: anthropic-brigade-fi-minimax-architect
 maxTurns: 25
 effort: high
 permissionMode: plan

@@ -60,6 +60,16 @@ class TestModelCapabilities:
             )
 
 
+class TestSidecarProfile:
+    def test_bounded_coprocessor_lane_is_enabled_by_default(self):
+        profile = SidecarProfileSpec()
+        assert profile.coprocessors_enabled is True
+
+    def test_bounded_coprocessor_lane_can_be_disabled(self):
+        profile = SidecarProfileSpec(coprocessors_enabled=False)
+        assert profile.coprocessors_enabled is False
+
+
 class TestModelSpec:
     def test_managed_group_requires_litellm_endpoints(self):
         with pytest.raises(ValidationError, match="managed-group"):
@@ -286,6 +296,40 @@ class TestLaunchPresetSpec:
         spec = LaunchPresetSpec(inference_profile_id="hybrid", sidecar_profile_id="lightweight")
         assert spec.inference_profile_id == "hybrid"
         assert spec.sidecar_profile_id == "lightweight"
+
+
+class TestWorkflowComposition:
+    def test_native_augmented_requires_both_execution_planes(self):
+        from enhanced_router.config_models import WorkflowSpec, WorkflowPhase
+
+        with pytest.raises(ValueError, match="both native and sidecar"):
+            WorkflowSpec(
+                default_profile="freeinference",
+                composition_mode="native-augmented",
+                phases=[WorkflowPhase(id="native", agent_id="implementer")],
+            )
+
+    def test_sidecar_only_rejects_native_worker_phase(self):
+        from enhanced_router.config_models import WorkflowSpec, WorkflowPhase
+
+        with pytest.raises(ValueError, match="sidecar-only"):
+            WorkflowSpec(
+                default_profile="freeinference",
+                composition_mode="sidecar-only",
+                phases=[WorkflowPhase(id="native", agent_id="implementer")],
+            )
+
+    def test_adaptive_preserves_operator_authored_mixed_workflows(self):
+        from enhanced_router.config_models import WorkflowSpec, WorkflowPhase
+
+        workflow = WorkflowSpec(
+            default_profile="freeinference",
+            phases=[
+                WorkflowPhase(id="native", agent_id="implementer"),
+                WorkflowPhase(id="sidecar", sidecar_agent="grounder"),
+            ],
+        )
+        assert workflow.composition_mode == "adaptive"
 
 
 class TestRecommendationConstraints:
