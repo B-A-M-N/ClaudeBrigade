@@ -10,6 +10,8 @@ avoid a circular import.
 
 from __future__ import annotations
 
+from enhanced_router.repository_base import RepositoryMixin
+
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -21,7 +23,7 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-class ConditionEvaluationRepository:
+class ConditionEvaluationRepository(RepositoryMixin):
     """Mixin providing conditional-phase evaluation methods.
 
     Requires a host class that provides ``_new_conn() -> sqlite3.Connection``

@@ -9,6 +9,8 @@ so existing importers (``mcp_control.py``, tests) are unaffected.
 
 from __future__ import annotations
 
+from enhanced_router.repository_base import RepositoryMixin
+
 import sqlite3
 from datetime import datetime, timezone
 
@@ -22,7 +24,7 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-class BindingCommandRepository:
+class BindingCommandRepository(RepositoryMixin):
     """Mixin providing binding command persistence methods.
 
     Requires a host class that provides ``_new_conn() -> sqlite3.Connection``

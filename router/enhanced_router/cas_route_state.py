@@ -9,6 +9,8 @@ so existing importers are unaffected.
 
 from __future__ import annotations
 
+from enhanced_router.repository_base import RepositoryMixin
+
 import sqlite3
 from datetime import datetime, timezone
 
@@ -23,7 +25,7 @@ class RouteConflictError(Exception):
     """Raised when a compare-and-set route update's expected version is stale."""
 
 
-class CasRouteRepository:
+class CasRouteRepository(RepositoryMixin):
     """Mixin providing the compare-and-set role-route update method.
 
     Requires a host class that provides ``_new_conn() -> sqlite3.Connection``

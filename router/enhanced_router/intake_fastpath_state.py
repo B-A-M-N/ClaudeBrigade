@@ -10,6 +10,8 @@ is a zero-cross-reference, zero-risk extraction.
 
 from __future__ import annotations
 
+from enhanced_router.repository_base import RepositoryMixin
+
 import hashlib
 import json
 import sqlite3
@@ -20,7 +22,7 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-class IntakeFastpathRepository:
+class IntakeFastpathRepository(RepositoryMixin):
     """Mixin providing task-intake/route-proposal/fastpath persistence.
 
     Requires a host class that provides ``_new_conn() -> sqlite3.Connection``

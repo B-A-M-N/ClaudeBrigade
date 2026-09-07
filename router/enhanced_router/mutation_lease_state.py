@@ -9,6 +9,8 @@ their original names.
 
 from __future__ import annotations
 
+from enhanced_router.repository_base import RepositoryMixin
+
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -30,7 +32,7 @@ def _utcnow_age(max_age_seconds: int) -> str:
 _STALE_LEASE_MAX_AGE_SECONDS = 1_200
 
 
-class MutationLeaseRepository:
+class MutationLeaseRepository(RepositoryMixin):
     """Mixin providing mutation lease persistence methods.
 
     Requires a host class that provides ``_new_conn() -> sqlite3.Connection``
@@ -201,4 +203,3 @@ class MutationLeaseRepository:
             return cursor.rowcount
         finally:
             conn.close()
-

@@ -9,6 +9,8 @@ so existing importers (``routing.py``, tests) are unaffected.
 
 from __future__ import annotations
 
+from enhanced_router.repository_base import RepositoryMixin
+
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -22,7 +24,7 @@ class ControllerModelError(Exception):
     """Raised when a controller model is not permitted by policy."""
 
 
-class ControllerPolicyRepository:
+class ControllerPolicyRepository(RepositoryMixin):
     """Mixin providing controller model policy persistence methods.
 
     Requires a host class that provides ``_new_conn() -> sqlite3.Connection``
