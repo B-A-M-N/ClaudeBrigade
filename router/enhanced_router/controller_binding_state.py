@@ -13,6 +13,8 @@ mixin's normal method resolution order.
 
 from __future__ import annotations
 
+from enhanced_router.repository_base import RepositoryMixin
+
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -27,7 +29,7 @@ def _utcnow_age(max_age_seconds: int) -> str:
     return cutoff.isoformat()
 
 
-class ControllerBindingRepository:
+class ControllerBindingRepository(RepositoryMixin):
     """Mixin providing controller binding/endpoint observation methods.
 
     Requires a host class that provides ``_new_conn() -> sqlite3.Connection``
@@ -92,6 +94,8 @@ class ControllerBindingRepository:
         deployment_group: str | None = None,
         allowed_deployments_json: str | None = None,
         deployment_policy_digest: str | None = None,
+        route_digest: str | None = None,
+        candidate_index: int | None = None,
     ) -> tuple[dict, bool]:
         """Create the immutable controller binding for one client session."""
         conn = self._new_conn()
@@ -108,13 +112,13 @@ class ControllerBindingRepository:
                 " provider_id, api_base, catalog_generation, registry_hash, certification_id, auth_spec_json,"
                 " api_key_env, endpoint_id, provider_ids_json, endpoint_selection_reason, endpoint_policy_json,"
                 " litellm_model_name, configuration_hash, routing_mode, deployment_group,"
-                " allowed_deployments_json, deployment_policy_digest, bound_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " allowed_deployments_json, deployment_policy_digest, route_digest, candidate_index, bound_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (run_id, client_session_id, public_model, registry_model_id, backend, upstream_model,
                  provider_id, api_base, catalog_generation, registry_hash, certification_id, auth_spec_json,
                  api_key_env, endpoint_id, provider_ids_json, endpoint_selection_reason, endpoint_policy_json,
                 litellm_model_name, configuration_hash, routing_mode, deployment_group,
-                allowed_deployments_json, deployment_policy_digest, now),
+                allowed_deployments_json, deployment_policy_digest, route_digest, candidate_index, now),
             )
             binding = self._select_controller_binding(conn, run_id, client_session_id)
             assert binding is not None

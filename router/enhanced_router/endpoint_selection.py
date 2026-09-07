@@ -55,6 +55,17 @@ def select_endpoint(
     if spec.availability == "unavailable":
         raise ValueError(f"Model '{model_id}' is unavailable in the provider catalog")
     endpoints = spec.endpoints or {"default": _legacy_endpoint(spec)}
+    if provider_id:
+        provider_endpoints = {
+            endpoint_id: endpoint
+            for endpoint_id, endpoint in endpoints.items()
+            if (endpoint.provider_id or spec.provider_id) == provider_id
+        }
+        if not provider_endpoints:
+            raise ValueError(
+                f"Provider '{provider_id}' has no endpoint for model '{model_id}'"
+            )
+        endpoints = provider_endpoints
     candidates: dict[str, ModelEndpointSpec] = {}
     for endpoint_id, endpoint in endpoints.items():
         if endpoint.availability == "unavailable":

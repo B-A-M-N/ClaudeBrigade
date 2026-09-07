@@ -12,16 +12,21 @@ method resolution order.
 
 from __future__ import annotations
 
+from enhanced_router.repository_base import RepositoryMixin
+
 import json
 import sqlite3
 from datetime import datetime, timezone
+
+from enhanced_router.route_ladder import target_candidates
+from enhanced_router.slot_binding_state import insert_slot_bindings
 
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-class EpochRepository:
+class EpochRepository(RepositoryMixin):
     """Mixin providing epoch lifecycle persistence methods.
 
     Requires a host class that provides ``_new_conn() -> sqlite3.Connection``
@@ -132,24 +137,39 @@ class EpochRepository:
                 for role in ("recon", "implementer", "adversary", "repairer"):
                     target = profile.route_target(role)
                     model_id = target.model
+                    candidates = target_candidates(target)
+                    primary = candidates[0]
+                    fallback_models = [item["model"] for item in candidates[1:]]
+                    fallback_routes = candidates[1:]
                     conn.execute(
-                        """INSERT INTO role_routes (run_id, epoch_id, role, model_id, source, reason, version, changed_at)
-                           VALUES (?, ?, ?, ?, 'profile', ?, 1, ?)
+                        """INSERT INTO role_routes (
+                               run_id, epoch_id, role, model_id, source, reason,
+                               version, changed_at, primary_route_json,
+                               fallback_models_json, fallback_routes_json
+                           ) VALUES (?, ?, ?, ?, 'profile', ?, 1, ?, ?, ?, ?)
                            ON CONFLICT(run_id, epoch_id, role) DO UPDATE SET
                                model_id = excluded.model_id,
                                source = excluded.source,
                                reason = excluded.reason,
                                version = version + 1,
-                               changed_at = excluded.changed_at""",
-                        (run_id, epoch_id, role, model_id, reason, now),
+                               changed_at = excluded.changed_at,
+                               primary_route_json = excluded.primary_route_json,
+                               fallback_models_json = excluded.fallback_models_json,
+                               fallback_routes_json = excluded.fallback_routes_json""",
+                        (
+                            run_id, epoch_id, role, model_id, reason, now,
+                            json.dumps(primary, separators=(",", ":")),
+                            json.dumps(fallback_models, separators=(",", ":")),
+                            json.dumps(fallback_routes, separators=(",", ":")),
+                        ),
                     )
                     conn.execute(
                         "UPDATE role_routes SET endpoint_id=? WHERE run_id=? AND epoch_id=? AND role=?",
                         (None if target.endpoint == "auto" else target.endpoint, run_id, epoch_id, role),
                     )
                     conn.execute(
-                        "UPDATE role_routes SET fallback_models_json=? WHERE run_id=? AND epoch_id=? AND role=?",
-                        (json.dumps(target.fallback_models), run_id, epoch_id, role),
+                        "UPDATE role_routes SET endpoint_id=? WHERE run_id=? AND epoch_id=? AND role=?",
+                        (None if primary["endpoint"] == "auto" else primary["endpoint"], run_id, epoch_id, role),
                     )
 
                     # 2. Read actual version after upsert
@@ -175,6 +195,14 @@ class EpochRepository:
                         "reason": reason,
                         "version": actual_version,
                     }
+
+                insert_slot_bindings(
+                    conn,
+                    run_id=run_id,
+                    epoch_id=epoch_id,
+                    bindings=reg.slot_alias_manifest(profile_id).values(),
+                    registry_hash=reg.registry_hash(),
+                )
 
                 conn.commit()
             except Exception:
@@ -207,40 +235,62 @@ class EpochRepository:
                         f"Active epoch already exists for run {run_id}"
                     )
 
-                # Create the epoch row
-                conn.execute(
-                    "INSERT INTO epochs (run_id, epoch_id, workflow_id, profile_id, status, created_at) VALUES (?, ?, ?, ?, 'active', ?)",
-                    (run_id, epoch_id, workflow_id, profile_id, _utcnow()),
-                )
-
-                # Load profile and set routes -- raise on failure
+                # Resolve and snapshot the workflow composition before the
+                # epoch becomes active. Later YAML reloads cannot change the
+                # execution-plane contract for this run.
                 from enhanced_router.registry import get_registry
 
                 reg = get_registry()
+                reg.load_workflows()
+                workflow = reg.get_workflow(workflow_id)
+                composition_mode = workflow.composition_mode if workflow else None
+
+                # Create the epoch row
+                conn.execute(
+                    "INSERT INTO epochs (run_id, epoch_id, workflow_id, profile_id, composition_mode, status, created_at) VALUES (?, ?, ?, ?, ?, 'active', ?)",
+                    (run_id, epoch_id, workflow_id, profile_id, composition_mode, _utcnow()),
+                )
+
+                # Load profile and set routes -- raise on failure
                 reg.load_profiles()
                 profile = reg.get_profile(profile_id)
                 now = _utcnow()
                 for role in ("recon", "implementer", "adversary", "repairer"):
                     target = profile.route_target(role)
                     model_id = target.model
+                    candidates = target_candidates(target)
+                    primary = candidates[0]
+                    fallback_models = [item["model"] for item in candidates[1:]]
+                    fallback_routes = candidates[1:]
                     conn.execute(
-                        """INSERT INTO role_routes (run_id, epoch_id, role, model_id, source, reason, version, changed_at)
-                           VALUES (?, ?, ?, ?, 'profile', ?, 1, ?)
+                        """INSERT INTO role_routes (
+                               run_id, epoch_id, role, model_id, source, reason,
+                               version, changed_at, primary_route_json,
+                               fallback_models_json, fallback_routes_json
+                           ) VALUES (?, ?, ?, ?, 'profile', ?, 1, ?, ?, ?, ?)
                            ON CONFLICT(run_id, epoch_id, role) DO UPDATE SET
                                model_id = excluded.model_id,
                                source = excluded.source,
                                reason = excluded.reason,
                                version = version + 1,
-                               changed_at = excluded.changed_at""",
-                        (run_id, epoch_id, role, model_id, f"profile:{profile_id}", now),
+                               changed_at = excluded.changed_at,
+                               primary_route_json = excluded.primary_route_json,
+                               fallback_models_json = excluded.fallback_models_json,
+                               fallback_routes_json = excluded.fallback_routes_json""",
+                        (
+                            run_id, epoch_id, role, model_id, f"profile:{profile_id}", now,
+                            json.dumps(primary, separators=(",", ":")),
+                            json.dumps(fallback_models, separators=(",", ":")),
+                            json.dumps(fallback_routes, separators=(",", ":")),
+                        ),
                     )
                     conn.execute(
                         "UPDATE role_routes SET endpoint_id=? WHERE run_id=? AND epoch_id=? AND role=?",
                         (None if target.endpoint == "auto" else target.endpoint, run_id, epoch_id, role),
                     )
                     conn.execute(
-                        "UPDATE role_routes SET fallback_models_json=? WHERE run_id=? AND epoch_id=? AND role=?",
-                        (json.dumps(target.fallback_models), run_id, epoch_id, role),
+                        "UPDATE role_routes SET endpoint_id=? WHERE run_id=? AND epoch_id=? AND role=?",
+                        (None if primary["endpoint"] == "auto" else primary["endpoint"], run_id, epoch_id, role),
                     )
 
                     # Append route_event for each role
@@ -249,6 +299,14 @@ class EpochRepository:
                         "VALUES (?, ?, 'profile_set', ?, ?, ?)",
                         (run_id, epoch_id, role, model_id, now),
                     )
+
+                insert_slot_bindings(
+                    conn,
+                    run_id=run_id,
+                    epoch_id=epoch_id,
+                    bindings=reg.slot_alias_manifest(profile_id).values(),
+                    registry_hash=reg.registry_hash(),
+                )
 
                 conn.commit()
                 epoch = conn.execute(

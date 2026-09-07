@@ -14,6 +14,8 @@ method resolution order, exactly like the public methods below.
 
 from __future__ import annotations
 
+from enhanced_router.repository_base import RepositoryMixin
+
 import sqlite3
 from datetime import datetime, timezone
 
@@ -22,7 +24,7 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-class BindingRepository:
+class BindingRepository(RepositoryMixin):
     """Mixin providing agent binding persistence methods.
 
     Requires a host class that provides ``_new_conn() -> sqlite3.Connection``
@@ -83,6 +85,8 @@ class BindingRepository:
         deployment_policy_digest: str | None = None,
         claude_session_id: str | None = None,
         claude_parent_agent_id: str | None = None,
+        route_digest: str | None = None,
+        candidate_index: int | None = None,
     ) -> tuple[dict, bool]:
         """Atomically bind or return existing binding.
 
@@ -117,17 +121,18 @@ class BindingRepository:
                     " backend, registry_hash, catalog_generation, litellm_model_name, upstream_model, api_base, api_key_env,"
                     " auth_spec_json, endpoint_id, endpoint_selection_reason, endpoint_policy_json, certification_id, provider_id,"
                     " provider_ids_json, claude_session_id, claude_parent_agent_id, configuration_hash, routing_mode, deployment_group,"
+                    " route_digest, candidate_index,"
                     " allowed_deployments_json, deployment_policy_digest) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
                     "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                    "?, ?, ?, ?, ?, ?, ?, ?)",
+                    "?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         run_id, claude_agent_id, epoch_id, role, model_id, route_version, now,
                         backend, registry_hash, catalog_generation, litellm_model_name, upstream_model, api_base, api_key_env,
                         auth_spec_json or "", endpoint_id, endpoint_selection_reason, endpoint_policy_json,
                         certification_id, provider_id, provider_ids_json, claude_session_id or "", claude_parent_agent_id or "",
-                        configuration_hash, routing_mode, deployment_group, allowed_deployments_json,
-                        deployment_policy_digest,
+                        configuration_hash, routing_mode, deployment_group, route_digest, candidate_index,
+                        allowed_deployments_json, deployment_policy_digest,
                     ),
                 )
                 binding = self._select_agent_binding(conn, run_id, claude_agent_id)

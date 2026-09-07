@@ -9,6 +9,8 @@ their original names.
 
 from __future__ import annotations
 
+from enhanced_router.repository_base import RepositoryMixin
+
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -20,7 +22,7 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-class RouteOperationsRepository:
+class RouteOperationsRepository(RepositoryMixin):
     """Mixin providing role-route persistence methods.
 
     Requires a host class that provides ``_new_conn() -> sqlite3.Connection``
@@ -33,6 +35,7 @@ class RouteOperationsRepository:
     def set_role_route(
         self, run_id: str, epoch_id: str, role: str, model_id: str, source: str,
         reason: str = "", endpoint_override: str | None = None,
+        provider_id: str | None = None,
         fallback_models: list[str] | None = None,
         fallback_routes: list[dict] | None = None,
     ) -> dict:
@@ -55,16 +58,28 @@ class RouteOperationsRepository:
             new_version = (existing[0] if existing else 0) + 1
 
             conn.execute(
-                """INSERT INTO role_routes (run_id, epoch_id, role, model_id, source, reason, version, changed_at, endpoint_id, endpoint_override)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO role_routes (
+                       run_id, epoch_id, role, model_id, source, reason, version,
+                       changed_at, endpoint_id, endpoint_override, primary_route_json
+                   )
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(run_id, epoch_id, role) DO UPDATE SET
                        model_id = excluded.model_id,
                        source = excluded.source,
                        reason = excluded.reason,
                        version = excluded.version,
                        changed_at = excluded.changed_at,
-                       endpoint_override = excluded.endpoint_override""",
-                (run_id, epoch_id, role, model_id, source, reason, new_version, now, endpoint_override, endpoint_override),
+                       endpoint_override = excluded.endpoint_override,
+                       primary_route_json = excluded.primary_route_json""",
+                (
+                    run_id, epoch_id, role, model_id, source, reason, new_version,
+                    now, endpoint_override, endpoint_override,
+                    json.dumps({
+                        "model": model_id,
+                        "provider_id": provider_id,
+                        "endpoint": endpoint_override or "auto",
+                    }, separators=(",", ":")),
+                ),
             )
 
             conn.execute(
@@ -102,6 +117,12 @@ class RouteOperationsRepository:
                 "version": new_version,
                 "changed_at": now,
                 "endpoint_override": endpoint_override,
+                "provider_id": provider_id,
+                "primary_route": {
+                    "model": model_id,
+                    "provider_id": provider_id,
+                    "endpoint": endpoint_override or "auto",
+                },
                 "fallback_models": fallback_models or [],
                 "fallback_routes": fallback_routes or [],
             }
@@ -111,12 +132,25 @@ class RouteOperationsRepository:
     _ROLE_ROUTE_COLUMNS: tuple[str, ...] = (
         "run_id", "epoch_id", "role", "model_id", "source", "reason", "version",
         "changed_at", "endpoint_id", "endpoint_override", "fallback_models_json",
-        "fallback_routes_json",
+        "primary_route_json", "fallback_routes_json",
     )
 
     @classmethod
     def _row_to_role_route(cls, row) -> dict:
         route: dict = dict(zip(cls._ROLE_ROUTE_COLUMNS, row))
+        try:
+            primary_route = json.loads(route.get("primary_route_json") or "{}")
+        except (TypeError, ValueError):
+            primary_route = {}
+        if not isinstance(primary_route, dict):
+            primary_route = {}
+        if not primary_route.get("model"):
+            primary_route = {
+                "model": route.get("model_id"),
+                "endpoint": route.get("endpoint_override") or "auto",
+            }
+        route["primary_route"] = primary_route
+        route["provider_id"] = primary_route.get("provider_id")
         try:
             route["fallback_routes"] = json.loads(route.get("fallback_routes_json") or "[]")
         except (TypeError, ValueError):

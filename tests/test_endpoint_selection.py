@@ -52,6 +52,33 @@ def test_explicit_endpoint_is_pinned_over_cache_rate():
     assert selected.endpoint_id == "anthropic"
 
 
+def test_provider_override_filters_auto_endpoint_selection():
+    """A route candidate's provider cannot be silently ignored."""
+    spec = ModelSpec(
+        display_name="Shared model",
+        backend="litellm",
+        litellm_model="openai/shared-model",
+        endpoints={
+            "openai": ModelEndpointSpec(
+                backend="litellm", litellm_model="openai/shared-model",
+                provider_id="provider-a", certified=True,
+            ),
+            "anthropic": ModelEndpointSpec(
+                backend="direct-anthropic", upstream_model="shared-model",
+                api_base="https://provider-b.example/anthropic",
+                provider_id="provider-b", certified=True,
+            ),
+        },
+        capabilities=ModelCapabilities(
+            tools=True, mutation=False, context_tokens=262144, reasoning="medium",
+        ),
+    )
+    selected = select_endpoint(
+        "shared-model", spec, FakeState({}), provider_id="provider-b",
+    )
+    assert selected.endpoint_id == "anthropic"
+
+
 def test_uncertified_endpoints_are_not_production_candidates():
     spec = ModelSpec(
         display_name="Qwen",
