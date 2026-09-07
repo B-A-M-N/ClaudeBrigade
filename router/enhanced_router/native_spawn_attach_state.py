@@ -11,6 +11,8 @@ the router actually bound), and the assignment lifecycle tracks completion.
 
 from __future__ import annotations
 
+from enhanced_router.repository_base import RepositoryMixin
+
 import hashlib
 import json
 import sqlite3
@@ -23,7 +25,7 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-class NativeSpawnAttachRepository:
+class NativeSpawnAttachRepository(RepositoryMixin):
     """Mixin providing native-agent spawn claim/attach persistence.
 
     Requires a host class that provides ``_new_conn() -> sqlite3.Connection``
@@ -102,7 +104,19 @@ class NativeSpawnAttachRepository:
                 "SELECT * FROM runnable_action_claims WHERE action_id=?",
                 (row["action_id"],),
             ).fetchone()
-            return dict(result) if result is not None else None
+            if result is None:
+                return None
+            result_dict = dict(result)
+            if result_dict.get("intent_id"):
+                intent = conn.execute(
+                    "SELECT worker_kind, worker_id, agent_definition_id, native_slot, "
+                    "public_model_alias, capability_digest, priority_class, package_id "
+                    "FROM spawn_intents WHERE intent_id=?",
+                    (result_dict["intent_id"],),
+                ).fetchone()
+                if intent is not None:
+                    result_dict.update(dict(intent))
+            return result_dict
         finally:
             conn.close()
 
@@ -114,11 +128,14 @@ class NativeSpawnAttachRepository:
         native_agent_name: str,
         role: str,
         model_id: str,
+        endpoint_id: str | None = None,
         claude_agent_id: str,
         execution_id: str,
         workspace_id: str | None,
         phase_id: str | None,
         provider_id: str | None = None,
+        route_digest: str | None = None,
+        candidate_index: int | None = None,
         spawn_call_id: str | None = None,
         claim_token: str | None = None,
         binding_id: int | None = None,
@@ -166,6 +183,39 @@ class NativeSpawnAttachRepository:
             claim = rows[0]
             if claim["claude_agent_id"] not in (None, claude_agent_id):
                 raise WorkflowStateError("native action is already attached to another child")
+            if str(claim["model_id"]) != str(model_id):
+                raise WorkflowStateError("native action model does not match its claim")
+            claimed_endpoint = str(claim["endpoint_id"] or "auto")
+            supplied_endpoint = str(endpoint_id or "auto")
+            if claimed_endpoint != supplied_endpoint:
+                raise WorkflowStateError("native action endpoint does not match its claim")
+            if claim["provider_id"] != provider_id:
+                raise WorkflowStateError("native action provider does not match its claim")
+            if claim["route_digest"] and route_digest and claim["route_digest"] != route_digest:
+                raise WorkflowStateError("native action route digest does not match its claim")
+            if claim["candidate_index"] is not None and candidate_index is not None \
+                    and int(claim["candidate_index"]) != int(candidate_index):
+                raise WorkflowStateError("native action candidate does not match its claim")
+
+            intent = None
+            capability_snapshot: dict = {}
+            if claim["intent_id"]:
+                intent = conn.execute(
+                    "SELECT * FROM spawn_intents WHERE intent_id=?",
+                    (claim["intent_id"],),
+                ).fetchone()
+                if intent is not None:
+                    try:
+                        capability_snapshot = json.loads(
+                            str(intent["capability_snapshot_json"] or "{}")
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        capability_snapshot = {}
+            can_mutate = (
+                bool(capability_snapshot.get("can_mutate"))
+                if capability_snapshot
+                else role in {"implementer", "repairer", "controller"}
+            )
 
             existing_execution = conn.execute(
                 "SELECT * FROM agent_executions WHERE execution_id=?",
@@ -221,7 +271,8 @@ class NativeSpawnAttachRepository:
             if binding_id is not None:
                 binding = conn.execute(
                     "SELECT run_id, epoch_id, claude_agent_id, role, model_id, released_at, "
-                    "provider_id FROM agent_bindings WHERE binding_id=?",
+                    "provider_id, endpoint_id, route_digest, candidate_index "
+                    "FROM agent_bindings WHERE binding_id=?",
                     (binding_id,),
                 ).fetchone()
                 if binding is None:
@@ -236,6 +287,10 @@ class NativeSpawnAttachRepository:
                     raise WorkflowStateError("native agent binding is already released")
                 if provider_id is not None and binding[6] is not None and provider_id != binding[6]:
                     raise WorkflowStateError("native execution provider does not match its binding")
+                if binding[7] is not None and str(binding[7] or "auto") != supplied_endpoint:
+                    raise WorkflowStateError("native execution endpoint does not match its binding")
+                if binding[8] and claim["route_digest"] and binding[8] != claim["route_digest"]:
+                    raise WorkflowStateError("native execution route does not match its binding")
 
             independence_key = hashlib.sha256(
                 json.dumps({
@@ -253,25 +308,44 @@ class NativeSpawnAttachRepository:
                     "SELECT kind, status, owner_execution_id FROM workspaces WHERE workspace_id=?",
                     (workspace_id,),
                 ).fetchone()
-                if role in {"implementer", "repairer", "controller"}:
+                if can_mutate:
                     if workspace is None or workspace[0] != "shadow" or workspace[1] != "active" \
                             or workspace[2] != execution_id:
                         raise WorkflowStateError(
                             "mutating native execution is not attached to its active shadow workspace"
                         )
-            elif role in {"implementer", "repairer", "controller"}:
+            elif can_mutate:
                 raise WorkflowStateError("mutating native execution requires a shadow workspace")
 
             now = _utcnow()
             conn.execute(
                 "INSERT INTO agent_executions "
                 "(execution_id, run_id, epoch_id, claude_agent_id, role, model_id, phase_id, "
-                "binding_id, status, actor_kind, execution_kind, provider_id, workspace_id, independence_key) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'started', ?, ?, ?, ?, ?)",
+                "binding_id, status, actor_kind, execution_kind, provider_id, endpoint_id, route_digest, "
+                "candidate_index, workspace_id, independence_key, "
+                "worker_kind, worker_id, capability_snapshot_json, tool_policy_digest, "
+                "prompt_contract_digest, workspace_policy, background, package_id, agent_definition_id, "
+                "native_slot, public_model_alias, capability_digest, priority_class) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'started', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     execution_id, run_id, epoch_id, claude_agent_id, role, model_id,
-                    phase_id, binding_id, actor_kind, execution_kind, provider_id,
+                    phase_id, binding_id, actor_kind, execution_kind, provider_id, endpoint_id,
+                    route_digest or claim["route_digest"],
+                    candidate_index if candidate_index is not None else claim["candidate_index"],
                     workspace_id, independence_key,
+                    (intent["worker_kind"] if intent is not None else None),
+                    (intent["worker_id"] if intent is not None else None),
+                    json.dumps(capability_snapshot, separators=(",", ":")),
+                    (intent["tool_policy_digest"] if intent is not None else None),
+                    (intent["prompt_contract_digest"] if intent is not None else None),
+                    (intent["workspace_policy"] if intent is not None else None),
+                    (intent["background"] if intent is not None else None),
+                    (intent["package_id"] if intent is not None else None),
+                    (intent["agent_definition_id"] if intent is not None else None),
+                    (intent["native_slot"] if intent is not None else None),
+                    (intent["public_model_alias"] if intent is not None else None),
+                    (intent["capability_digest"] if intent is not None else None),
+                    (intent["priority_class"] if intent is not None else None),
                 ),
             )
             claim_update = conn.execute(
@@ -317,8 +391,11 @@ class NativeSpawnAttachRepository:
         conn = self._new_conn()
         try:
             rows = conn.execute(
-                "SELECT * FROM runnable_action_claims WHERE run_id=? AND epoch_id=? "
-                "AND native_agent_name=? AND role=? AND status='claimed' "
+                "SELECT c.*, i.worker_kind, i.worker_id, i.capability_snapshot_json, "
+                "i.workspace_policy, i.background, i.package_id "
+                "FROM runnable_action_claims AS c LEFT JOIN spawn_intents AS i "
+                "ON i.intent_id=c.intent_id WHERE c.run_id=? AND c.epoch_id=? "
+                "AND c.native_agent_name=? AND c.role=? AND c.status='claimed' "
                 "AND expires_at >= ? ORDER BY claimed_at, action_id",
                 (run_id, epoch_id, native_agent_name, role, _utcnow()),
             ).fetchall()
@@ -445,6 +522,7 @@ class NativeSpawnAttachRepository:
         }[status]
         intent_status = "completed" if status == "completed" else "failed"
         conn = self._new_conn()
+        token_reservation_id: str | None = None
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -456,6 +534,7 @@ class NativeSpawnAttachRepository:
             if row is None:
                 conn.rollback()
                 return None
+            token_reservation_id = str(row["token_reservation_id"]) if row["token_reservation_id"] else None
             now = _utcnow()
             # Older embedded callers may still consume a claim with a child
             # ID before creating an authoritative execution.  Preserve their
@@ -481,6 +560,11 @@ class NativeSpawnAttachRepository:
                 "SELECT * FROM runnable_action_claims WHERE action_id=?",
                 (row["action_id"],),
             ).fetchone()
+            if token_reservation_id:
+                self.release_token_reservation(
+                    token_reservation_id,
+                    "consumed" if status == "completed" else "released",
+                )
             return dict(result) if result is not None else None
         finally:
             conn.close()

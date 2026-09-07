@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import logging
-import secrets
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Callable
 
 from enhanced_router.base import DEFAULT_DB_PATH
-from enhanced_router.state_errors import WorkflowStateError
+from enhanced_router.state_errors import WorkflowStateError  # noqa: F401
 from enhanced_router.litellm_state import LiteLLMGenerationRepository
 from enhanced_router.model_health_state import ModelHealthRepository
 from enhanced_router.mutation_lease_state import MutationLeaseRepository
@@ -22,20 +20,28 @@ from enhanced_router.route_state import RouteOperationsRepository
 from enhanced_router.binding_state import BindingRepository
 from enhanced_router.epoch_state import EpochRepository
 from enhanced_router.controller_binding_state import ControllerBindingRepository
-from enhanced_router.cas_route_state import CasRouteRepository, RouteConflictError
-from enhanced_router.controller_policy_state import ControllerPolicyRepository, ControllerModelError
-from enhanced_router.binding_command_state import BindingCommandRepository, VALID_COMMAND_TYPES
-from enhanced_router.workflow_phase_state import WorkflowPhaseRepository, WorkflowPhaseStateError
+from enhanced_router.cas_route_state import CasRouteRepository, RouteConflictError  # noqa: F401
+from enhanced_router.controller_policy_state import ControllerPolicyRepository, ControllerModelError  # noqa: F401
+from enhanced_router.binding_command_state import BindingCommandRepository, VALID_COMMAND_TYPES  # noqa: F401
+from enhanced_router.workflow_phase_state import WorkflowPhaseRepository, WorkflowPhaseStateError  # noqa: F401
 from enhanced_router.condition_evaluation_state import ConditionEvaluationRepository
 from enhanced_router.agent_execution_state import AgentExecutionRepository
 from enhanced_router.shadow_workspace_state import ShadowWorkspaceRepository
 from enhanced_router.intake_fastpath_state import IntakeFastpathRepository
 from enhanced_router.provider_reservation_state import ProviderReservationRepository
-from enhanced_router.sidecar_execution_state import SidecarExecutionRepository
+from enhanced_router.coprocessor_execution_state import CoprocessorExecutionRepository
 from enhanced_router.native_spawn_attach_state import NativeSpawnAttachRepository
 from enhanced_router.run_registry_state import RunRegistryRepository
-from enhanced_router.runnable_action_state import RunnableActionRepository, _utcnow_age
+from enhanced_router.runnable_action_state import RunnableActionRepository, _utcnow_age  # noqa: F401
 from enhanced_router.run_orchestration_state import RunOrchestrationRepository
+from enhanced_router.slot_binding_state import SlotBindingRepository
+from enhanced_router.feedback_state import FeedbackRepository
+from enhanced_router.token_reservation_state import TokenReservationRepository
+from enhanced_router.route_attempt_state import RouteAttemptRepository
+from enhanced_router.contract_state import ContractRepository
+from enhanced_router.work_package_state import WorkPackageRepository
+from enhanced_router.escalation_state import EscalationRepository
+from enhanced_router.resource_policy_state import ResourcePolicyRepository
 
 logger = logging.getLogger("claude-enhanced-router")
 
@@ -60,6 +66,7 @@ CREATE TABLE IF NOT EXISTS runs (
     run_id TEXT PRIMARY KEY,
     claude_session_id TEXT,
     cwd TEXT,
+    resource_policy_json TEXT,
     created_at TEXT NOT NULL,
     closed_at TEXT
 );
@@ -70,6 +77,7 @@ CREATE TABLE IF NOT EXISTS epochs (
     epoch_id TEXT NOT NULL,
     workflow_id TEXT NOT NULL,
     profile_id TEXT,
+    composition_mode TEXT,
     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','closed')),
     created_at TEXT NOT NULL,
     closed_at TEXT
@@ -86,6 +94,8 @@ CREATE TABLE IF NOT EXISTS role_routes (
     version INTEGER NOT NULL,
     changed_at TEXT NOT NULL,
     fallback_models_json TEXT NOT NULL DEFAULT '[]',
+    primary_route_json TEXT NOT NULL DEFAULT '{}',
+    fallback_routes_json TEXT DEFAULT '[]',
     PRIMARY KEY (run_id, epoch_id, role)
 );
 
@@ -156,6 +166,23 @@ CREATE TABLE IF NOT EXISTS litellm_deployments (
     health_checked_at TEXT,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS litellm_deployment_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    deployment_id INTEGER NOT NULL REFERENCES litellm_deployments(id),
+    generation INTEGER NOT NULL REFERENCES litellm_generations(generation),
+    event TEXT NOT NULL,
+    status TEXT,
+    pid INTEGER,
+    port INTEGER,
+    active_requests INTEGER NOT NULL DEFAULT 0,
+    active_streams INTEGER NOT NULL DEFAULT 0,
+    reason TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_litellm_deployment_events
+    ON litellm_deployment_events(deployment_id, created_at);
 
 CREATE TABLE IF NOT EXISTS workflow_phases (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -309,6 +336,27 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     if current < 41:
         _migrate_v41(conn)
         conn.execute("PRAGMA user_version = 41")
+    # Capability and worker identity fields are shape-detected so existing
+    # v41 installations migrate safely without rewriting historical rows.
+    _migrate_v42(conn)
+    _migrate_v43(conn)
+    _migrate_v44(conn)
+    _migrate_v45(conn)
+    _migrate_v46(conn)
+    _migrate_v47(conn)
+    _migrate_v48(conn)
+    _migrate_v49(conn)
+    # v42+ hardening migrations are shape-detected rather than versioned so
+    # legacy installations retain their historical user_version contract.
+    # v50 is idempotent and is therefore also shape-applied here.
+    _migrate_v50(conn)
+    _migrate_v51(conn)
+    _migrate_v52(conn)
+    _migrate_v53(conn)
+    _migrate_v54(conn)
+    _migrate_v55(conn)
+    _migrate_v56(conn)
+    _migrate_v57(conn)
 
 
 def _needs_v37_hardening(conn: sqlite3.Connection) -> bool:
@@ -972,7 +1020,6 @@ def _migrate_v24(conn: sqlite3.Connection) -> None:
         "result_json": "TEXT",
     }.items():
         _add_column_if_missing(conn, "agent_executions", name, declaration)
-
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS provider_reservations (
             reservation_id TEXT PRIMARY KEY,
@@ -1244,6 +1291,7 @@ def _migrate_v35(conn: sqlite3.Connection) -> None:
             role TEXT NOT NULL,
             native_agent_name TEXT NOT NULL,
             model_id TEXT NOT NULL,
+            endpoint_id TEXT,
             provider_id TEXT,
             claim_token TEXT NOT NULL UNIQUE,
             reservation_id TEXT,
@@ -1311,6 +1359,453 @@ def _migrate_v41(conn: sqlite3.Connection) -> None:
     conn.execute("UPDATE workspaces SET heartbeat_at = created_at WHERE heartbeat_at IS NULL")
 
 
+def _migrate_v42(conn: sqlite3.Connection) -> None:
+    """Persist native worker identity and immutable capability snapshots."""
+    # v40 was historically version-gated, but some installations reached v41
+    # through the shape-detected hardening path without the additive column.
+    _add_column_if_missing(conn, "runs", "token_budget", "INTEGER")
+    for name, declaration in {
+        "worker_kind": "TEXT",
+        "worker_id": "TEXT",
+        "capability_snapshot_json": "TEXT",
+        "tool_policy_digest": "TEXT",
+        "prompt_contract_digest": "TEXT",
+        "workspace_policy": "TEXT",
+        "background": "INTEGER",
+        "package_id": "TEXT",
+    }.items():
+        _add_column_if_missing(conn, "agent_executions", name, declaration)
+    for name, declaration in {
+        "worker_kind": "TEXT",
+        "worker_id": "TEXT",
+        "capability_snapshot_json": "TEXT",
+        "tool_policy_digest": "TEXT",
+        "prompt_contract_digest": "TEXT",
+        "workspace_policy": "TEXT",
+        "background": "INTEGER",
+        "package_id": "TEXT",
+    }.items():
+        _add_column_if_missing(conn, "spawn_intents", name, declaration)
+    for name, declaration in {
+        "sidecar_agent_id": "TEXT",
+        "coprocessor_id": "TEXT",
+        "produces": "TEXT",
+        "fanout_from": "TEXT",
+    }.items():
+        _add_column_if_missing(conn, "workflow_phases", name, declaration)
+
+
+def _migrate_v43(conn: sqlite3.Connection) -> None:
+    """Add immutable slot and native-launch identity fields."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS slot_bindings (
+            run_id TEXT NOT NULL,
+            epoch_id TEXT NOT NULL,
+            slot_name TEXT NOT NULL,
+            public_alias TEXT NOT NULL,
+            model_alias TEXT NOT NULL,
+            logical_model_id TEXT NOT NULL,
+            provider_id TEXT,
+            endpoint_id TEXT,
+            fallback_policy_json TEXT NOT NULL DEFAULT '[]',
+            registry_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (run_id, epoch_id, slot_name)
+        )"""
+    )
+    for table in ("agent_executions", "spawn_intents"):
+        for name, declaration in {
+            "agent_definition_id": "TEXT",
+            "native_slot": "TEXT",
+            "public_model_alias": "TEXT",
+            "capability_digest": "TEXT",
+            "priority_class": "TEXT",
+        }.items():
+            _add_column_if_missing(conn, table, name, declaration)
+
+
+def _migrate_v44(conn: sqlite3.Connection) -> None:
+    """Persist explicit named native agents on workflow phase snapshots."""
+    _add_column_if_missing(conn, "workflow_phases", "agent_id", "TEXT")
+
+
+def _migrate_v45(conn: sqlite3.Connection) -> None:
+    """Persist automatic coprocessor checkpoint dedupe and results."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS feedback_checkpoints (
+            feedback_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES runs(run_id),
+            epoch_id TEXT NOT NULL,
+            execution_key TEXT NOT NULL,
+            claude_agent_id TEXT,
+            action_id TEXT,
+            checkpoint TEXT NOT NULL,
+            coprocessor_id TEXT NOT NULL,
+            provider_id TEXT,
+            evidence_digest TEXT NOT NULL,
+            packet_digest TEXT NOT NULL,
+            coprocessor_execution_id TEXT,
+            status TEXT NOT NULL CHECK(status IN ('running','completed','failed','deferred')),
+            attempt INTEGER NOT NULL DEFAULT 1,
+            result_json TEXT,
+            feedback_text TEXT,
+            error TEXT,
+            created_at TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            completed_at TEXT
+        )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_feedback_checkpoint_scope "
+        "ON feedback_checkpoints(run_id, epoch_id, execution_key, checkpoint, created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_feedback_checkpoint_active "
+        "ON feedback_checkpoints(run_id, epoch_id, coprocessor_id, status)"
+    )
+
+
+def _migrate_v46(conn: sqlite3.Connection) -> None:
+    """Persist complete primary and fallback route identities.
+
+    Older rows keep their legacy model/endpoint columns. New writers store
+    the atomic route identity in JSON so provider selection cannot be lost
+    when a profile is copied into an epoch.
+    """
+    _add_column_if_missing(conn, "role_routes", "primary_route_json", "TEXT NOT NULL DEFAULT '{}'")
+    _add_column_if_missing(conn, "role_routes", "fallback_routes_json", "TEXT DEFAULT '[]'")
+    # Native action claims must retain the exact endpoint selected by the
+    # scheduler.  Without this column a fallback can change model/provider
+    # while the first Claude request remains free to select another endpoint.
+    _add_column_if_missing(conn, "runnable_action_claims", "endpoint_id", "TEXT")
+
+
+def _migrate_v47(conn: sqlite3.Connection) -> None:
+    """Persist exact route identity and outstanding token reservations."""
+    for table in ("agent_bindings", "controller_bindings"):
+        _add_column_if_missing(conn, table, "route_digest", "TEXT")
+        _add_column_if_missing(conn, table, "candidate_index", "INTEGER")
+    for table in ("agent_executions", "spawn_intents"):
+        _add_column_if_missing(conn, table, "endpoint_id", "TEXT")
+        _add_column_if_missing(conn, table, "route_digest", "TEXT")
+        _add_column_if_missing(conn, table, "candidate_index", "INTEGER")
+    _add_column_if_missing(conn, "agent_executions", "token_reservation_id", "TEXT")
+    for name, declaration in {
+        "route_digest": "TEXT",
+        "candidate_index": "INTEGER",
+        "token_reservation_id": "TEXT",
+    }.items():
+        _add_column_if_missing(conn, "runnable_action_claims", name, declaration)
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS token_reservations (
+            reservation_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES runs(run_id),
+            epoch_id TEXT,
+            action_id TEXT,
+            execution_id TEXT,
+            estimated_tokens INTEGER NOT NULL CHECK(estimated_tokens > 0),
+            state TEXT NOT NULL CHECK(state IN ('reserved','consumed','released','expired','cancelled')),
+            created_at TEXT NOT NULL,
+            released_at TEXT
+        )"""
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_active_token_action "
+        "ON token_reservations(action_id) WHERE action_id IS NOT NULL AND state='reserved'"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_token_reservations_run "
+        "ON token_reservations(run_id, state)"
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS route_attempts (
+            attempt_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES runs(run_id),
+            epoch_id TEXT NOT NULL,
+            execution_id TEXT NOT NULL,
+            candidate_index INTEGER NOT NULL,
+            model_id TEXT NOT NULL,
+            provider_id TEXT,
+            endpoint_id TEXT NOT NULL,
+            route_digest TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('started','succeeded','failed','cancelled','skipped')),
+            status_code INTEGER,
+            error_class TEXT,
+            error TEXT,
+            usage_json TEXT NOT NULL DEFAULT '{}',
+            started_at TEXT NOT NULL,
+            finished_at TEXT
+        )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_route_attempts_execution "
+        "ON route_attempts(run_id, epoch_id, execution_id, candidate_index)"
+    )
+
+
+def _migrate_v48(conn: sqlite3.Connection) -> None:
+    """Persist lifecycle and request-activity telemetry for LiteLLM children."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS litellm_deployment_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            deployment_id INTEGER NOT NULL REFERENCES litellm_deployments(id),
+            generation INTEGER NOT NULL REFERENCES litellm_generations(generation),
+            event TEXT NOT NULL,
+            status TEXT,
+            pid INTEGER,
+            port INTEGER,
+            active_requests INTEGER NOT NULL DEFAULT 0,
+            active_streams INTEGER NOT NULL DEFAULT 0,
+            reason TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_litellm_deployment_events
+            ON litellm_deployment_events(deployment_id, created_at);
+        """
+    )
+
+
+def _migrate_v49(conn: sqlite3.Connection) -> None:
+    """Make feedback delivery, adjudication and crash recovery durable."""
+    for name, declaration in {
+        "delivery_status": "TEXT NOT NULL DEFAULT 'pending'",
+        "heartbeat_at": "TEXT",
+        "lease_expires_at": "TEXT",
+        "orphaned_at": "TEXT",
+        "delivered_at": "TEXT",
+        "consumer_turn_id": "TEXT",
+        "delivery_count": "INTEGER NOT NULL DEFAULT 0",
+        "disposition": "TEXT",
+        "disposition_reason": "TEXT",
+        "adopted_finding_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+        "rejected_finding_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+        "resulting_action_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+        "resulting_changeset_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+        "later_validation_json": "TEXT",
+        "harm_class": "TEXT",
+        "latency_ms": "REAL",
+        "input_tokens": "INTEGER",
+        "output_tokens": "INTEGER",
+        "estimated_cost": "REAL",
+        "finalized_at": "TEXT",
+        "parent_execution_id": "TEXT",
+        "prompt_version": "TEXT",
+        "schema_version": "TEXT",
+    }.items():
+        _add_column_if_missing(conn, "feedback_checkpoints", name, declaration)
+    conn.execute(
+        "UPDATE feedback_checkpoints SET delivery_status='ready' "
+        "WHERE status='completed' AND delivery_status='pending'"
+    )
+    conn.execute(
+        "UPDATE feedback_checkpoints SET delivery_status='expired' "
+        "WHERE status IN ('failed','deferred') AND delivery_status='pending'"
+    )
+    for name, declaration in {
+        "result_disposition": "TEXT",
+        "adjudication_reason": "TEXT",
+        "adjudicated_by": "TEXT",
+        "adjudicated_at": "TEXT",
+        "accepted_finding_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+        "estimated_cost": "REAL",
+    }.items():
+        _add_column_if_missing(conn, "agent_executions", name, declaration)
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS coprocessor_outcomes (
+            outcome_id TEXT PRIMARY KEY,
+            feedback_id TEXT NOT NULL REFERENCES feedback_checkpoints(feedback_id),
+            run_id TEXT NOT NULL REFERENCES runs(run_id),
+            epoch_id TEXT NOT NULL,
+            coprocessor_id TEXT NOT NULL,
+            model_id TEXT,
+            provider_id TEXT,
+            prompt_version TEXT,
+            schema_version TEXT,
+            task_class TEXT,
+            disposition TEXT NOT NULL,
+            disposition_reason TEXT,
+            adopted_finding_ids_json TEXT NOT NULL DEFAULT '[]',
+            rejected_finding_ids_json TEXT NOT NULL DEFAULT '[]',
+            resulting_action_ids_json TEXT NOT NULL DEFAULT '[]',
+            resulting_changeset_ids_json TEXT NOT NULL DEFAULT '[]',
+            later_validation_json TEXT,
+            harm_class TEXT,
+            latency_ms REAL,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            estimated_cost REAL,
+            created_at TEXT NOT NULL,
+            finalized_at TEXT,
+            quality_score REAL,
+            quality_dimensions_json TEXT
+        )"""
+    )
+    _add_column_if_missing(conn, "coprocessor_outcomes", "quality_score", "REAL")
+    _add_column_if_missing(conn, "coprocessor_outcomes", "quality_dimensions_json", "TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_coprocessor_outcomes_scope "
+        "ON coprocessor_outcomes(run_id, epoch_id, coprocessor_id, disposition)"
+    )
+
+
+def _migrate_v50(conn: sqlite3.Connection) -> None:
+    """Add durable task coverage, package scheduling and escalation state."""
+    for name, declaration in {
+        "escalation_level": "TEXT",
+        "escalation_state": "TEXT NOT NULL DEFAULT 'stable'",
+        "escalation_reason": "TEXT",
+        "escalated_at": "TEXT",
+        "mutation_paused": "INTEGER NOT NULL DEFAULT 0",
+        "escalation_generation": "INTEGER NOT NULL DEFAULT 0",
+    }.items():
+        _add_column_if_missing(conn, "epochs", name, declaration)
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS task_contracts (
+            contract_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES runs(run_id),
+            epoch_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            contract_json TEXT NOT NULL,
+            contract_digest TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('draft','published','approved','superseded','rejected')),
+            source TEXT NOT NULL,
+            approved_by TEXT,
+            created_at TEXT NOT NULL,
+            published_at TEXT,
+            approved_at TEXT,
+            superseded_at TEXT,
+            UNIQUE(run_id, epoch_id, version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_task_contract_scope
+            ON task_contracts(run_id, epoch_id, status, version);
+
+        CREATE TABLE IF NOT EXISTS requirements (
+            requirement_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES runs(run_id),
+            epoch_id TEXT NOT NULL,
+            contract_id TEXT NOT NULL REFERENCES task_contracts(contract_id),
+            statement TEXT NOT NULL,
+            category TEXT NOT NULL,
+            mandatory INTEGER NOT NULL DEFAULT 1,
+            risk TEXT NOT NULL DEFAULT 'normal',
+            acceptance_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL CHECK(status IN ('open','in_progress','satisfied','waived','blocked')),
+            status_reason TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_requirements_scope
+            ON requirements(run_id, epoch_id, status, mandatory);
+
+        CREATE TABLE IF NOT EXISTS ambiguities (
+            ambiguity_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES runs(run_id),
+            epoch_id TEXT NOT NULL,
+            question TEXT NOT NULL,
+            options_json TEXT NOT NULL DEFAULT '[]',
+            resolution TEXT,
+            status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','resolved','deferred')),
+            resolved_by TEXT,
+            created_at TEXT NOT NULL,
+            resolved_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS evidence_links (
+            evidence_id TEXT PRIMARY KEY,
+            requirement_id TEXT NOT NULL REFERENCES requirements(requirement_id),
+            evidence_kind TEXT NOT NULL,
+            evidence_ref TEXT NOT NULL,
+            evidence_digest TEXT,
+            valid INTEGER,
+            created_at TEXT NOT NULL,
+            UNIQUE(requirement_id, evidence_kind, evidence_ref)
+        );
+        CREATE INDEX IF NOT EXISTS idx_evidence_requirement
+            ON evidence_links(requirement_id, valid);
+
+        CREATE TABLE IF NOT EXISTS coverage_audits (
+            audit_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES runs(run_id),
+            epoch_id TEXT NOT NULL,
+            complete INTEGER NOT NULL,
+            missing_json TEXT NOT NULL DEFAULT '[]',
+            auditor TEXT NOT NULL,
+            contract_version INTEGER,
+            workspace_generation INTEGER,
+            workspace_digest TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS work_packages (
+            package_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES runs(run_id),
+            epoch_id TEXT NOT NULL,
+            phase_id TEXT NOT NULL,
+            objective TEXT NOT NULL,
+            path_scope_json TEXT NOT NULL DEFAULT '[]',
+            requirement_ids_json TEXT NOT NULL DEFAULT '[]',
+            dependencies_json TEXT NOT NULL DEFAULT '[]',
+            acceptance_json TEXT NOT NULL DEFAULT '[]',
+            required_tests_json TEXT NOT NULL DEFAULT '[]',
+            prohibited_paths_json TEXT NOT NULL DEFAULT '[]',
+            contract_digest TEXT NOT NULL,
+            risk TEXT NOT NULL DEFAULT 'normal',
+            can_run_parallel INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL CHECK(status IN ('ready','claimed','running','completed','integrated','blocked','retry','cancelled')),
+            status_reason TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_work_packages_phase
+            ON work_packages(run_id, epoch_id, phase_id, status);
+
+        CREATE TABLE IF NOT EXISTS escalation_events (
+            escalation_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES runs(run_id),
+            epoch_id TEXT NOT NULL,
+            from_tier TEXT NOT NULL,
+            to_tier TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            signals_json TEXT NOT NULL DEFAULT '[]',
+            policy_digest TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('proposed','accepted','rejected','applied','rolled_back')),
+            created_at TEXT NOT NULL,
+            applied_at TEXT,
+            acknowledged_at TEXT,
+            acknowledged_by TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_escalations_scope
+            ON escalation_events(run_id, epoch_id, created_at);
+        """
+    )
+    for name, declaration in {
+        "contract_version": "INTEGER NOT NULL DEFAULT 1",
+        "prompt_contract_json": "TEXT",
+        "prompt_contract_digest": "TEXT",
+        "display_name": "TEXT",
+        "summary": "TEXT",
+    }.items():
+        _add_column_if_missing(conn, "work_packages", name, declaration)
+    _add_column_if_missing(conn, "escalation_events", "acknowledged_at", "TEXT")
+    _add_column_if_missing(conn, "escalation_events", "acknowledged_by", "TEXT")
+    for name, declaration in {
+        "contract_version": "INTEGER",
+        "workspace_generation": "INTEGER",
+        "workspace_digest": "TEXT",
+    }.items():
+        _add_column_if_missing(conn, "coverage_audits", name, declaration)
+    for name, declaration in {
+        "phase_template_id": "TEXT",
+        "iteration": "INTEGER NOT NULL DEFAULT 0",
+        "supersedes_phase_id": "TEXT",
+        "trigger_event": "TEXT",
+    }.items():
+        _add_column_if_missing(conn, "workflow_phases", name, declaration)
+
+
 def _migrate_v37(conn: sqlite3.Connection) -> None:
     """Harden actor credentials, native spawn correlation, and workspace generations."""
     _add_column_if_missing(conn, "runs", "controller_capability_hash", "TEXT")
@@ -1349,6 +1844,12 @@ def _migrate_v37(conn: sqlite3.Connection) -> None:
         "max_attempts": "INTEGER NOT NULL DEFAULT 1",
         "max_attempts_per_model": "INTEGER",
         "sidecar_id": "TEXT",
+        "completion_mode": "TEXT NOT NULL DEFAULT 'quorum'",
+        "minimum_quality_score": "REAL",
+        "requires_controller_acceptance": "INTEGER NOT NULL DEFAULT 0",
+        "initial_fanout": "INTEGER",
+        "maximum_replicas": "INTEGER",
+        "hedge_delay_seconds": "REAL",
     }.items():
         _add_column_if_missing(conn, "workflow_phases", name, declaration)
     _add_column_if_missing(conn, "role_routes", "fallback_models_json", "TEXT NOT NULL DEFAULT '[]'")
@@ -1383,6 +1884,7 @@ def _migrate_v37(conn: sqlite3.Connection) -> None:
                 native_agent_name TEXT NOT NULL,
                 model_id TEXT NOT NULL,
                 action_kind TEXT NOT NULL DEFAULT 'native_agent',
+                endpoint_id TEXT,
                 provider_id TEXT,
                 claim_token TEXT NOT NULL UNIQUE,
                 reservation_id TEXT,
@@ -1413,11 +1915,11 @@ def _migrate_v37(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT INTO runnable_action_claims "
             "(action_id, run_id, epoch_id, phase_id, role, native_agent_name, model_id, action_kind, "
-            "provider_id, claim_token, reservation_id, intent_id, status, created_at, "
+            "endpoint_id, provider_id, claim_token, reservation_id, intent_id, status, created_at, "
             "claimed_at, consumed_at, expires_at, claude_agent_id, spawn_call_id, execution_id) "
             "SELECT action_id, run_id, epoch_id, phase_id, role, native_agent_name, model_id, "
             "CASE WHEN action_id LIKE 'integration:%' THEN 'controller_integration' "
-            "ELSE 'native_agent' END, provider_id, claim_token, reservation_id, intent_id, status, created_at, "
+            "ELSE 'native_agent' END, NULL, provider_id, claim_token, reservation_id, intent_id, status, created_at, "
             "claimed_at, consumed_at, expires_at, claude_agent_id, "
             f"{extra_select}, {execution_select} FROM runnable_action_claims_v37_old"
         )
@@ -1469,6 +1971,104 @@ def _migrate_v37(conn: sqlite3.Connection) -> None:
     """)
 
 
+def _migrate_v51(conn: sqlite3.Connection) -> None:
+    """Add the immutable per-run resource-policy snapshot."""
+    _add_column_if_missing(conn, "runs", "resource_policy_json", "TEXT")
+
+
+def _migrate_v52(conn: sqlite3.Connection) -> None:
+    """Persist adaptive launch policy on each immutable workflow phase."""
+    _add_column_if_missing(
+        conn, "workflow_phases", "launch_policy",
+        "TEXT NOT NULL DEFAULT 'minimum_first'",
+    )
+
+
+def _migrate_v53(conn: sqlite3.Connection) -> None:
+    """Persist an explicit orphan disposition for crash-recovered executions.
+
+    Detached fastpath calls cannot use a native ``SubagentStop`` event when
+    the router process dies.  They remain ``timeout`` for compatibility with
+    the existing execution state machine, but ``orphaned_at`` makes the
+    reason machine-readable and prevents restart recovery from being counted
+    as a provider failure.
+    """
+    _add_column_if_missing(conn, "agent_executions", "orphaned_at", "TEXT")
+
+
+def _migrate_v54(conn: sqlite3.Connection) -> None:
+    """Persist per-request LiteLLM deployment attribution.
+
+    A managed group is admitted conservatively across all approved provider
+    candidates.  The response may later identify the physical deployment,
+    but that identity must be recorded separately from the requested logical
+    route and only trusted after it is checked against the immutable allowed
+    deployment set.
+    """
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS litellm_request_attributions (
+            attribution_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id TEXT NOT NULL,
+            generation INTEGER,
+            agent_binding_id INTEGER,
+            logical_model_id TEXT,
+            requested_provider_ids_json TEXT NOT NULL DEFAULT '[]',
+            allowed_deployments_json TEXT NOT NULL DEFAULT '[]',
+            reported_deployment_id TEXT,
+            actual_provider_id TEXT,
+            actual_endpoint_id TEXT,
+            attribution_source TEXT NOT NULL,
+            trusted INTEGER NOT NULL DEFAULT 0,
+            status_code INTEGER,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_litellm_request_attribution_request
+            ON litellm_request_attributions(request_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_litellm_request_attribution_route
+            ON litellm_request_attributions(generation, actual_endpoint_id, created_at);
+        """
+    )
+
+
+def _migrate_v55(conn: sqlite3.Connection) -> None:
+    """Persist typed verdict contracts and generation-bound phase evidence."""
+    for name, declaration in {
+        "result_contract_json": "TEXT",
+        "invalidated_at": "TEXT",
+        "invalidation_reason": "TEXT",
+        "evidence_generation": "INTEGER",
+        "evidence_digest": "TEXT",
+    }.items():
+        _add_column_if_missing(conn, "workflow_phases", name, declaration)
+    for name, declaration in {
+        "workspace_generation": "INTEGER",
+        "workspace_digest": "TEXT",
+        "result_contract_id": "TEXT",
+    }.items():
+        _add_column_if_missing(conn, "agent_executions", name, declaration)
+    _add_column_if_missing(conn, "completion_tokens", "evidence_snapshot_sha256", "TEXT")
+
+
+def _migrate_v56(conn: sqlite3.Connection) -> None:
+    """Persist the logical model on provider reservations.
+
+    Reservation promotion can happen long after the action was planned.  The
+    model identity must therefore live with the reservation instead of being
+    reconstructed from mutable registry state when capacity becomes free.
+    """
+    _add_column_if_missing(conn, "provider_reservations", "model_id", "TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_provider_reservations_model "
+        "ON provider_reservations(provider_id, model_id, state, queued_at)"
+    )
+
+
+def _migrate_v57(conn: sqlite3.Connection) -> None:
+    """Persist the selected workflow's execution-plane composition contract."""
+    _add_column_if_missing(conn, "epochs", "composition_mode", "TEXT")
+
+
 # ------------------------------------------------------------------ RouteState
 
 class RouteState(
@@ -1477,8 +2077,11 @@ class RouteState(
     ControllerBindingRepository, CasRouteRepository, ControllerPolicyRepository,
     BindingCommandRepository, WorkflowPhaseRepository, ConditionEvaluationRepository,
     AgentExecutionRepository, ShadowWorkspaceRepository, IntakeFastpathRepository,
-    ProviderReservationRepository, SidecarExecutionRepository, NativeSpawnAttachRepository,
+    ProviderReservationRepository, CoprocessorExecutionRepository, NativeSpawnAttachRepository,
     RunRegistryRepository, RunnableActionRepository, RunOrchestrationRepository,
+    SlotBindingRepository, FeedbackRepository, TokenReservationRepository,
+    RouteAttemptRepository, ContractRepository, WorkPackageRepository,
+    EscalationRepository, ResourcePolicyRepository,
 ):
     """SQLite-backed persistent state for runs, epochs, routes, bindings, health."""
 
@@ -1602,7 +2205,8 @@ class RouteState(
         conn = self._new_conn()
         try:
             routes_rows = conn.execute(
-                "SELECT role, model_id, version, endpoint_id, fallback_models_json FROM role_routes "
+                "SELECT role, model_id, version, endpoint_id, fallback_models_json, "
+                "primary_route_json, fallback_routes_json FROM role_routes "
                 "WHERE run_id = ? AND epoch_id = ?",
                 (run_id, epoch_id),
             ).fetchall()
@@ -1612,6 +2216,8 @@ class RouteState(
                     "version": row[2],
                     "endpoint_id": row[3],
                     "fallback_models": json.loads(row[4] or "[]"),
+                    "primary_route": json.loads(row[5] or "{}"),
+                    "fallback_routes": json.loads(row[6] or "[]"),
                 }
                 for row in routes_rows
             }

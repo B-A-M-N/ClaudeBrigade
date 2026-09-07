@@ -83,3 +83,13 @@ def test_missing_controller_capability_is_rejected(monkeypatch):
 
     assert messages[0]["status"] == 401
     assert not seen
+
+
+def test_error_response_disconnect_is_swallowed():
+    async def run() -> None:
+        async def send(_message):
+            raise ConnectionResetError("client disconnected")
+
+        await mcp_transport._send_error(send, 401, "gone")
+
+    asyncio.run(run())

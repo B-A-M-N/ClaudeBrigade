@@ -11,6 +11,8 @@ integration candidate dispositions.
 
 from __future__ import annotations
 
+from enhanced_router.repository_base import RepositoryMixin
+
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -35,7 +37,7 @@ def _utcnow_age(max_age_seconds: int) -> str:
 _STALE_SHADOW_WORKSPACE_MAX_AGE_SECONDS = 1_200
 
 
-class ShadowWorkspaceRepository:
+class ShadowWorkspaceRepository(RepositoryMixin):
     """Mixin providing shadow workspace/changeset/integration persistence.
 
     Requires a host class that provides ``_new_conn() -> sqlite3.Connection``
@@ -191,6 +193,13 @@ class ShadowWorkspaceRepository:
                     applied_changeset_id, new_base_sha, new_dirty_hash, workspace_id,
                 ),
             )
+            self._invalidate_completion_evidence_in_transaction(
+                conn,
+                run_id=str(row["run_id"]),
+                epoch_id=str(row["epoch_id"]),
+                generation=current_generation + 1,
+                reason=f"canonical workspace advanced by changeset {applied_changeset_id}",
+            )
             conn.commit()
             result = conn.execute(
                 "SELECT * FROM workspaces WHERE workspace_id=?", (workspace_id,)
@@ -202,6 +211,64 @@ class ShadowWorkspaceRepository:
             raise
         finally:
             conn.close()
+
+    @staticmethod
+    def _invalidate_completion_evidence_in_transaction(
+        conn: sqlite3.Connection,
+        *,
+        run_id: str,
+        epoch_id: str,
+        generation: int,
+        reason: str,
+    ) -> None:
+        """Void signoffs after canonical mutation while retaining history.
+
+        The execution ledger remains immutable evidence of what happened.  A
+        completed review is not allowed to authorize a newer workspace, so
+        its phase is reopened and its acceptance is cleared in the same
+        transaction as the canonical-generation advance.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE completion_tokens SET consumed_at=COALESCE(consumed_at, ?) "
+            "WHERE run_id=? AND epoch_id=? AND consumed_at IS NULL",
+            (now, run_id, epoch_id),
+        )
+        conn.execute(
+            "UPDATE coverage_audits SET complete=0, missing_json=?, created_at=? "
+            "WHERE run_id=? AND epoch_id=? AND complete=1",
+            (json.dumps(["canonical workspace changed"], separators=(",", ":")), now, run_id, epoch_id),
+        )
+        phase_rows = conn.execute(
+            "SELECT phase_id, max_attempts FROM workflow_phases "
+            "WHERE run_id=? AND epoch_id=? AND status IN ('active','completed','skipped')",
+            (run_id, epoch_id),
+        ).fetchall()
+        markers = ("ground", "senior", "completion", "critical", "verification", "final", "audit")
+        for phase in phase_rows:
+            phase_id = str(phase[0]).lower()
+            if not any(marker in phase_id for marker in markers):
+                continue
+            attempts = conn.execute(
+                "SELECT COUNT(*) FROM agent_executions WHERE run_id=? AND epoch_id=? AND phase_id=?",
+                (run_id, epoch_id, phase[0]),
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE workflow_phases SET status='pending', started_at=NULL, "
+                "completed_at=NULL, result_evidence=NULL, error=?, "
+                "invalidated_at=?, invalidation_reason=?, evidence_generation=NULL, "
+                "evidence_digest=NULL, max_attempts=MAX(COALESCE(max_attempts, 1), ?) "
+                "WHERE run_id=? AND epoch_id=? AND phase_id=?",
+                ("stale completion evidence: " + reason, now, reason, int(attempts) + 1,
+                 run_id, epoch_id, phase[0]),
+            )
+            conn.execute(
+                "UPDATE agent_executions SET accepted_by_controller=NULL, "
+                "evidence_valid=0, result_disposition='invalidated', "
+                "adjudication_reason=?, adjudicated_at=? "
+                "WHERE run_id=? AND epoch_id=? AND phase_id=? AND status='completed'",
+                (reason, now, run_id, epoch_id, phase[0]),
+            )
 
     def begin_integration_journal(
         self,
@@ -476,7 +543,20 @@ class ShadowWorkspaceRepository:
             row = conn.execute(
                 "SELECT * FROM execution_changesets WHERE changeset_id=?", (changeset_id,)
             ).fetchone()
-            return dict(row) if row is not None else None
+            result = dict(row) if row is not None else None
+            if result and result.get("execution_id"):
+                execution = conn.execute(
+                    "SELECT package_id FROM agent_executions WHERE execution_id=?",
+                    (result["execution_id"],),
+                ).fetchone()
+                if execution is not None and execution[0]:
+                    conn.execute(
+                        "UPDATE work_packages SET status='integrated', status_reason=?, updated_at=? "
+                        "WHERE package_id=? AND status IN ('completed','running','claimed','ready')",
+                        (f"changeset {changeset_id} integrated", _utcnow(), execution[0]),
+                    )
+                    conn.commit()
+            return result
         finally:
             conn.close()
 

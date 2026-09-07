@@ -9,6 +9,8 @@ against a matching workspace/route snapshot.
 
 from __future__ import annotations
 
+from enhanced_router.repository_base import RepositoryMixin
+
 import hashlib
 import hmac
 import json
@@ -18,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from enhanced_router.state_errors import WorkflowStateError
+from enhanced_router.route_ladder import target_candidates
 
 _VALID_ROLES = frozenset(("recon", "implementer", "adversary", "repairer"))
 
@@ -26,7 +29,40 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-class RunOrchestrationRepository:
+WORKFLOW_TIERS = ("trivial", "normal", "cross-cutting", "high-risk")
+
+
+def resolve_effective_workflow(
+    requested_workflow: str,
+    minimum_tier: str | None,
+    requested_spec: object | None,
+) -> str:
+    """Resolve intake workflow without permitting a tier downgrade.
+
+    Built-in workflow IDs are ordered by name. Custom workflow IDs must
+    declare ``WorkflowSpec.tier`` when a caller has already committed a
+    minimum tier; otherwise there is no safe way to prove that a forced
+    workflow contains the required review/verification strength.
+    """
+    tier_order = {name: index for index, name in enumerate(WORKFLOW_TIERS)}
+    requested_tier = (
+        requested_workflow
+        if requested_workflow in tier_order
+        else getattr(requested_spec, "tier", None)
+    )
+    if minimum_tier not in tier_order:
+        return requested_workflow
+    if requested_tier not in tier_order:
+        raise ValueError(
+            f"workflow '{requested_workflow}' does not declare a tier and "
+            f"cannot satisfy minimum tier '{minimum_tier}'"
+        )
+    if tier_order[str(requested_tier)] < tier_order[str(minimum_tier)]:
+        return str(minimum_tier)
+    return requested_workflow
+
+
+class RunOrchestrationRepository(RepositoryMixin):
     """Mixin providing task orchestration entry points.
 
     Requires a host class that provides ``_new_conn() -> sqlite3.Connection``
@@ -73,25 +109,41 @@ class RunOrchestrationRepository:
 
         signals = signals or []
 
-        # Determine effective workflow
-        if force_workflow:
-            effective_workflow = force_workflow
-        elif minimum_tier:
-            effective_workflow = minimum_tier
-        else:
-            from enhanced_router.config_models import determine_tier
-            tier = determine_tier(signals) if signals else (workflow_id or "normal")
-            effective_workflow = tier
-
-        # Verify workflow exists
+        # Determine the effective workflow without allowing a caller or a
+        # late route proposal to downgrade the intake commitment. Named
+        # custom workflows must declare their tier when a minimum has been
+        # committed; otherwise intake fails closed.
+        from enhanced_router.config_models import determine_tier
+        requested_workflow = force_workflow or workflow_id
+        if requested_workflow is None:
+            requested_workflow = determine_tier(signals) if signals else "normal"
         reg = get_registry()
         reg.load_workflows()
-        spec = reg.get_workflow(effective_workflow)
+        requested_workflow = str(requested_workflow)
+        requested_spec = reg.get_workflow(requested_workflow)
+        if requested_spec is None:
+            raise ValueError(f"Workflow '{requested_workflow}' not found in registry")
+        effective_workflow = resolve_effective_workflow(
+            requested_workflow, minimum_tier, requested_spec,
+        )
+
+        # Verify the promoted built-in tier (or explicitly declared custom
+        # workflow) exists before mutating any run/epoch state.
+        spec = (
+            requested_spec
+            if effective_workflow == requested_workflow
+            else reg.get_workflow(effective_workflow)
+        )
         if spec is None:
             raise ValueError(f"Workflow '{effective_workflow}' not found in registry")
         reg.load_profiles()
         effective_profile_id = profile_id or spec.default_profile
         profile = reg.get_profile(effective_profile_id)
+        resource_policy_json = json.dumps(
+            spec.resource_policy.model_dump(exclude_none=False),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         prompt_digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest() if prompt else None
 
         conn = self._new_conn()
@@ -100,8 +152,18 @@ class RunOrchestrationRepository:
 
             # 1. Create or confirm run
             conn.execute(
-                "INSERT OR IGNORE INTO runs (run_id, claude_session_id, cwd, created_at) VALUES (?, ?, ?, ?)",
-                (run_id, session_id, cwd, _utcnow()),
+                "INSERT OR IGNORE INTO runs "
+                "(run_id, claude_session_id, cwd, resource_policy_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (run_id, session_id, cwd, resource_policy_json, _utcnow()),
+            )
+            # The launcher pre-registers the run before task intake.  Bind the
+            # selected workflow's policy exactly once at epoch creation so a
+            # later YAML reload cannot change this run's limits.
+            conn.execute(
+                "UPDATE runs SET resource_policy_json=COALESCE(resource_policy_json, ?) "
+                "WHERE run_id=? AND closed_at IS NULL",
+                (resource_policy_json, run_id),
             )
             if session_id or cwd:
                 sets: list[str] = []
@@ -131,10 +193,11 @@ class RunOrchestrationRepository:
             # 3. Create epoch
             epoch_id = f"ep_{_utcnow().replace(':', '-').replace('.', '-')}"
             conn.execute(
-                "INSERT INTO epochs (run_id, epoch_id, workflow_id, profile_id, status, created_at,"
+                "INSERT INTO epochs (run_id, epoch_id, workflow_id, profile_id, composition_mode, status, created_at,"
                 " prompt_digest, minimum_tier, intake_id, contract_json, baseline_fingerprint)"
-                " VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
-                (run_id, epoch_id, effective_workflow, effective_profile_id, _utcnow(),
+                " VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
+                (run_id, epoch_id, effective_workflow, effective_profile_id,
+                 spec.composition_mode, _utcnow(),
                  prompt_digest, minimum_tier or effective_workflow, intake_id,
                  json.dumps(contract or {}, sort_keys=True, separators=(",", ":")),
                  baseline_fingerprint),
@@ -145,24 +208,39 @@ class RunOrchestrationRepository:
             for role in ("recon", "implementer", "adversary", "repairer"):
                 target = profile.route_target(role)
                 model_id = target.model
+                candidates = target_candidates(target)
+                primary = candidates[0]
+                fallback_models = [item["model"] for item in candidates[1:]]
+                fallback_routes = candidates[1:]
                 conn.execute(
-                    """INSERT INTO role_routes (run_id, epoch_id, role, model_id, source, reason, version, changed_at)
-                       VALUES (?, ?, ?, ?, 'profile', ?, 1, ?)
+                    """INSERT INTO role_routes (
+                           run_id, epoch_id, role, model_id, source, reason,
+                           version, changed_at, primary_route_json,
+                           fallback_models_json, fallback_routes_json
+                       ) VALUES (?, ?, ?, ?, 'profile', ?, 1, ?, ?, ?, ?)
                        ON CONFLICT(run_id, epoch_id, role) DO UPDATE SET
                            model_id = excluded.model_id,
                            source = excluded.source,
                            reason = excluded.reason,
                            version = version + 1,
-                           changed_at = excluded.changed_at""",
-                    (run_id, epoch_id, role, model_id, f"profile:{effective_profile_id}", now),
+                           changed_at = excluded.changed_at,
+                           primary_route_json = excluded.primary_route_json,
+                           fallback_models_json = excluded.fallback_models_json,
+                           fallback_routes_json = excluded.fallback_routes_json""",
+                    (
+                        run_id, epoch_id, role, model_id, f"profile:{effective_profile_id}", now,
+                        json.dumps(primary, separators=(",", ":")),
+                        json.dumps(fallback_models, separators=(",", ":")),
+                        json.dumps(fallback_routes, separators=(",", ":")),
+                    ),
                 )
                 conn.execute(
                     "UPDATE role_routes SET endpoint_id=? WHERE run_id=? AND epoch_id=? AND role=?",
                     (None if target.endpoint == "auto" else target.endpoint, run_id, epoch_id, role),
                 )
                 conn.execute(
-                    "UPDATE role_routes SET fallback_models_json=? WHERE run_id=? AND epoch_id=? AND role=?",
-                    (json.dumps(target.fallback_models), run_id, epoch_id, role),
+                    "UPDATE role_routes SET endpoint_id=? WHERE run_id=? AND epoch_id=? AND role=?",
+                    (None if primary["endpoint"] == "auto" else primary["endpoint"], run_id, epoch_id, role),
                 )
                 conn.execute(
                     "INSERT INTO route_events (run_id, epoch_id, event_type, role, new_model_id, created_at) "
@@ -179,6 +257,7 @@ class RunOrchestrationRepository:
                     "mutation": p.mutation,
                     "depends_on": p.depends_on,
                     "conditional": p.conditional,
+                    "condition": p.condition.model_dump(exclude_none=True) if p.condition else None,
                     "actor": p.actor or "",
                     "distinct_agent_from": p.distinct_agent_from,
                     "parallel_group": p.parallel_group,
@@ -189,14 +268,30 @@ class RunOrchestrationRepository:
                     "min_fanout": p.min_fanout,
                     "max_fanout": p.max_fanout,
                     "result_schema": p.result_schema,
+                    "result_contract": (
+                        p.result_contract.model_dump(exclude_none=True)
+                        if p.result_contract else None
+                    ),
                     "quality_quorum": p.quality_quorum,
                     "fallback_policy": p.fallback_policy,
                     "execution_kind": p.execution_kind,
+                    "agent_id": p.agent_id,
                     "max_parallelism": p.max_parallelism,
                     "required_successes": p.required_successes,
                     "max_attempts": p.max_attempts,
                     "max_attempts_per_model": p.max_attempts_per_model,
+                    "completion_mode": p.completion_mode,
+                    "launch_policy": p.launch_policy,
+                    "minimum_quality_score": p.minimum_quality_score,
+                    "requires_controller_acceptance": p.requires_controller_acceptance,
+                    "initial_fanout": p.initial_fanout,
+                    "maximum_replicas": p.maximum_replicas,
+                    "hedge_delay_seconds": p.hedge_delay_seconds,
                     "sidecar_id": p.sidecar,
+                    "sidecar_agent_id": p.sidecar_agent,
+                    "coprocessor_id": p.coprocessor,
+                    "produces": p.produces,
+                    "fanout_from": p.fanout_from,
                 }
                 for p in spec.phases
             ]
@@ -211,7 +306,8 @@ class RunOrchestrationRepository:
                        specification_hash, ordinal, distinct_agent_from_json, max_duration_seconds,
                        turn_budget, provider_requirements_json, min_fanout, max_fanout, result_schema,
                        quality_quorum, fallback_policy, execution_kind, required_actor,
-                       max_parallelism, required_successes, max_attempts, max_attempts_per_model, sidecar_id)
+                       max_parallelism, required_successes, max_attempts, max_attempts_per_model, sidecar_id,
+                       sidecar_agent_id, coprocessor_id, produces, fanout_from)
                        VALUES (
                            ?, ?, ?, ?,
                            ?, ?, ?, ?,
@@ -219,7 +315,7 @@ class RunOrchestrationRepository:
                            ?, ?, ?, ?,
                            ?, ?, ?, ?,
                            ?, ?, ?, ?,
-                           ?, ?, ?, ?, ?
+                           ?, ?, ?, ?, ?, ?, ?, ?, ?
                        )""",
                     (
                         run_id, epoch_id, phase["id"], "pending",
@@ -239,11 +335,56 @@ class RunOrchestrationRepository:
                         phase.get("execution_kind", "native_agent"), phase.get("actor", ""),
                         phase.get("max_parallelism"), phase.get("required_successes"),
                         phase.get("max_attempts") or phase.get("max_fanout", 1), phase.get("max_attempts_per_model"),
-                        phase.get("sidecar_id"),
+                        phase.get("sidecar_id"), phase.get("sidecar_agent_id"),
+                        phase.get("coprocessor_id"), phase.get("produces"), phase.get("fanout_from"),
                     ),
                 )
+                conn.execute(
+                    "UPDATE workflow_phases SET agent_id=? "
+                    "WHERE run_id=? AND epoch_id=? AND phase_id=?",
+                    (phase.get("agent_id"), run_id, epoch_id, phase["id"]),
+                )
+                conn.execute(
+                    "UPDATE workflow_phases SET completion_mode=?, minimum_quality_score=?, "
+                    "requires_controller_acceptance=?, initial_fanout=?, maximum_replicas=?, hedge_delay_seconds=?, launch_policy=? "
+                    "WHERE run_id=? AND epoch_id=? AND phase_id=?",
+                    (
+                        phase.get("completion_mode", "quorum"), phase.get("minimum_quality_score"),
+                        1 if phase.get("requires_controller_acceptance", True) else 0,
+                        phase.get("initial_fanout"), phase.get("maximum_replicas"),
+                        phase.get("hedge_delay_seconds"), phase.get("launch_policy", "minimum_first"),
+                        run_id, epoch_id, phase["id"],
+                    ),
+                )
+                if phase.get("result_contract") is not None:
+                    conn.execute(
+                        "UPDATE workflow_phases SET result_contract_json=? "
+                        "WHERE run_id=? AND epoch_id=? AND phase_id=?",
+                        (
+                            json.dumps(phase["result_contract"], sort_keys=True, separators=(",", ":")),
+                            run_id, epoch_id, phase["id"],
+                        ),
+                    )
+                if phase.get("condition") is not None:
+                    conn.execute(
+                        "UPDATE workflow_phases SET condition_json=? "
+                        "WHERE run_id=? AND epoch_id=? AND phase_id=?",
+                        (
+                            json.dumps(phase["condition"], sort_keys=True, separators=(",", ":")),
+                            run_id, epoch_id, phase["id"],
+                        ),
+                    )
 
             conn.commit()
+
+            if contract:
+                # Mirror the intake contract into the normalized coverage
+                # ledger after the atomic run/epoch transaction commits.  The
+                # epoch JSON remains a compatibility snapshot; the ledger is
+                # the authoritative completion surface for new tasks.
+                self.publish_task_contract(
+                    run_id, epoch_id, contract, source="begin_task",
+                )
 
             # 6. Controller policy is capability-based. The controller is not
             # required to be one of the worker models in the selected profile.
@@ -308,6 +449,29 @@ class RunOrchestrationRepository:
         active = self.get_active_epoch(run_id)
         if not active or active.get("epoch_id") != epoch_id:
             return {"valid": False, "reason": f"No active epoch for run {run_id}"}
+        reclassify = getattr(self, "reclassify_before_gate", None)
+        if callable(reclassify):
+            try:
+                gate_result = reclassify(run_id, epoch_id, gate="completion")
+            except Exception as exc:
+                return {
+                    "valid": False,
+                    "reason": f"Unable to reclassify workspace before completion: {exc}",
+                }
+            if isinstance(gate_result, dict) and gate_result.get("applied"):
+                return {
+                    "valid": False,
+                    "reason": (
+                        "Workspace changes require workflow escalation before completion; "
+                        "controller must complete the compensating review graph"
+                    ),
+                    "escalation": gate_result,
+                }
+        if bool(active.get("mutation_paused")) or str(active.get("escalation_state") or "") == "escalated":
+            return {
+                "valid": False,
+                "reason": "Workflow escalation requires controller acknowledgment and compensating phases",
+            }
 
         # Lifecycle state is authoritative.  JSONL hook mirrors and the
         # assistant's footer cannot make an active or queued execution look
@@ -433,12 +597,91 @@ class RunOrchestrationRepository:
             return {"valid": False, "reason": "Accepted findings exist without verified resolution evidence"}
 
         # 6. Validate that phases have result_evidence when completed
+        main_workspaces = [
+            row for row in self.get_workspaces(run_id=run_id, epoch_id=epoch_id, kind="main")
+            if row.get("status") in {"active", "ready", "merged"}
+        ]
+        current_workspace = main_workspaces[0] if main_workspaces else None
         for phase in phases:
             if phase.get("status") == "completed" and not phase.get("result_evidence"):
                 return {
                     "valid": False,
                     "reason": f"Phase '{phase['phase_id']}' is completed but has no result_evidence"
                 }
+            if phase.get("status") == "completed" and current_workspace is not None:
+                contract_json = phase.get("result_contract_json")
+                try:
+                    result_contract = json.loads(str(contract_json or "{}"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    result_contract = {}
+                if result_contract.get("requires_current_generation"):
+                    if phase.get("evidence_generation") is None or int(phase["evidence_generation"]) != int(current_workspace.get("canonical_generation") or 0):
+                        return {
+                            "valid": False,
+                            "reason": f"Phase '{phase['phase_id']}' evidence is stale for the current workspace generation",
+                        }
+                if result_contract.get("requires_current_digest"):
+                    current_digest = current_workspace.get("current_dirty_hash") or current_workspace.get("dirty_patch_hash")
+                    if not current_digest or str(phase.get("evidence_digest") or "") != str(current_digest):
+                        return {
+                            "valid": False,
+                            "reason": f"Phase '{phase['phase_id']}' evidence is stale for the current workspace digest",
+                        }
+
+        # A published task contract turns completion into a coverage claim,
+        # not merely a phase-order claim.  Legacy runs without a contract
+        # retain their historical behavior; new controller-managed tasks
+        # cannot finish while mandatory requirements are uncovered.
+        contract = self.get_task_contract(run_id, epoch_id)
+        if contract is not None:
+            coverage = self.get_requirement_coverage(run_id, epoch_id)
+            if not coverage.get("complete", False):
+                return {
+                    "valid": False,
+                    "reason": "Mandatory task requirements remain uncovered: "
+                    + ", ".join(str(item) for item in coverage.get("missing_mandatory", [])),
+                    "coverage": coverage,
+                }
+            coverage_audit = self.get_latest_coverage_audit(run_id, epoch_id)
+            if not coverage_audit or not bool(coverage_audit.get("complete")):
+                return {
+                    "valid": False,
+                    "reason": "A complete controller coverage audit is required before completion",
+                    "coverage": coverage,
+                    "coverage_audit": coverage_audit,
+                }
+            audit_version = coverage_audit.get("contract_version")
+            if audit_version is not None and int(audit_version) != int(contract.get("version") or 0):
+                return {
+                    "valid": False,
+                    "reason": "Coverage audit was created for a different task-contract version",
+                    "coverage": coverage,
+                    "coverage_audit": coverage_audit,
+                }
+            main_workspaces = [
+                row for row in self.get_workspaces(run_id=run_id, epoch_id=epoch_id, kind="main")
+                if row.get("status") in {"active", "ready", "merged"}
+            ]
+            if main_workspaces:
+                workspace = main_workspaces[0]
+                current_generation = int(workspace.get("canonical_generation") or 0)
+                audited_generation = coverage_audit.get("workspace_generation")
+                if audited_generation is not None and int(audited_generation) != current_generation:
+                    return {
+                        "valid": False,
+                        "reason": "Coverage audit is stale: canonical workspace generation changed",
+                        "coverage": coverage,
+                        "coverage_audit": coverage_audit,
+                    }
+                current_digest = workspace.get("current_dirty_hash") or workspace.get("dirty_patch_hash")
+                audited_digest = coverage_audit.get("workspace_digest")
+                if current_digest and audited_digest and str(current_digest) != str(audited_digest):
+                    return {
+                        "valid": False,
+                        "reason": "Coverage audit is stale: canonical workspace changed after the audit",
+                        "coverage": coverage,
+                        "coverage_audit": coverage_audit,
+                    }
 
         # 7. Validate route snapshot
         snapshot_sha256 = parsed.get("Route-Snapshot-SHA256", "").lower()
@@ -477,6 +720,7 @@ class RunOrchestrationRepository:
         if not active or active.get("epoch_id") != epoch_id:
             raise WorkflowStateError("completion token requires the active epoch")
         snapshot = self.create_route_snapshot(run_id, epoch_id, purpose="verified-completion")
+        evidence_snapshot = self.create_completion_evidence_snapshot(run_id, epoch_id)
         token = secrets.token_urlsafe(32)
         token_id = f"completion:{secrets.token_hex(12)}"
         issued_at = datetime.now(timezone.utc)
@@ -486,11 +730,12 @@ class RunOrchestrationRepository:
             conn.execute(
                 "INSERT INTO completion_tokens "
                 "(token_id, run_id, epoch_id, token_hash, workspace_fingerprint, "
-                "route_snapshot_sha256, issued_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "route_snapshot_sha256, evidence_snapshot_sha256, issued_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     token_id, run_id, epoch_id,
                     hashlib.sha256(token.encode("utf-8")).hexdigest(),
-                    workspace_fingerprint, snapshot,
+                    workspace_fingerprint, snapshot, evidence_snapshot,
                     issued_at.isoformat(), expires_at.isoformat(),
                 ),
             )
@@ -504,8 +749,45 @@ class RunOrchestrationRepository:
             "epoch_id": epoch_id,
             "workspace_fingerprint": workspace_fingerprint,
             "route_snapshot_sha256": snapshot,
+            "evidence_snapshot_sha256": evidence_snapshot,
             "expires_at": expires_at.isoformat(),
         }
+
+    def create_completion_evidence_snapshot(self, run_id: str, epoch_id: str) -> str:
+        """Hash current signoff phase/result provenance for token binding."""
+        import hashlib
+        import json
+
+        phases = self.get_workflow_phases(run_id, epoch_id)
+        signoff_markers = (
+            "ground", "senior", "completion", "critical", "verification", "final", "audit",
+        )
+        evidence: list[dict[str, object]] = []
+        for phase in phases:
+            phase_id = str(phase.get("phase_id") or "").lower()
+            if not any(marker in phase_id for marker in signoff_markers):
+                continue
+            executions = self.get_agent_executions(
+                run_id, epoch_id=epoch_id, phase_id=str(phase.get("phase_id")),
+            )
+            evidence.append({
+                "phase_id": phase.get("phase_id"),
+                "status": phase.get("status"),
+                "evidence_generation": phase.get("evidence_generation"),
+                "evidence_digest": phase.get("evidence_digest"),
+                "result_evidence": phase.get("result_evidence"),
+                "executions": [
+                    {
+                        "execution_id": item.get("execution_id"),
+                        "output_hash": item.get("output_hash"),
+                        "result_json": item.get("result_json"),
+                        "result_disposition": item.get("result_disposition"),
+                    }
+                    for item in executions
+                ],
+            })
+        payload = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def consume_completion_token(
         self,
@@ -534,6 +816,11 @@ class RunOrchestrationRepository:
                 return {"valid": False, "reason": "completion token workspace mismatch"}
             if not hmac.compare_digest(str(row["route_snapshot_sha256"]), route_snapshot_sha256):
                 return {"valid": False, "reason": "completion token route snapshot mismatch"}
+            expected_evidence = row["evidence_snapshot_sha256"]
+            if expected_evidence:
+                current_evidence = self.create_completion_evidence_snapshot(run_id, epoch_id)
+                if not hmac.compare_digest(str(expected_evidence), current_evidence):
+                    return {"valid": False, "reason": "completion token evidence snapshot mismatch"}
             consumed_at = _utcnow()
             updated = conn.execute(
                 "UPDATE completion_tokens SET consumed_at=? "

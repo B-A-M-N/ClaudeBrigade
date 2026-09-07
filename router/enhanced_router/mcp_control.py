@@ -318,7 +318,59 @@ async def get_runnable_actions() -> dict[str, Any]:
         "run_id": run_id,
         "epoch_id": active["epoch_id"],
         "actions": actions,
+        "capacity": state.get_run_resource_capacity(run_id, str(active["epoch_id"])),
         "next_poll": "after a native agent reaches a terminal lifecycle state",
+    }
+
+
+@control_mcp.tool()
+async def get_runnable_action_wave(limit: int | None = None) -> dict[str, Any]:
+    """Return all independently packageable native actions in one bounded wave."""
+    state: RouteState = get_state()
+    run_id = _get_current_run_id()
+    if not run_id:
+        return {"ready": False, "error": "No active run ID", "actions": []}
+    authorization_error = _require_capability(state, run_id, "read_routes")
+    if authorization_error:
+        return {"ready": False, "error": authorization_error, "actions": []}
+    active = state.get_active_epoch(run_id)
+    if not active:
+        return {"ready": False, "error": "No active epoch", "actions": []}
+    try:
+        actions = state.get_runnable_action_wave(
+            run_id, str(active["epoch_id"]), limit=limit
+        )
+    except (ValueError, WorkflowStateError) as exc:
+        return {"ready": False, "error": str(exc), "actions": []}
+    provider_worker_limits: dict[str, int] = {}
+    try:
+        from enhanced_router.registry import get_registry
+
+        registry = get_registry()
+        for action in actions:
+            provider_id = str(action.get("provider_id") or "").strip()
+            provider = registry.providers.get(provider_id) if provider_id else None
+            if provider is not None:
+                provider_worker_limits[provider_id] = int(
+                    provider.limits.max_worker_concurrency or 0
+                )
+    except Exception:
+        # Action generation already failed closed when a provider cannot be
+        # resolved. Keep this response compatible with older registry
+        # doubles used by embedded callers.
+        provider_worker_limits = {}
+    return {
+        "ready": True,
+        "run_id": run_id,
+        "epoch_id": active["epoch_id"],
+        "actions": actions,
+        # ``worker_limit`` is retained for older controllers, but it is not
+        # the authority when multiple providers are present.  Consumers
+        # should use provider_worker_limits and the run-wide capacity snapshot.
+        "worker_limit": None,
+        "provider_worker_limits": provider_worker_limits,
+        "capacity": state.get_run_resource_capacity(run_id, str(active["epoch_id"])),
+        "next_poll": "after a wave changes terminal state or capacity",
     }
 
 
@@ -353,18 +405,91 @@ async def claim_runnable_action(action_id: str) -> dict[str, Any]:
 
 
 @control_mcp.tool()
-async def invoke_specialist(
+async def get_action_contract(action_id: str) -> dict[str, Any]:
+    """Return the exact native worker contract for a runnable action."""
+    state: RouteState = get_state()
+    run_id = _get_current_run_id()
+    if not run_id:
+        return {"found": False, "error": "No active run ID"}
+    authorization_error = _require_capability(
+        state, run_id, "read_routes", controller_only=True,
+    )
+    if authorization_error:
+        return {"found": False, "error": authorization_error}
+    active = state.get_active_epoch(run_id)
+    if not active:
+        return {"found": False, "error": "No active epoch"}
+    actions = state.get_runnable_actions(
+        run_id, str(active["epoch_id"]), include_claimed=True,
+    )
+    action = next((item for item in actions if item.get("action_id") == action_id), None)
+    if action is None:
+        action = next(
+            (
+                item for item in state.get_runnable_action_wave(
+                    run_id, str(active["epoch_id"]), include_claimed=True
+                )
+                if item.get("action_id") == action_id
+            ),
+            None,
+        )
+    if action is None:
+        return {"found": False, "error": f"Action '{action_id}' not found"}
+    return {
+        "found": True,
+        "action_id": action_id,
+        "native_agent_name": action.get("native_agent_name"),
+        "worker_kind": action.get("worker_kind"),
+        "worker_id": action.get("worker_id"),
+        "agent_id": action.get("agent_id"),
+        "native_slot": action.get("native_slot"),
+        "expected_model_alias": action.get("expected_model_alias"),
+        "package_id": action.get("package_id"),
+        "package_contract_digest": action.get("package_contract_digest"),
+        "prompt_contract_digest": action.get("prompt_contract_digest"),
+        "package_contract_version": action.get("package_contract_version"),
+        "package_display_name": action.get("package_display_name"),
+        "package_summary": action.get("package_summary"),
+        "display_name": action.get("display_name") or action.get("package_display_name"),
+        "display_summary": action.get("display_summary") or action.get("package_summary"),
+        "controller_action_kind": action.get("controller_action_kind"),
+        "produces": action.get("produces"),
+        "fanout_from": action.get("fanout_from"),
+        "launch_policy": action.get("launch_policy"),
+        "initial_fanout": action.get("initial_fanout"),
+        "maximum_replicas": action.get("maximum_replicas"),
+        "required_successes": action.get("required_successes"),
+        "required_action": action.get("required_action"),
+        "prompt_contract": action.get("prompt") or {},
+        "path_scope": action.get("path_scope", []),
+        "prohibited_paths": action.get("prohibited_paths", []),
+        "priority_class": action.get("priority_class"),
+        "model_id": action.get("model_id"),
+        "capability_snapshot": action.get("capability_snapshot") or {},
+        "workspace_policy": action.get("workspace_policy", "none"),
+        "background": bool(action.get("background", True)),
+        "prompt": action.get("prompt") or {
+            "phase_id": action.get("phase_id"),
+            "role": action.get("role"),
+            "acceptance_criteria": [],
+            "required_tests": [],
+        },
+    }
+
+
+@control_mcp.tool()
+async def invoke_coprocessor(
     action_id: str,
     claim_token: str,
     packet: dict[str, Any],
 ) -> dict[str, Any]:
-    """Start a bounded read-only sidecar for a claimed workflow action."""
+    """Start a bounded coprocessor for a claimed coprocessor action."""
     state = get_state()
     run_id = _get_current_run_id()
     if not run_id:
         return {"started": False, "error": "No active run ID"}
     authorization_error = _require_capability(
-        state, run_id, "invoke_sidecar", controller_only=True,
+        state, run_id, "invoke_coprocessor", controller_only=True,
     )
     if authorization_error:
         return {"started": False, "error": authorization_error}
@@ -372,8 +497,8 @@ async def invoke_specialist(
     if active is None:
         return {"started": False, "error": "No active epoch"}
     try:
-        from enhanced_router.sidecar_executor import get_sidecar_executor
-        execution = await get_sidecar_executor(state).invoke(
+        from enhanced_router.coprocessor_executor import get_coprocessor_executor
+        execution = await get_coprocessor_executor(state).invoke(
             run_id=run_id,
             epoch_id=str(active["epoch_id"]),
             action_id=action_id,
@@ -389,6 +514,200 @@ async def invoke_specialist(
         "execution_id": execution["execution_id"],
         "execution": execution,
     }
+
+
+@control_mcp.tool()
+async def adjudicate_coprocessor_result(
+    run_id: str,
+    epoch_id: str,
+    execution_id: str,
+    disposition: str,
+    reason: str = "",
+    evidence_valid: bool | None = None,
+    quality_score: float | None = None,
+    accepted_finding_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Explicitly accept or reject a completed bounded coprocessor result.
+
+    Transport success and schema validity never authorize workflow progress;
+    only this controller-owned operation can set acceptance evidence.
+    """
+    state = get_state()
+    authorization_error = _require_capability(
+        state, run_id, "adjudicate_coprocessor_result", epoch_id=epoch_id,
+        controller_only=True,
+    )
+    if authorization_error:
+        return {"adjudicated": False, "error": authorization_error}
+    principal = _get_current_principal()
+    adjudicated_by = str(principal.agent_id if principal and principal.agent_id else "controller")
+    try:
+        result = state.adjudicate_coprocessor_result(
+            run_id=run_id,
+            epoch_id=epoch_id,
+            execution_id=execution_id,
+            disposition=disposition,
+            reason=reason,
+            evidence_valid=evidence_valid,
+            quality_score=quality_score,
+            accepted_finding_ids=accepted_finding_ids,
+            adjudicated_by=adjudicated_by,
+        )
+    except (ValueError, WorkflowStateError) as exc:
+        return {"adjudicated": False, "error": str(exc)}
+    if result is None:
+        return {"adjudicated": False, "error": "coprocessor execution not found"}
+    return {"adjudicated": True, "execution": result}
+
+
+@control_mcp.tool()
+async def adjudicate_native_result(
+    run_id: str,
+    epoch_id: str,
+    execution_id: str,
+    disposition: str,
+    reason: str = "",
+    evidence_valid: bool | None = None,
+    quality_score: float | None = None,
+    accepted_finding_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Accept or reject a completed native worker result for quality-gated phases."""
+    state = get_state()
+    error = _require_capability(
+        state, run_id, "adjudicate_native_result", epoch_id=epoch_id,
+        controller_only=True,
+    )
+    if error:
+        return {"adjudicated": False, "error": error}
+    principal = _get_current_principal()
+    adjudicated_by = str(principal.agent_id if principal and principal.agent_id else "controller")
+    try:
+        result = state.adjudicate_native_result(
+            run_id=run_id, epoch_id=epoch_id, execution_id=execution_id,
+            disposition=disposition, reason=reason, evidence_valid=evidence_valid,
+            quality_score=quality_score, accepted_finding_ids=accepted_finding_ids,
+            adjudicated_by=adjudicated_by,
+        )
+    except (ValueError, WorkflowStateError) as exc:
+        return {"adjudicated": False, "error": str(exc)}
+    return {"adjudicated": result is not None, "execution": result}
+
+
+@control_mcp.tool()
+async def adjudicate_feedback(
+    run_id: str,
+    epoch_id: str,
+    feedback_id: str,
+    disposition: str,
+    reason: str = "",
+    adopted_finding_ids: list[str] | None = None,
+    rejected_finding_ids: list[str] | None = None,
+    resulting_action_ids: list[str] | None = None,
+    resulting_changeset_ids: list[str] | None = None,
+    later_validation: dict[str, Any] | None = None,
+    harm_class: str | None = None,
+    quality_score: float | None = None,
+    quality_dimensions: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Record whether delivered automatic advice helped, harmed or was ignored."""
+    state = get_state()
+    authorization_error = _require_capability(
+        state, run_id, "adjudicate_feedback", epoch_id=epoch_id,
+        controller_only=True,
+    )
+    if authorization_error:
+        return {"adjudicated": False, "error": authorization_error}
+    feedback = state.get_feedback(feedback_id)
+    if feedback is None or str(feedback.get("run_id")) != run_id or str(feedback.get("epoch_id")) != epoch_id:
+        return {"adjudicated": False, "error": "feedback is outside the requested run and epoch"}
+    try:
+        result = state.adjudicate_feedback(
+            feedback_id,
+            disposition=disposition,
+            reason=reason,
+            adopted_finding_ids=adopted_finding_ids,
+            rejected_finding_ids=rejected_finding_ids,
+            resulting_action_ids=resulting_action_ids,
+            resulting_changeset_ids=resulting_changeset_ids,
+            later_validation=later_validation,
+            harm_class=harm_class,
+            quality_score=quality_score,
+            quality_dimensions=quality_dimensions,
+            task_class=str(feedback.get("checkpoint") or ""),
+        )
+    except ValueError as exc:
+        return {"adjudicated": False, "error": str(exc)}
+    return {"adjudicated": result is not None, "feedback": result}
+
+
+@control_mcp.tool()
+async def get_coprocessor_metrics(
+    run_id: str,
+    epoch_id: str,
+    coprocessor_id: str,
+    task_class: str = "",
+) -> dict[str, Any]:
+    """Return measured feedback outcomes for operator/controller decisions."""
+    state = get_state()
+    authorization_error = _require_capability(
+        state, run_id, "read_routes", epoch_id=epoch_id, controller_only=True,
+    )
+    if authorization_error:
+        return {"available": False, "error": authorization_error}
+    active = state.get_active_epoch(run_id)
+    if active is None or str(active.get("epoch_id")) != epoch_id:
+        return {"available": False, "error": "epoch is not active for this run"}
+    return {
+        "available": True,
+        "metrics": state.get_coprocessor_outcome_metrics(
+            coprocessor_id,
+            task_class=task_class or None,
+            run_id=run_id,
+        ),
+    }
+
+
+async def invoke_specialist(
+    action_id: str,
+    claim_token: str,
+    packet: dict[str, Any],
+) -> dict[str, Any]:
+    """Compatibility alias for ``invoke_coprocessor``."""
+    return await invoke_coprocessor(action_id, claim_token, packet)
+
+
+@control_mcp.tool()
+async def request_feedback_checkpoint(
+    checkpoint: str,
+    packet: dict[str, Any],
+    action_id: str | None = None,
+) -> dict[str, Any]:
+    """Request the current automatic-feedback checkpoint policy.
+
+    Hooks use the authenticated loopback endpoint because they must return
+    ``additionalContext`` to Claude Code synchronously.  This MCP tool calls
+    the same service for controllers or workers that explicitly want to
+    inspect/trigger a checkpoint.
+    """
+    state = get_state()
+    run_id = _get_current_run_id()
+    principal = _get_current_principal()
+    if not run_id or principal is None:
+        return {"status": "ignored", "reason": "MCP principal or run ID is missing"}
+    if not ("read_routes" in principal.allowed_capabilities
+            or "report_worker_result" in principal.allowed_capabilities):
+        return {"status": "denied", "reason": "MCP principal cannot request feedback"}
+    from enhanced_router.feedback_service import request_feedback_checkpoint as run_checkpoint
+
+    body = dict(packet)
+    body.update({
+        "run_id": run_id,
+        "epoch_id": body.get("epoch_id"),
+        "checkpoint": checkpoint,
+        "agent_id": body.get("agent_id") or principal.agent_id,
+        "action_id": action_id or body.get("action_id"),
+    })
+    return await run_checkpoint(state=state, body=body)
 
 
 @control_mcp.tool()
@@ -442,7 +761,7 @@ async def cancel_execution(
     epoch_id: str,
     execution_id: str,
 ) -> dict[str, Any]:
-    """Cancel a running sidecar execution."""
+    """Cancel a running bounded coprocessor execution."""
     state = get_state()
     authorization_error = _require_capability(
         state, run_id, "cancel_execution", epoch_id=epoch_id, controller_only=True,
@@ -452,10 +771,10 @@ async def cancel_execution(
     execution = state.get_agent_execution_scoped(run_id, epoch_id, execution_id)
     if execution is None:
         return {"cancelled": False, "error": f"Execution '{execution_id}' not found"}
-    if execution.get("execution_kind") != "sidecar_call":
-        return {"cancelled": False, "error": "only sidecar executions can be cancelled here"}
-    from enhanced_router.sidecar_executor import get_sidecar_executor
-    result = await get_sidecar_executor(state).cancel(execution_id)
+    if execution.get("execution_kind") not in {"sidecar_call", "coprocessor_call"}:
+        return {"cancelled": False, "error": "only coprocessor executions can be cancelled here"}
+    from enhanced_router.coprocessor_executor import get_coprocessor_executor
+    result = await get_coprocessor_executor(state).cancel(execution_id)
     return {"cancelled": True, "execution": result}
 
 
@@ -465,7 +784,7 @@ async def retry_execution(
     epoch_id: str,
     execution_id: str,
 ) -> dict[str, Any]:
-    """Retry a failed sidecar within its bounded retry budget."""
+    """Retry a failed coprocessor within its bounded retry budget."""
     state = get_state()
     authorization_error = _require_capability(
         state, run_id, "retry_execution", epoch_id=epoch_id, controller_only=True,
@@ -475,9 +794,9 @@ async def retry_execution(
     execution = state.get_agent_execution_scoped(run_id, epoch_id, execution_id)
     if execution is None:
         return {"started": False, "error": f"Execution '{execution_id}' not found"}
-    from enhanced_router.sidecar_executor import get_sidecar_executor
+    from enhanced_router.coprocessor_executor import get_coprocessor_executor
     try:
-        retried = await get_sidecar_executor(state).retry(execution_id)
+        retried = await get_coprocessor_executor(state).retry(execution_id)
     except (ValueError, WorkflowStateError) as exc:
         return {"started": False, "error": str(exc)}
     return {"started": True, "execution": retried, "retry_of": execution_id}
@@ -496,6 +815,17 @@ async def get_orchestration_status() -> dict[str, Any]:
     epoch_id = str(active["epoch_id"])
     from enhanced_router.backends import provider_admission_snapshots
 
+    supervisor = get_litellm_supervisor()
+    litellm = None
+    if supervisor is not None:
+        litellm = {
+            "runtime": supervisor.deployment_telemetry()
+            if hasattr(supervisor, "deployment_telemetry") else None,
+            "deployments": state.get_litellm_deployment_telemetry(limit=20),
+            "request_attributions": state.get_litellm_request_attributions(limit=50),
+        }
+    from enhanced_router.presentation import orchestration_snapshot
+
     return {
         "ready": True,
         "run_id": run_id,
@@ -506,8 +836,80 @@ async def get_orchestration_status() -> dict[str, Any]:
             run_id=run_id, epoch_id=epoch_id,
         ),
         "provider_admission": provider_admission_snapshots(),
+        "litellm": litellm,
         "runnable_actions": state.get_runnable_actions(run_id, epoch_id),
+        "orchestration": orchestration_snapshot(state, run_id, epoch_id),
     }
+
+
+@control_mcp.tool()
+async def get_orchestration_plan(run_id: str, epoch_id: str) -> dict[str, Any]:
+    """Return the durable execution plan without creating or claiming work.
+
+    Native workflow drivers use this as a read-only projection.  SQLite/MCP
+    remains authoritative for phase readiness, package ownership, action
+    claims, provider admission, and completion; the projection never becomes
+    a second scheduler.
+    """
+    state: RouteState = get_state()
+    error = _authorize_explicit_run(run_id)
+    if error:
+        return {"ready": False, "error": error}
+    capability_error = _require_capability(
+        state, run_id, "read_routes", epoch_id=epoch_id,
+    )
+    if capability_error:
+        return {"ready": False, "error": capability_error}
+    active = state.get_active_epoch(run_id)
+    if active is None or str(active.get("epoch_id")) != str(epoch_id):
+        return {"ready": False, "error": "epoch is not active for this run"}
+    from enhanced_router.backends import provider_admission_snapshots
+    from enhanced_router.presentation import orchestration_snapshot
+    orchestration = orchestration_snapshot(state, run_id, epoch_id)
+    wave = state.get_runnable_action_wave(run_id, epoch_id, limit=3)
+    return {
+        "ready": True,
+        "plan_version": "orchestration-plan-v1",
+        "scheduler_authority": "claudebrigade-mcp",
+        "run_id": run_id,
+        "epoch_id": epoch_id,
+        "workflow_id": active.get("workflow_id"),
+        "escalation": state.get_escalation_state(run_id, epoch_id),
+        "phases": state.get_workflow_phases(run_id, epoch_id),
+        "work_packages": state.get_work_packages(run_id, epoch_id),
+        "runnable_actions": wave,
+        "wave": {
+            "count": len(wave),
+            "action_ids": [item.get("action_id") for item in wave],
+            "package_ids": sorted({
+                str(item.get("package_id"))
+                for item in wave
+                if item.get("package_id")
+            }),
+            "worker_kinds": sorted({
+                str(item.get("worker_kind") or item.get("action_kind"))
+                for item in wave
+            }),
+        },
+        "capacity": state.get_run_resource_capacity(run_id, epoch_id),
+        "provider_admission": provider_admission_snapshots(),
+        "coverage": state.get_requirement_coverage(run_id, epoch_id),
+        "orchestration": orchestration,
+        "wait_reasons": orchestration.get("wait_reasons", []),
+    }
+
+
+@control_mcp.tool()
+async def get_escalation_state(run_id: str, epoch_id: str) -> dict[str, Any]:
+    """Return the durable escalation state for one run/epoch."""
+    state = get_state()
+    error = _authorize_explicit_run(run_id)
+    if error:
+        return {"ready": False, "error": error}
+    active = state.get_active_epoch(run_id)
+    if active is None or str(active.get("epoch_id")) != str(epoch_id):
+        return {"ready": False, "error": "epoch is not active for this run"}
+    return state.get_escalation_state(run_id, epoch_id)
 
 
 @control_mcp.tool()
@@ -847,10 +1249,362 @@ async def get_task_state(
     }
 
 
+@control_mcp.tool()
+async def publish_task_contract(
+    run_id: str,
+    epoch_id: str,
+    contract: dict[str, Any],
+    source: str = "controller",
+    replace_unapproved: bool = False,
+) -> dict[str, Any]:
+    """Publish the scope/acceptance contract for an epoch.
+
+    Before approval, the controller may replace an earlier intake/draft
+    contract.  Once approved, the contract is immutable for the epoch.
+    """
+    state = get_state()
+    error = _require_capability(
+        state, run_id, "complete_workflow", epoch_id=epoch_id, controller_only=True,
+    )
+    if error:
+        return {"published": False, "error": error}
+    try:
+        record = state.publish_task_contract(
+            run_id, epoch_id, contract, source=source,
+            replace_draft=replace_unapproved,
+        )
+        return {"published": True, "contract": record}
+    except (ValueError, KeyError) as exc:
+        return {"published": False, "error": str(exc)}
+
+
+@control_mcp.tool()
+async def approve_task_contract(run_id: str, epoch_id: str, approved_by: str = "controller") -> dict[str, Any]:
+    """Approve the published contract before package mutation is admitted."""
+    state = get_state()
+    error = _require_capability(
+        state, run_id, "complete_workflow", epoch_id=epoch_id, controller_only=True,
+    )
+    if error:
+        return {"approved": False, "error": error}
+    try:
+        record = state.approve_task_contract(run_id, epoch_id, approved_by=approved_by)
+        contract_action_id = f"contract:{run_id}:{epoch_id}"
+        # If approval was performed through the scheduler's first-class
+        # contract action, close that claim as part of the same controller
+        # operation.  Direct state/API callers remain compatible when no
+        # contract action was claimed.
+        consumed = state.consume_controller_action(run_id, epoch_id, contract_action_id)
+        if consumed is not None:
+            state.finish_controller_action(run_id, epoch_id, contract_action_id, "completed")
+        return {"approved": True, "contract": record, "action_id": contract_action_id if consumed else None}
+    except ValueError as exc:
+        return {"approved": False, "error": str(exc)}
+
+
+@control_mcp.tool()
+async def add_requirement(
+    run_id: str,
+    epoch_id: str,
+    statement: str,
+    category: str = "functional",
+    mandatory: bool = True,
+    acceptance: dict[str, Any] | None = None,
+    requirement_id: str | None = None,
+    risk: str = "normal",
+) -> dict[str, Any]:
+    """Add one requirement to the controller-owned coverage ledger."""
+    state = get_state()
+    error = _require_capability(
+        state, run_id, "complete_workflow", epoch_id=epoch_id, controller_only=True,
+    )
+    if error:
+        return {"added": False, "error": error}
+    try:
+        requirement = state.add_requirement(
+            run_id, epoch_id, statement, category=category, mandatory=mandatory,
+            acceptance=acceptance, requirement_id=requirement_id, risk=risk,
+        )
+        return {"added": True, "requirement": requirement}
+    except ValueError as exc:
+        return {"added": False, "error": str(exc)}
+
+
+@control_mcp.tool()
+async def update_requirement(requirement_id: str, status: str, reason: str = "") -> dict[str, Any]:
+    """Adjudicate requirement coverage status."""
+    state = get_state()
+    requirement = None
+    # The ID is globally unique; derive scope from the row before auth.
+    conn = state._new_conn()
+    try:
+        row = conn.execute("SELECT run_id, epoch_id FROM requirements WHERE requirement_id=?", (requirement_id,)).fetchone()
+        if row is None:
+            return {"updated": False, "error": "requirement not found"}
+        error = _require_capability(state, str(row[0]), "complete_workflow", epoch_id=str(row[1]), controller_only=True)
+        if error:
+            return {"updated": False, "error": error}
+    finally:
+        conn.close()
+    try:
+        requirement = state.update_requirement(requirement_id, status=status, reason=reason)
+        return {"updated": requirement is not None, "requirement": requirement}
+    except ValueError as exc:
+        return {"updated": False, "error": str(exc)}
+
+
+@control_mcp.tool()
+async def link_requirement_evidence(
+    requirement_id: str,
+    evidence_kind: str,
+    evidence_ref: str,
+    evidence_digest: str | None = None,
+    valid: bool | None = None,
+) -> dict[str, Any]:
+    """Attach a test, changeset, finding, or audit artifact to a requirement."""
+    state = get_state()
+    conn = state._new_conn()
+    try:
+        row = conn.execute("SELECT run_id, epoch_id FROM requirements WHERE requirement_id=?", (requirement_id,)).fetchone()
+        if row is None:
+            return {"linked": False, "error": "requirement not found"}
+        error = _require_capability(state, str(row[0]), "complete_workflow", epoch_id=str(row[1]), controller_only=True)
+        if error:
+            return {"linked": False, "error": error}
+    finally:
+        conn.close()
+    return {"linked": True, "evidence": state.link_requirement_evidence(
+        requirement_id, evidence_kind=evidence_kind, evidence_ref=evidence_ref,
+        evidence_digest=evidence_digest, valid=valid,
+    )}
+
+
+@control_mcp.tool()
+async def get_requirement_coverage(run_id: str, epoch_id: str) -> dict[str, Any]:
+    """Return the authoritative requirement/evidence coverage projection."""
+    error = _authorize_explicit_run(run_id)
+    if error:
+        return {"error": error}
+    return get_state().get_requirement_coverage(run_id, epoch_id)
+
+
+@control_mcp.tool()
+async def record_coverage_audit(
+    run_id: str,
+    epoch_id: str,
+    complete: bool,
+    missing: list[str] | None = None,
+    auditor: str = "controller",
+    contract_version: int | None = None,
+    workspace_generation: int | None = None,
+    workspace_digest: str | None = None,
+) -> dict[str, Any]:
+    """Persist the controller's requirement-coverage audit.
+
+    A successful coverage audit is evidence that the current contract and
+    canonical workspace were checked together.  It is intentionally separate
+    from ``get_requirement_coverage``: computed coverage is not itself an
+    attestation that a controller performed the final audit.
+    """
+    state = get_state()
+    error = _require_capability(
+        state, run_id, "complete_workflow", epoch_id=epoch_id, controller_only=True,
+    )
+    if error:
+        return {"recorded": False, "error": error}
+    try:
+        audit = state.record_coverage_audit(
+            run_id,
+            epoch_id,
+            complete=complete,
+            missing=missing,
+            auditor=auditor,
+            contract_version=contract_version,
+            workspace_generation=workspace_generation,
+            workspace_digest=workspace_digest,
+        )
+    except ValueError as exc:
+        return {"recorded": False, "error": str(exc)}
+    return {"recorded": True, "audit": audit}
+
+
+@control_mcp.tool()
+async def add_ambiguity(
+    run_id: str,
+    epoch_id: str,
+    question: str,
+    options: list[str] | None = None,
+    ambiguity_id: str | None = None,
+) -> dict[str, Any]:
+    """Record an unresolved contract question before implementation."""
+    state = get_state()
+    error = _require_capability(state, run_id, "complete_workflow", epoch_id=epoch_id, controller_only=True)
+    if error:
+        return {"added": False, "error": error}
+    try:
+        return {"added": True, "ambiguity": state.add_ambiguity(
+            run_id, epoch_id, question, options=options, ambiguity_id=ambiguity_id,
+        )}
+    except ValueError as exc:
+        return {"added": False, "error": str(exc)}
+
+
+@control_mcp.tool()
+async def resolve_ambiguity(
+    ambiguity_id: str,
+    resolution: str,
+    status: str = "resolved",
+) -> dict[str, Any]:
+    """Resolve or defer a recorded contract ambiguity."""
+    state = get_state()
+    conn = state._new_conn()
+    try:
+        row = conn.execute("SELECT run_id, epoch_id FROM ambiguities WHERE ambiguity_id=?", (ambiguity_id,)).fetchone()
+        if row is None:
+            return {"resolved": False, "error": "ambiguity not found"}
+        error = _require_capability(state, str(row[0]), "complete_workflow", epoch_id=str(row[1]), controller_only=True)
+        if error:
+            return {"resolved": False, "error": error}
+    finally:
+        conn.close()
+    try:
+        result = state.resolve_ambiguity(ambiguity_id, resolution, status=status)
+        return {"resolved": result is not None, "ambiguity": result}
+    except ValueError as exc:
+        return {"resolved": False, "error": str(exc)}
+
+
+@control_mcp.tool()
+async def publish_work_packages(
+    run_id: str,
+    epoch_id: str,
+    phase_id: str,
+    packages: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Publish disjoint package contracts consumed by the native scheduler."""
+    state = get_state()
+    error = _require_capability(state, run_id, "complete_workflow", epoch_id=epoch_id, controller_only=True)
+    if error:
+        return {"published": False, "error": error}
+    published: list[dict[str, Any]] = []
+    try:
+        for package in packages:
+            published.append(state.publish_work_package(
+                run_id, epoch_id, phase_id, str(package.get("objective") or ""),
+                package_id=package.get("package_id"), path_scope=package.get("path_scope"),
+                requirement_ids=package.get("requirements"), dependencies=package.get("dependencies"),
+                acceptance=package.get("acceptance"), required_tests=package.get("required_tests"),
+                prohibited_paths=package.get("prohibited_paths"), contract_digest=package.get("contract_digest"),
+                contract_version=int(package.get("contract_version") or 1),
+                prompt_contract=package.get("prompt_contract"),
+                display_name=package.get("display_name"), summary=package.get("summary"),
+                risk=str(package.get("risk") or "normal"), can_run_parallel=bool(package.get("can_run_parallel", True)),
+            ))
+        return {"published": True, "packages": published}
+    except (ValueError, KeyError) as exc:
+        return {"published": False, "error": str(exc)}
+
+
+@control_mcp.tool()
+async def get_work_packages(run_id: str, epoch_id: str, phase_id: str | None = None) -> dict[str, Any]:
+    """List persisted package contracts and their statuses."""
+    error = _authorize_explicit_run(run_id)
+    if error:
+        return {"error": error}
+    return {"packages": get_state().get_work_packages(run_id, epoch_id, phase_id)}
+
+
+@control_mcp.tool()
+async def evaluate_escalation(
+    run_id: str,
+    epoch_id: str,
+    failed_tests: int = 0,
+    unresolved_findings: int = 0,
+    missing_requirements: int = 0,
+    changed_files: int = 0,
+    changed_security_paths: bool = False,
+    repeated_repairs: int = 0,
+    provider_failures: int = 0,
+    evidence_incomplete: bool = False,
+    deadline_pressure: bool = False,
+) -> dict[str, Any]:
+    """Evaluate an adaptive escalation without applying it."""
+    from enhanced_router.escalation_policy import EscalationInputs, evaluate_escalation as decide
+    state = get_state()
+    active = state.get_active_epoch(run_id)
+    current = str(
+        (active or {}).get("escalation_level")
+        or (active or {}).get("workflow_id")
+        or "normal"
+    )
+    decision = decide(EscalationInputs(
+        current_tier=current, failed_tests=failed_tests, unresolved_findings=unresolved_findings,
+        missing_requirements=missing_requirements, changed_files=changed_files,
+        changed_security_paths=changed_security_paths, repeated_repairs=repeated_repairs,
+        provider_failures=provider_failures, evidence_incomplete=evidence_incomplete,
+        deadline_pressure=deadline_pressure,
+    ))
+    return {"decision": decision.__dict__}
+
+
+@control_mcp.tool()
+async def apply_escalation(run_id: str, epoch_id: str, decision: dict[str, Any]) -> dict[str, Any]:
+    """Apply a previously evaluated escalation through the controller authority."""
+    from enhanced_router.escalation_policy import EscalationDecision
+    state = get_state()
+    error = _require_capability(state, run_id, "complete_workflow", epoch_id=epoch_id, controller_only=True)
+    if error:
+        return {"applied": False, "error": error}
+    try:
+        parsed = EscalationDecision(
+            should_escalate=bool(decision.get("should_escalate")),
+            from_tier=str(decision["from_tier"]), to_tier=str(decision["to_tier"]),
+            reasons=tuple(str(item) for item in decision.get("reasons", [])),
+            policy_digest=str(decision["policy_digest"]),
+        )
+        return {"applied": True, "state": state.escalate_epoch(run_id, epoch_id, parsed)}
+    except (KeyError, ValueError) as exc:
+        return {"applied": False, "error": str(exc)}
+
+
+@control_mcp.tool()
+async def escalate_workflow(
+    run_id: str, epoch_id: str, decision: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply an escalation; explicit name for controller workflow clients."""
+    return await apply_escalation(run_id, epoch_id, decision)
+
+
+@control_mcp.tool()
+async def acknowledge_escalation(
+    run_id: str, epoch_id: str, reason: str = "",
+) -> dict[str, Any]:
+    """Acknowledge compensating review and resume admitted mutation."""
+    state = get_state()
+    error = _require_capability(
+        state, run_id, "complete_workflow", epoch_id=epoch_id, controller_only=True,
+    )
+    if error:
+        return {"acknowledged": False, "error": error}
+    principal = _get_current_principal()
+    actor = str(principal.agent_id if principal and principal.agent_id else "controller")
+    try:
+        result = state.acknowledge_escalation(
+            run_id, epoch_id, acknowledged_by=actor,
+        )
+        return {"acknowledged": True, "reason": reason, "state": result}
+    except (KeyError, ValueError, WorkflowStateError) as exc:
+        return {"acknowledged": False, "error": str(exc)}
+
+
 def _proposal_route_targets(proposal: dict) -> dict[str, tuple[str, str]]:
     """Extract model/endpoint targets without granting fastpath authority."""
     raw = json.loads(str(proposal.get("parsed_proposal_json") or "{}"))
-    routes = raw.get("routes")
+    # Detached proposals retain both the model-facing compact ``routes`` and
+    # the router-resolved ``resolved_routes``.  Prefer the latter: the MCP
+    # controller may accept a proposal long after the original candidate map
+    # has left memory, but it must never trust an unresolvable candidate alias.
+    routes = raw.get("resolved_routes") or raw.get("routes")
     if not isinstance(routes, dict):
         raise ValueError("route proposal has no routes object")
     targets: dict[str, tuple[str, str]] = {}
@@ -860,6 +1614,11 @@ def _proposal_route_targets(proposal: dict) -> dict[str, tuple[str, str]]:
         if not isinstance(target, dict):
             raise ValueError(f"route proposal target for '{role}' is not an object")
         model_id = target.get("model") or target.get("preferred_logical_model")
+        if not model_id and target.get("candidate_id"):
+            raise ValueError(
+                f"route proposal target for '{role}' has an unresolved candidate "
+                "and cannot be applied"
+            )
         endpoint = target.get("endpoint", "auto")
         if not isinstance(model_id, str) or not model_id:
             continue
@@ -893,12 +1652,17 @@ async def accept_route_proposal(
     proposal_id: str,
     reason: str,
     apply_routes: bool = False,
+    apply_plan: bool | None = None,
 ) -> dict[str, Any]:
-    """Accept an advisory proposal, optionally applying its logical routes.
+    """Accept an advisory proposal, optionally applying routes and its plan.
 
     DiffusionGemma never applies routes itself.  Only the authenticated main
     controller may accept a proposal, and endpoint selection remains in the
     normal certified/cache-aware resolver.
+
+    ``apply_plan`` defaults to ``apply_routes`` for compatibility with the
+    original one-switch MCP contract: a controller that explicitly approves
+    route application also gets the proposal's still-pending fanout hints.
     """
     run_id = _get_current_run_id()
     if not run_id:
@@ -919,6 +1683,43 @@ async def accept_route_proposal(
             raise ValueError("no active epoch for proposal")
         epoch_id = str(active["epoch_id"])
         registry = _get_registry()
+        parsed_proposal = json.loads(str(proposal.get("parsed_proposal_json") or "{}"))
+        if not isinstance(parsed_proposal, dict):
+            raise ValueError("route proposal payload is not an object")
+        proposal_registry_hash = parsed_proposal.get("registry_hash")
+        if proposal_registry_hash and str(proposal_registry_hash) != registry.registry_hash():
+            raise ValueError(
+                "route proposal was generated from a stale registry/catalog snapshot"
+            )
+        proposal_candidate_digest = parsed_proposal.get("candidate_set_digest")
+        if proposal_candidate_digest:
+            from enhanced_router.fastpath import build_route_candidates
+            import hashlib
+
+            offered_candidates, _ = build_route_candidates(
+                registry, ["recon", "implementer", "adversary", "repairer"],
+            )
+            current_candidate_digest = hashlib.sha256(
+                json.dumps(
+                    {
+                        "registry_hash": registry.registry_hash(),
+                        "candidates": offered_candidates,
+                        "minimum_tier": parsed_proposal.get("minimum_tier", "normal"),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            if str(proposal_candidate_digest) != current_candidate_digest:
+                raise ValueError(
+                    "route proposal was generated from a stale candidate-set snapshot"
+                )
+        should_apply_plan = apply_routes if apply_plan is None else apply_plan
+        plan_result: dict[str, Any] = {"applied": False, "changes": []}
+        if should_apply_plan:
+            plan_result = state.apply_fastpath_plan(
+                run_id, epoch_id, parsed_proposal,
+            )
         if apply_routes:
             for role, (model_id, endpoint) in targets.items():
                 spec = registry.get_model(model_id)
@@ -943,6 +1744,9 @@ async def accept_route_proposal(
             "accepted": result is not None,
             "proposal": result,
             "applied_routes": apply_routes,
+            "applied_plan": plan_result["applied"],
+            "plan_changes": plan_result["changes"],
+            "proposed_workflow_tier": parsed_proposal.get("workflow_tier"),
             "routes": targets,
         }
     except (KeyError, ValueError, json.JSONDecodeError) as exc:
@@ -1170,7 +1974,20 @@ async def integrate_shadow_changeset(
             )
             state.update_workspace_status(workspace_id, "merged")
             integration_outcome = "completed"
-            return {"integrated": True, **result}
+            # Reclassify the canonical result as well as the worker shadow
+            # changeset.  A collection of individually small packages can
+            # become cross-subsystem or security-sensitive only after they
+            # are combined in the canonical workspace.
+            try:
+                escalation = state.auto_escalate_after_changeset(
+                    run_id, epoch_id, changeset_id, apply=True,
+                )
+            except Exception as exc:
+                # Integration is already durable at this point.  Preserve the
+                # successful apply and surface escalation evaluation failure as
+                # follow-up evidence rather than mislabeling the changeset red.
+                escalation = {"applied": False, "error": str(exc)}
+            return {"integrated": True, **result, "escalation": escalation}
         except Exception as exc:
             state.mark_integration_candidate(
                 changeset_id, disposition="red", validation={"preflight_error": str(exc)},
@@ -1263,6 +2080,46 @@ async def resolve_shadow_candidate(
 
 
 @control_mcp.tool()
+async def append_phase_instance(
+    run_id: str,
+    epoch_id: str,
+    template_phase_id: str,
+    dependencies: list[str] | None = None,
+    supersedes_phase_id: str | None = None,
+    trigger_event: str | None = None,
+    phase_id: str | None = None,
+) -> dict[str, Any]:
+    """Append a controller-authorized review/repair phase instance.
+
+    This is the durable mechanism for a second adversarial review or repair
+    cycle.  It clones the persisted phase semantics while creating a new
+    identity such as ``adversarial-review#2``; ordinary execution retries do
+    not masquerade as a new semantic cycle.
+    """
+    authorization_error = _authorize_explicit_run(run_id)
+    if authorization_error:
+        return {"appended": False, "error": authorization_error}
+    state: RouteState = get_state()
+    authorization_error = _require_capability(
+        state, run_id, "complete_workflow", epoch_id=epoch_id,
+        controller_only=True,
+    )
+    if authorization_error:
+        return {"appended": False, "error": authorization_error}
+    try:
+        phase = state.append_phase_instance(
+            run_id, epoch_id, template_phase_id,
+            dependencies=dependencies,
+            supersedes_phase_id=supersedes_phase_id,
+            trigger_event=trigger_event,
+            phase_id=phase_id,
+        )
+        return {"appended": True, "phase": phase}
+    except (ValueError, KeyError) as exc:
+        return {"appended": False, "error": str(exc)}
+
+
+@control_mcp.tool()
 async def start_phase(
     run_id: str,
     epoch_id: str,
@@ -1344,6 +2201,10 @@ async def complete_phase(
         return {"error": authorization_error}
     try:
         result = state.complete_phase(run_id, epoch_id, phase_id, result_evidence=result_evidence, error=error)
+        state.finish_controller_actions_for_phase(
+            run_id, epoch_id, phase_id,
+            "failed" if error else "completed",
+        )
         return {"phase_id": phase_id, "status": result["status"]}
     except WorkflowPhaseStateError as exc:
         return {"error": str(exc)}
@@ -1458,6 +2319,8 @@ async def adjudicate_finding(
     result = state.adjudicate_finding(
         finding_id=finding_id,
         disposition=disposition,
+        run_id=run_id,
+        epoch_id=epoch_id,
         reason=reason,
         dispositioned_by=dispositioned_by,
         repair_agent_id=repair_agent_id,
@@ -1515,6 +2378,8 @@ async def resolve_finding(
         finding_id=finding_id,
         verification_status=verification_status,
         resolution_evidence_json=resolution_evidence_json,
+        run_id=run_id,
+        epoch_id=epoch_id,
     )
     if result is None:
         return {"error": f"Finding '{finding_id}' not found"}
@@ -1809,7 +2674,11 @@ def set_current_run_id(run_id: str | None) -> None:
             allowed_capabilities=frozenset({
                 "read_routes", "claim_native_action", "report_worker_result",
                 "adjudicate_finding", "integrate_changeset", "complete_workflow",
-                "invoke_sidecar", "cancel_execution", "retry_execution",
+                "adjudicate_coprocessor_result", "adjudicate_feedback",
+                "adjudicate_native_result",
+                "get_coprocessor_metrics",
+                "invoke_coprocessor", "invoke_sidecar",
+                "cancel_execution", "retry_execution",
             }),
             authenticated=False,
         ))

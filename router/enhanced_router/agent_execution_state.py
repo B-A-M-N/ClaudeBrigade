@@ -17,6 +17,8 @@ increment's cross-section calls.
 
 from __future__ import annotations
 
+from enhanced_router.repository_base import RepositoryMixin
+
 import hashlib
 import json
 import logging
@@ -43,7 +45,7 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-class AgentExecutionRepository:
+class AgentExecutionRepository(RepositoryMixin):
     """Mixin providing agent execution ledger persistence methods.
 
     Requires a host class that provides ``_new_conn() -> sqlite3.Connection``
@@ -76,6 +78,19 @@ class AgentExecutionRepository:
         parent_execution_id: str | None = None,
         workspace_id: str | None = None,
         independence_key: str | None = None,
+        worker_kind: str | None = None,
+        worker_id: str | None = None,
+        capability_snapshot: dict | None = None,
+        tool_policy_digest: str | None = None,
+        prompt_contract_digest: str | None = None,
+        workspace_policy: str | None = None,
+        background: bool | None = None,
+        package_id: str | None = None,
+        agent_definition_id: str | None = None,
+        native_slot: str | None = None,
+        public_model_alias: str | None = None,
+        capability_digest: str | None = None,
+        priority_class: str | None = None,
     ) -> dict:
         """Record the start of an authoritative execution.
 
@@ -85,7 +100,12 @@ class AgentExecutionRepository:
         """
         conn = self._new_conn()
         try:
-            if role in {"implementer", "repairer", "controller"}:
+            can_mutate = (
+                bool(capability_snapshot.get("can_mutate"))
+                if capability_snapshot is not None
+                else role in {"implementer", "repairer", "controller"}
+            )
+            if can_mutate:
                 if not workspace_id:
                     raise ValueError("mutating agent execution requires a shadow workspace")
                 workspace_row = conn.execute(
@@ -148,6 +168,20 @@ class AgentExecutionRepository:
                         "parent_execution_id": parent_execution_id,
                     }, sort_keys=True, separators=(",", ":")).encode()
                 ).hexdigest()
+
+            current_workspace = conn.execute(
+                "SELECT canonical_generation, current_dirty_hash, dirty_patch_hash "
+                "FROM workspaces WHERE run_id=? AND epoch_id=? AND kind='main' "
+                "AND status IN ('active','ready','merged') ORDER BY created_at LIMIT 1",
+                (run_id, epoch_id),
+            ).fetchone()
+            workspace_generation = (
+                int(current_workspace[0] or 0) if current_workspace is not None else None
+            )
+            workspace_digest = (
+                str(current_workspace[1] or current_workspace[2] or "")
+                if current_workspace is not None else None
+            )
 
             if phase_id is not None:
                 phase = conn.execute(
@@ -242,15 +276,34 @@ class AgentExecutionRepository:
                    (execution_id, run_id, epoch_id, claude_agent_id, role, model_id,
                     phase_id, binding_id, status, actor_kind, execution_kind, provider_id,
                     endpoint_id, transport, configuration_hash, parent_execution_id,
-                    workspace_id, independence_key)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'started', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   workspace_id, independence_key, worker_kind, worker_id,
+                   capability_snapshot_json, tool_policy_digest, prompt_contract_digest,
+                   workspace_policy, background, package_id, agent_definition_id,
+                   native_slot, public_model_alias, capability_digest, priority_class,
+                   workspace_generation, workspace_digest)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'started', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (execution_id, run_id, epoch_id, claude_agent_id, role, model_id,
                  phase_id, binding_id, actor_kind, execution_kind, provider_id,
                  endpoint_id, transport, configuration_hash, parent_execution_id,
-                 workspace_id, independence_key),
+                 workspace_id, independence_key, worker_kind, worker_id,
+                 json.dumps(capability_snapshot or {}, separators=(",", ":")),
+                 tool_policy_digest, prompt_contract_digest, workspace_policy,
+                 1 if background else 0 if background is not None else None,
+                 package_id, agent_definition_id, native_slot, public_model_alias,
+                 capability_digest, priority_class, workspace_generation, workspace_digest),
             )
             conn.commit()
-            return self.get_agent_execution(execution_id)  # type: ignore[return-value]
+            result = self.get_agent_execution(execution_id)
+            if package_id:
+                try:
+                    self.update_work_package(
+                        package_id,
+                        status="running",
+                        reason="native execution attached",
+                    )
+                except Exception:
+                    logger.debug("unable to mark package %s running", package_id, exc_info=True)
+            return result  # type: ignore[return-value]
         finally:
             conn.close()
 
@@ -297,6 +350,7 @@ class AgentExecutionRepository:
         cache_read_tokens: int | None = None,
         cache_write_tokens: int | None = None,
         output_tokens: int | None = None,
+        estimated_cost: float | None = None,
         ttft_ms: float | None = None,
         wall_time_ms: float | None = None,
         error_class: str | None = None,
@@ -306,6 +360,12 @@ class AgentExecutionRepository:
         quality_score: float | None = None,
         verdict: str | None = None,
         confidence: float | None = None,
+        result_disposition: str | None = None,
+        adjudication_reason: str | None = None,
+        adjudicated_by: str | None = None,
+        adjudicated_at: str | None = None,
+        accepted_finding_ids_json: str | None = None,
+        orphaned_at: str | None = None,
     ) -> dict | None:
         """Update an agent execution while enforcing lifecycle transitions.
 
@@ -316,7 +376,7 @@ class AgentExecutionRepository:
         conn = self._new_conn()
         try:
             current = conn.execute(
-                "SELECT status FROM agent_executions WHERE execution_id=?",
+                "SELECT status, package_id FROM agent_executions WHERE execution_id=?",
                 (execution_id,),
             ).fetchone()
             if current is None:
@@ -366,11 +426,18 @@ class AgentExecutionRepository:
                 ("cache_read_tokens", cache_read_tokens), ("cache_write_tokens", cache_write_tokens),
                 ("output_tokens", output_tokens), ("ttft_ms", ttft_ms),
                 ("wall_time_ms", wall_time_ms), ("error_class", error_class),
+                ("estimated_cost", estimated_cost),
                 ("schema_valid", None if schema_valid is None else int(schema_valid)),
                 ("evidence_valid", None if evidence_valid is None else int(evidence_valid)),
                 ("accepted_by_controller", None if accepted_by_controller is None else int(accepted_by_controller)),
                 ("quality_score", quality_score), ("verdict", verdict),
                 ("confidence", confidence),
+                ("result_disposition", result_disposition),
+                ("adjudication_reason", adjudication_reason),
+                ("adjudicated_by", adjudicated_by),
+                ("adjudicated_at", adjudicated_at),
+                ("accepted_finding_ids_json", accepted_finding_ids_json),
+                ("orphaned_at", orphaned_at),
             ):
                 if value is not None:
                     sets.append(f"{column} = ?")
@@ -381,9 +448,80 @@ class AgentExecutionRepository:
                 params,
             )
             conn.commit()
-            return self.get_agent_execution(execution_id)
+            result = self.get_agent_execution(execution_id)
+            if result and result.get("status") in _EXECUTION_TERMINAL_STATUSES:
+                package_id = str(result.get("package_id") or current[1] or "")
+                if package_id:
+                    package_status = (
+                        "completed" if result["status"] == "completed"
+                        else "retry" if result["status"] in {"failed", "timeout"}
+                        else "cancelled"
+                    )
+                    try:
+                        self.update_work_package(
+                            package_id,
+                            status=package_status,
+                            reason=(result.get("error") or "")[:2000],
+                        )
+                    except Exception:
+                        # A package may have been removed by a migration or
+                        # legacy caller; execution terminalization remains
+                        # authoritative and must not be rolled back.
+                        logger.debug("unable to update package %s", package_id, exc_info=True)
+                claim = conn.execute(
+                    "SELECT token_reservation_id FROM runnable_action_claims "
+                    "WHERE execution_id=? ORDER BY consumed_at DESC LIMIT 1",
+                    (execution_id,),
+                ).fetchone()
+                if claim is not None and claim[0]:
+                    self.release_token_reservation(
+                        str(claim[0]),
+                        "consumed" if result["status"] == "completed" else "released",
+                    )
+            return result
         finally:
             conn.close()
+
+    def adjudicate_native_result(
+        self,
+        *,
+        run_id: str,
+        epoch_id: str,
+        execution_id: str,
+        disposition: str,
+        reason: str = "",
+        evidence_valid: bool | None = None,
+        quality_score: float | None = None,
+        accepted_finding_ids: list[str] | None = None,
+        adjudicated_by: str = "controller",
+    ) -> dict | None:
+        """Record controller acceptance for a completed native execution."""
+        if disposition not in {"accepted", "partially_accepted", "rejected", "insufficient_evidence"}:
+            raise ValueError(f"invalid native result disposition: {disposition}")
+        if quality_score is not None and not 0 <= quality_score <= 1:
+            raise ValueError("native quality_score must be between 0 and 1")
+        execution = self.get_agent_execution_scoped(run_id, epoch_id, execution_id)
+        if execution is None:
+            raise WorkflowStateError("native execution is outside the requested epoch")
+        if execution.get("execution_kind") in {"coprocessor_call", "sidecar_call"}:
+            raise WorkflowStateError("use coprocessor adjudication for bounded calls")
+        if execution.get("status") != "completed":
+            raise WorkflowStateError("native result must be terminally completed before adjudication")
+        accepted = disposition in {"accepted", "partially_accepted"}
+        updated = self.update_agent_execution(
+            execution_id,
+            accepted_by_controller=accepted,
+            evidence_valid=accepted if evidence_valid is None else evidence_valid,
+            quality_score=quality_score,
+            result_disposition=disposition,
+            adjudication_reason=reason[:2000],
+            adjudicated_by=adjudicated_by[:256],
+            adjudicated_at=_utcnow(),
+            accepted_finding_ids_json=json.dumps(accepted_finding_ids or [], separators=(",", ":")),
+        )
+        if updated is not None:
+            self.complete_phase_if_ready(run_id, epoch_id, str(execution.get("phase_id") or ""))
+        return updated
 
     def increment_execution_tool_calls(
         self, execution_id: str, *, run_id: str | None = None,
@@ -411,6 +549,128 @@ class AgentExecutionRepository:
             return self.get_agent_execution(execution_id)
         finally:
             conn.close()
+
+    def enforce_execution_limits(
+        self,
+        execution_id: str,
+        *,
+        run_id: str,
+        epoch_id: str,
+    ) -> dict[str, object]:
+        """Check a native execution before another tool call.
+
+        Phase-start validation prevents admitting an already-over-budget
+        worker, but it cannot stop a live worker from consuming tools after a
+        deadline or aggregate turn budget is reached.  This check is called
+        from the PreToolUse hook and terminalizes the execution atomically so
+        the next lifecycle reconciliation sees a typed timeout instead of a
+        generic failure.
+        """
+        conn = self._new_conn()
+        reservation_id: str | None = None
+        provider_id: str | None = None
+        exceeded: tuple[str, str] | None = None
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            execution = conn.execute(
+                "SELECT execution_id, status, phase_id, started_at, tool_call_count, provider_id "
+                "FROM agent_executions WHERE execution_id=? AND run_id=? AND epoch_id=?",
+                (execution_id, run_id, epoch_id),
+            ).fetchone()
+            if execution is None:
+                conn.rollback()
+                return {"allowed": True, "execution": None}
+            status = str(execution[1])
+            if status in _EXECUTION_TERMINAL_STATUSES:
+                conn.rollback()
+                return {"allowed": False, "reason": f"execution is already {status}"}
+            phase_id = execution[2]
+            phase = None
+            if phase_id:
+                phase = conn.execute(
+                    "SELECT status, started_at, max_duration_seconds, turn_budget "
+                    "FROM workflow_phases WHERE run_id=? AND epoch_id=? AND phase_id=?",
+                    (run_id, epoch_id, phase_id),
+                ).fetchone()
+            now = datetime.now(timezone.utc)
+            if phase is not None and phase[2] is not None and phase[1]:
+                started = datetime.fromisoformat(str(phase[1])).astimezone(timezone.utc)
+                if (now - started).total_seconds() >= float(phase[2]):
+                    exceeded = (
+                        "deadline_exceeded",
+                        f"workflow phase {phase_id!r} exceeded its {phase[2]} second deadline",
+                    )
+            if exceeded is None and phase is not None and phase[3] is not None:
+                used = conn.execute(
+                    "SELECT COALESCE(SUM(tool_call_count), 0) FROM agent_executions "
+                    "WHERE run_id=? AND epoch_id=? AND phase_id=?",
+                    (run_id, epoch_id, phase_id),
+                ).fetchone()[0]
+                if int(used or 0) >= int(phase[3]):
+                    exceeded = (
+                        "turn_budget_exhausted",
+                        f"workflow phase {phase_id!r} exhausted turn budget {phase[3]}",
+                    )
+            if exceeded is None:
+                conn.commit()
+                return {"allowed": True, "execution_id": execution_id}
+            error_class, reason = exceeded
+            conn.execute(
+                "UPDATE agent_executions SET status='timeout', completed_at=?, error=?, "
+                "error_class=?, updated_at=? WHERE execution_id=? AND status NOT IN "
+                "('completed','failed','timeout','cancelled')",
+                (_utcnow(), reason, error_class, _utcnow(), execution_id),
+            )
+            claim = conn.execute(
+                "SELECT reservation_id, token_reservation_id, provider_id FROM runnable_action_claims "
+                "WHERE execution_id=? ORDER BY consumed_at DESC LIMIT 1",
+                (execution_id,),
+            ).fetchone()
+            if claim is not None:
+                reservation_id = str(claim[0]) if claim[0] else None
+                provider_id = str(claim[2]) if claim[2] else str(execution[5] or "") or None
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+        # Reuse the normal terminal accounting path after the atomic state
+        # transition.  It releases token reservations and updates package
+        # status; the provider reservation is released here immediately so a
+        # denied tool call cannot strand admission capacity until SubagentStop.
+        try:
+            self.update_agent_execution(
+                execution_id,
+                status="timeout",
+                error=exceeded[1] if exceeded else "execution limit exceeded",
+                error_class=exceeded[0] if exceeded else "execution_limit_exceeded",
+            )
+        except WorkflowStateError:
+            # Another terminal lifecycle event won the race after the atomic
+            # check.  The state is still safe and the hook must deny this call.
+            pass
+        if reservation_id:
+            released = self.release_provider_reservation(reservation_id, "expired")
+            if released:
+                try:
+                    from enhanced_router.registry import get_registry
+
+                    provider = get_registry().providers.get(str(provider_id or released.get("provider_id")))
+                    if provider:
+                        self.admit_provider_agents(
+                            str(provider_id or released.get("provider_id")),
+                            provider.limits.max_active_agents,
+                        )
+                except Exception:
+                    logger.debug("unable to re-admit provider after execution timeout", exc_info=True)
+        return {
+            "allowed": False,
+            "execution_id": execution_id,
+            "reason": exceeded[1] if exceeded else "execution limit exceeded",
+            "error_class": exceeded[0] if exceeded else "execution_limit_exceeded",
+        }
 
     def increment_execution_requests(self, binding_id: int | None) -> dict | None:
         """Correlate an admitted model request with its execution ledger row."""

@@ -8,17 +8,23 @@ sidecar profile, launch preset) and its controller capability credential.
 
 from __future__ import annotations
 
+from enhanced_router.repository_base import RepositoryMixin
+
 import hashlib
 import hmac
+import json
 import sqlite3
 from datetime import datetime, timezone
+from typing import Any
+
+from enhanced_router.config_models import RunResourcePolicy
 
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-class RunRegistryRepository:
+class RunRegistryRepository(RepositoryMixin):
     """Mixin providing run-registry persistence methods.
 
     Requires a host class that provides ``_new_conn() -> sqlite3.Connection``
@@ -31,7 +37,7 @@ class RunRegistryRepository:
     _RUN_COLUMNS = (
         "run_id", "claude_session_id", "cwd", "controller_capability_hash",
         "inference_profile_id", "sidecar_profile_id", "launch_preset_id",
-        "token_budget", "created_at", "closed_at",
+        "token_budget", "resource_policy_json", "created_at", "closed_at",
     )
 
     def create_run(
@@ -44,6 +50,7 @@ class RunRegistryRepository:
         sidecar_profile_id: str | None = None,
         launch_preset_id: str | None = None,
         token_budget: int | None = None,
+        resource_policy: RunResourcePolicy | dict | None = None,
     ) -> dict:
         """Insert run if not exists (idempotent). Returns run dict.
 
@@ -52,14 +59,26 @@ class RunRegistryRepository:
         RunnableActionRepository.claim_runnable_action. NULL/unset means
         unbounded, matching every run created before this field existed.
         """
+        policy_json = None
+        if resource_policy is not None:
+            parsed_policy = (
+                resource_policy
+                if isinstance(resource_policy, RunResourcePolicy)
+                else RunResourcePolicy(**resource_policy)
+            )
+            policy_json = json.dumps(
+                parsed_policy.model_dump(exclude_none=False),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         conn = self._new_conn()
         try:
             conn.execute(
                 "INSERT OR IGNORE INTO runs "
                 "(run_id, claude_session_id, cwd, controller_capability_hash, "
                 "inference_profile_id, sidecar_profile_id, launch_preset_id, "
-                "token_budget, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "token_budget, resource_policy_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     session_id,
@@ -70,6 +89,7 @@ class RunRegistryRepository:
                     sidecar_profile_id,
                     launch_preset_id,
                     token_budget,
+                    policy_json,
                     _utcnow(),
                 ),
             )
@@ -96,6 +116,12 @@ class RunRegistryRepository:
                     "launch_preset_id=COALESCE(launch_preset_id, ?) WHERE run_id=?",
                     (inference_profile_id, sidecar_profile_id, launch_preset_id, run_id),
                 )
+            if policy_json is not None:
+                conn.execute(
+                    "UPDATE runs SET resource_policy_json=COALESCE(resource_policy_json, ?) "
+                    "WHERE run_id=?",
+                    (policy_json, run_id),
+                )
             conn.commit()
             row = conn.execute(
                 f"SELECT {', '.join(self._RUN_COLUMNS)} FROM runs WHERE run_id = ?",
@@ -103,7 +129,7 @@ class RunRegistryRepository:
             ).fetchone()
             if row is None:
                 raise RuntimeError(f"Failed to create run {run_id}")
-            return dict(zip(self._RUN_COLUMNS, row))
+            return self._decode_run(row)
         finally:
             conn.close()
 
@@ -143,7 +169,7 @@ class RunRegistryRepository:
                 f"SELECT {', '.join(self._RUN_COLUMNS)} FROM runs WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
-            return dict(zip(self._RUN_COLUMNS, row)) if row is not None else None
+            return self._decode_run(row) if row is not None else None
         finally:
             conn.close()
 
@@ -156,9 +182,48 @@ class RunRegistryRepository:
             ).fetchone()
             if row is None:
                 return None
-            return dict(zip(self._RUN_COLUMNS, row))
+            return self._decode_run(row)
         finally:
             conn.close()
+
+    def get_latest_open_run(self) -> dict | None:
+        """Return the most recently created run that has not been closed."""
+        conn = self._new_conn()
+        try:
+            row = conn.execute(
+                f"SELECT {', '.join(self._RUN_COLUMNS)} FROM runs "
+                "WHERE closed_at IS NULL ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            return self._decode_run(row) if row is not None else None
+        finally:
+            conn.close()
+
+    def get_latest_active_run(self) -> dict | None:
+        """Return the newest open run that also owns an active epoch."""
+        conn = self._new_conn()
+        try:
+            row = conn.execute(
+                f"SELECT {', '.join(self._RUN_COLUMNS)} FROM runs "
+                "WHERE closed_at IS NULL AND EXISTS ("
+                "SELECT 1 FROM epochs e WHERE e.run_id=runs.run_id AND e.closed_at IS NULL"
+                ") ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            return self._decode_run(row) if row is not None else None
+        finally:
+            conn.close()
+
+    @classmethod
+    def _decode_run(cls, row: sqlite3.Row | tuple) -> dict[str, Any]:
+        result: dict[str, Any] = dict(zip(cls._RUN_COLUMNS, row))
+        raw = result.get("resource_policy_json")
+        if raw:
+            try:
+                result["resource_policy"] = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result["resource_policy"] = None
+        else:
+            result["resource_policy"] = None
+        return result
 
     def active_run_selections(self) -> list[dict]:
         """Return inference/sidecar profile selections for every open run.

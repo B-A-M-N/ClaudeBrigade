@@ -9,10 +9,12 @@ their original names.
 
 from __future__ import annotations
 
+from enhanced_router.repository_base import RepositoryMixin
+
 import sqlite3
 
 
-class FindingRepository:
+class FindingRepository(RepositoryMixin):
     """Mixin providing finding lifecycle persistence methods.
 
     Requires a host class that provides ``_new_conn() -> sqlite3.Connection``
@@ -110,6 +112,8 @@ class FindingRepository:
         finding_id: str,
         disposition: str,
         *,
+        run_id: str | None = None,
+        epoch_id: str | None = None,
         reason: str = "",
         dispositioned_by: str = "",
         repair_agent_id: str | None = None,
@@ -119,18 +123,31 @@ class FindingRepository:
 
         Accepted findings with a repair_agent_id are flagged for resolution.
         """
+        if disposition not in {"pending", "accepted", "rejected", "duplicate", "waived"}:
+            raise ValueError(f"invalid finding disposition: {disposition}")
+        if (run_id is None) != (epoch_id is None):
+            raise ValueError("run_id and epoch_id must be supplied together")
         conn = self._new_conn()
         try:
+            predicates = ["finding_id=?"]
+            params: list[object] = [finding_id]
+            if run_id is not None and epoch_id is not None:
+                predicates.extend(["run_id=?", "epoch_id=?"])
+                params.extend([run_id, epoch_id])
             conn.execute(
                 """UPDATE findings SET disposition=?, disposition_reason=?,
                    dispositioned_at=datetime('now'), dispositioned_by=?,
                    repair_agent_id=?, repair_phase_id=?, updated_at=datetime('now')
-                   WHERE finding_id=?""",
-                (disposition, reason, dispositioned_by, repair_agent_id,
-                 repair_phase_id, finding_id),
+                   WHERE """ + " AND ".join(predicates),
+                [disposition, reason, dispositioned_by, repair_agent_id,
+                 repair_phase_id, *params],
             )
             conn.commit()
-            return self.get_finding(finding_id)
+            return (
+                self.get_finding_scoped(run_id, epoch_id, finding_id)
+                if run_id is not None and epoch_id is not None
+                else self.get_finding(finding_id)
+            )
         finally:
             conn.close()
 
@@ -139,18 +156,34 @@ class FindingRepository:
         finding_id: str,
         verification_status: str,
         resolution_evidence_json: str = "{}",
+        *,
+        run_id: str | None = None,
+        epoch_id: str | None = None,
     ) -> dict | None:
         """Record resolution evidence and verification result for a finding."""
+        if verification_status not in {"pending", "verified", "failed", "irrelevant"}:
+            raise ValueError(f"invalid finding verification status: {verification_status}")
+        if (run_id is None) != (epoch_id is None):
+            raise ValueError("run_id and epoch_id must be supplied together")
         conn = self._new_conn()
         try:
+            predicates = ["finding_id=?"]
+            params: list[object] = [finding_id]
+            if run_id is not None and epoch_id is not None:
+                predicates.extend(["run_id=?", "epoch_id=?"])
+                params.extend([run_id, epoch_id])
             conn.execute(
                 """UPDATE findings SET verification_status=?,
                    resolution_evidence_json=?, updated_at=datetime('now')
-                   WHERE finding_id=?""",
-                (verification_status, resolution_evidence_json, finding_id),
+                   WHERE """ + " AND ".join(predicates),
+                [verification_status, resolution_evidence_json, *params],
             )
             conn.commit()
-            return self.get_finding(finding_id)
+            return (
+                self.get_finding_scoped(run_id, epoch_id, finding_id)
+                if run_id is not None and epoch_id is not None
+                else self.get_finding(finding_id)
+            )
         finally:
             conn.close()
 

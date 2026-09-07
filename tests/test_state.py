@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -56,6 +57,34 @@ def test_create_run_idempotent(state: RouteState):
     r2 = state.create_run(run_id, session_id="s2", cwd="/b")  # different values
     assert r1["claude_session_id"] == "s1"
     assert r2["claude_session_id"] == "s1"  # first value wins
+
+
+def test_litellm_deployment_telemetry_persists_events(state: RouteState):
+    generation = state.create_litellm_generation(
+        registry_hash="registry-1",
+        model_count=2,
+        config_digest="config-1",
+        reason="test",
+    )
+    deployment = state.register_litellm_deployment(generation, 18000, 1234)
+    event = state.record_litellm_deployment_event(
+        deployment_id=deployment,
+        generation=generation,
+        event="healthy",
+        status="active",
+        pid=1234,
+        port=18000,
+        active_requests=2,
+        active_streams=1,
+        metadata={"reason": "probe"},
+    )
+
+    assert event["event"] == "healthy"
+    telemetry = state.get_litellm_deployment_telemetry(deployment_id=deployment)
+    assert telemetry[0]["event_count"] == 1
+    assert telemetry[0]["last_event"] == "healthy"
+    assert telemetry[0]["last_active_requests"] == 2
+    assert state.get_litellm_deployment_events(deployment)[0]["metadata_json"] == '{"reason":"probe"}'
 
 
 def test_create_run_accepts_launch_selection(state: RouteState):
@@ -731,6 +760,83 @@ def test_reserve_provider_agent_does_not_block_an_untested_model(state: RouteSta
     assert result["state"] == "reserved"
 
 
+def test_reserve_provider_agent_rejects_stale_health(state: RouteState):
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    state.set_model_health(
+        "stale-model", "cfg", "1.0", "healthy",
+        reachable=True, authenticated=True, compatible=True,
+    )
+    old_checked_at = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    conn = state._new_conn()
+    try:
+        conn.execute(
+            "UPDATE model_health SET checked_at=? WHERE model_id=?",
+            (old_checked_at, "stale-model"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = state.reserve_provider_agent(
+        reservation_id="stale-reservation", run_id="r1", epoch_id="ep-1",
+        provider_id="freeinference", execution_id="e1", max_active=1,
+        enqueue=False, model_id="stale-model", health_max_age_seconds=60,
+    )
+    assert result["state"] == "unavailable"
+    assert "stale" in result["reason"]
+    assert state.get_provider_reservations("freeinference") == []
+
+
+def test_provider_promotion_skips_newly_unhealthy_queued_model(state: RouteState):
+    state.create_run("r1")
+    state.create_epoch("r1", "ep-1", "normal", "hybrid")
+    state.set_model_health(
+        "queued-model", "cfg", "1.0", "healthy",
+        reachable=True, authenticated=True, compatible=True,
+    )
+    state.set_model_health(
+        "healthy-model", "cfg", "1.0", "healthy",
+        reachable=True, authenticated=True, compatible=True,
+    )
+    blocker = state.reserve_provider_agent(
+        reservation_id="blocker", run_id="r1", epoch_id="ep-1",
+        provider_id="freeinference", execution_id="blocker-exec",
+        max_active=1, enqueue=False,
+    )
+    assert blocker["state"] == "reserved"
+    queued = state.reserve_provider_agent(
+        reservation_id="queued-bad", run_id="r1", epoch_id="ep-1",
+        provider_id="freeinference", execution_id="bad-exec",
+        max_active=1, enqueue=True, model_id="queued-model",
+    )
+    healthy = state.reserve_provider_agent(
+        reservation_id="queued-good", run_id="r1", epoch_id="ep-1",
+        provider_id="freeinference", execution_id="good-exec",
+        max_active=1, enqueue=True, model_id="healthy-model",
+    )
+    assert queued["state"] == "queued"
+    assert healthy["state"] == "queued"
+    assert queued["model_id"] == "queued-model"
+
+    state.set_model_health(
+        "queued-model", "cfg", "1.0", "unhealthy",
+        reachable=False, authenticated=True, compatible=True,
+    )
+    state.release_provider_reservation("blocker")
+    admitted = state.admit_provider_agents(
+        "freeinference", 1, health_max_age_seconds=60,
+    )
+
+    assert [item["reservation_id"] for item in admitted] == ["queued-good"]
+    reservations = {
+        item["reservation_id"]: item
+        for item in state.get_provider_reservations("freeinference")
+    }
+    assert reservations["queued-bad"]["state"] == "expired"
+    assert reservations["queued-good"]["state"] == "reserved"
+
+
 def test_ttl_expired_claim_releases_its_provider_reservation(
     state: RouteState, monkeypatch: pytest.MonkeyPatch,
 ):
@@ -1111,6 +1217,58 @@ def test_reconcile_lifecycle_terminalizes_orphaned_detached_fastpath_jobs(
     assert execution is not None
     assert execution["status"] == "timeout"
     assert "orphaned" in execution["error"]
+    assert execution["error_class"] == "orphaned_after_restart"
+    assert execution["orphaned_at"] is not None
+
+
+def test_startup_reconciles_recent_detached_job_immediately(state: RouteState):
+    state.create_run("r-recent")
+    state.create_epoch("r-recent", "ep-1", "normal", "hybrid")
+    state.start_detached_sidecar_execution(
+        run_id="r-recent", epoch_id="ep-1", execution_id="scx-recent",
+        phase_id="fastpath:verify", role="fastpath", model_id="model-a",
+        provider_id=None, packet={"streaming": True},
+    )
+
+    result = state.reconcile_lifecycle(detached_max_age_seconds=0)
+
+    assert result["detached_executions_orphaned"] == 1
+    execution = state.get_agent_execution("scx-recent")
+    assert execution is not None
+    assert execution["error_class"] == "orphaned_after_restart"
+
+
+def test_restart_orphan_does_not_advance_route_ladder():
+    from enhanced_router.runnable_action_state import _execution_advances_route
+
+    assert not _execution_advances_route({
+        "status": "timeout",
+        "error_class": "orphaned_after_restart",
+    })
+
+
+def test_litellm_request_attribution_preserves_requested_and_observed_routes(
+    state: RouteState,
+):
+    row = state.record_litellm_request_attribution(
+        request_id="req-1",
+        generation=3,
+        agent_binding_id=None,
+        logical_model_id="grouped",
+        requested_provider_ids=["openrouter", "freeinference"],
+        allowed_deployments=["free", "local"],
+        reported_deployment_id="free",
+        actual_provider_id="freeinference",
+        actual_endpoint_id="free",
+        attribution_source="validated_response_header",
+        trusted=True,
+        status_code=200,
+    )
+    assert row["trusted"] == 1
+    assert row["requested_provider_ids_json"] == '["freeinference","openrouter"]'
+    assert state.get_litellm_request_attributions(request_id="req-1")[0][
+        "actual_endpoint_id"
+    ] == "free"
 
 
 def test_v29_to_current_adds_binding_and_group_columns(tmp_path: Path):
@@ -1218,6 +1376,45 @@ def test_claim_runnable_action_denied_once_run_token_budget_is_exhausted(
         state.claim_runnable_action("r1", "ep-1", native["action_id"])
 
 
+def test_token_budget_reservations_block_concurrent_claims_before_spend(
+    state: RouteState,
+):
+    """Admission accounts for live reservations, not only completed usage."""
+    state.create_run("r1", token_budget=500)
+
+    first = state.reserve_token_budget(
+        reservation_id="tokens:first",
+        run_id="r1",
+        epoch_id="ep-1",
+        action_id="action:first",
+        execution_id=None,
+        estimated_tokens=400,
+    )
+    assert first["state"] == "reserved"
+
+    blocked = state.reserve_token_budget(
+        reservation_id="tokens:second",
+        run_id="r1",
+        epoch_id="ep-1",
+        action_id="action:second",
+        execution_id=None,
+        estimated_tokens=200,
+    )
+    assert blocked["state"] == "unavailable"
+    assert "exhausted its token budget" in blocked["reason"]
+
+    state.release_token_reservation("tokens:first", "released")
+    admitted = state.reserve_token_budget(
+        reservation_id="tokens:second",
+        run_id="r1",
+        epoch_id="ep-1",
+        action_id="action:second",
+        execution_id=None,
+        estimated_tokens=200,
+    )
+    assert admitted["state"] == "reserved"
+
+
 def test_claim_runnable_action_ignores_budget_when_run_has_none(
     state: RouteState, monkeypatch: pytest.MonkeyPatch,
 ):
@@ -1273,10 +1470,15 @@ def test_controller_phase_generates_controlled_native_mutator_action(
     monkeypatch.setattr(registry_module, "get_registry", lambda: FakeRegistry())
 
     action = next(item for item in state.get_runnable_actions("r1", "ep-1"))
-    assert action["action_kind"] == "native_agent"
+    assert action["action_kind"] == "controller_action"
+    assert action["legacy_action_kind"] == "native_agent"
+    assert action["controller_action_kind"] == "controller_implementation"
     assert action["native_agent_name"] == "controller-direct"
     assert action["role"] == "controller"
     assert action["requires_main_controller"] is True
+    claimed = state.claim_runnable_action("r1", "ep-1", action["action_id"])
+    assert claimed["action_kind"] == "controller_action"
+    assert state.get_spawn_assignment("r1", "ep-1", "controller") is None
 
 
 def test_unclaimed_native_action_is_not_spawnable(state: RouteState, monkeypatch: pytest.MonkeyPatch):
@@ -1529,7 +1731,11 @@ def test_fallback_activation_preserves_candidate_endpoint(
     state.create_epoch("r1", "ep-1", "normal", "hybrid")
     state.set_role_route(
         "r1", "ep-1", "recon", "model-a", "manual",
-        fallback_routes=[{"model": "model-b", "endpoint": "provider-b"}],
+        fallback_routes=[{
+            "model": "model-b",
+            "endpoint": "provider-b",
+            "provider_id": "provider-b",
+        }],
     )
     state.initialize_workflow_phases(
         "r1", "ep-1", [{"id": "recon", "roles": ["recon"], "max_fanout": 1, "max_attempts": 2}],
@@ -1559,6 +1765,7 @@ def test_fallback_activation_preserves_candidate_endpoint(
     second = next(item for item in state.get_runnable_actions("r1", "ep-1"))
     assert second["model_id"] == "model-b"
     assert second["endpoint"] == "provider-b"
+    assert second["provider_id"] == "provider-b"
 
 
 def test_fallback_activation_legacy_rows_still_work(

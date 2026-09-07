@@ -117,6 +117,10 @@ def authenticated_mcp_app(
                 "adjudicate_finding",
                 "integrate_changeset",
                 "complete_workflow",
+                "adjudicate_coprocessor_result",
+                "adjudicate_feedback",
+                "adjudicate_native_result",
+                "invoke_coprocessor",
                 "invoke_sidecar",
                 "cancel_execution",
                 "retry_execution",
@@ -173,14 +177,20 @@ async def _send_error(send: Callable, status: int, detail: str) -> None:
     body = json.dumps(
         {"error": detail}, separators=(",", ":")
     ).encode("utf-8")
-    await send(
-        {
-            "type": "http.response.start",
-            "status": status,
-            "headers": [
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(body)).encode()),
-            ],
-        }
-    )
-    await send({"type": "http.response.body", "body": body})
+    try:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        # A client may disconnect while authentication/capability checks are
+        # running. There is no response left to send, and this should not
+        # become a router-level failure.
+        LOGGER.debug("MCP client disconnected before error response", exc_info=True)

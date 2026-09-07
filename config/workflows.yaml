@@ -1,6 +1,17 @@
+# The controller owns this DAG; native sidecars are execution workers selected
+# independently from the inference profile.  Conditional phases are skipped
+# only from typed result contracts, never from controller prose.
 workflows:
   trivial:
     default_profile: freeinference
+    tier: trivial
+    composition_mode: native-only
+    resource_policy:
+      max_active_native_agents: 1
+      max_active_mutators: 1
+      max_active_reviewers: 1
+      max_active_coprocessors: 1
+      max_active_worktrees: 1
     phases:
       - id: implementation
         actor: controller
@@ -9,90 +20,607 @@ workflows:
         min_fanout: 1
         max_fanout: 1
         quality_quorum: 1
+
   normal:
-    default_profile: hybrid
+    default_profile: freeinference
+    tier: normal
+    composition_mode: sidecar-only
+    resource_policy:
+      max_active_native_agents: 3
+      max_active_mutators: 1
+      max_active_reviewers: 1
+      max_active_coprocessors: 1
+      max_active_worktrees: 1
     phases:
+      - id: contract
+        actor: controller
+        required: true
+        mutation: false
+        produces: task_contract
+      - id: pre-grounding
+        sidecar_agent: grounder
+        execution_kind: native_agent
+        roles: [recon]
+        depends_on: [contract]
+        result_contract:
+          schema_id: qwen_grounding_v1
+          success_verdicts: [PASS]
+          failure_verdicts: [BLOCKED]
+      - id: package-plan
+        actor: controller
+        required: true
+        mutation: false
+        depends_on: [pre-grounding]
+        produces: work_packages
       - id: implementation
+        sidecar_agent: implementation-worker
+        execution_kind: native_agent
         roles: [implementer]
         required: true
         mutation: true
-        min_fanout: 1
-        max_fanout: 1
-        quality_quorum: 1
+        depends_on: [package-plan]
+        fanout_from: work_packages
+        completion_mode: all_packages
+        launch_policy: all_packages
+        max_parallelism: 1
+      - id: integration
+        actor: controller
+        required: true
+        mutation: false
+        depends_on: [implementation]
+      - id: post-grounding
+        sidecar_agent: grounder
+        execution_kind: native_agent
+        roles: [recon]
+        depends_on: [integration]
+        result_contract:
+          schema_id: qwen_grounding_v1
+          success_verdicts: [PASS]
+          failure_verdicts: [BLOCKED]
+          branch_field: complexity
+          branches: {TRIVIAL: completion-controller, COMPLEX: senior-review}
+          requires_current_generation: true
+          requires_current_digest: true
+      - id: senior-review
+        sidecar_agent: senior-reviewer
+        execution_kind: native_agent
+        roles: [adversary]
+        required: false
+        mutation: false
+        depends_on: [post-grounding]
+        condition:
+          kind: phase_result_equals
+          phase_id: post-grounding
+          field: complexity
+          value: COMPLEX
+        result_contract:
+          schema_id: minimax_senior_review_v1
+          success_verdicts: [PASS, NO_FINDINGS]
+          failure_verdicts: [BLOCKED]
+          requires_current_generation: true
+          requires_current_digest: true
+      - id: repair
+        sidecar_agent: repair-worker
+        execution_kind: native_agent
+        roles: [repairer]
+        required: false
+        mutation: true
+        depends_on: [senior-review]
+        conditional: accepted_findings
+      - id: post-repair-grounding
+        sidecar_agent: grounder
+        execution_kind: native_agent
+        roles: [recon]
+        required: false
+        depends_on: [repair]
+        conditional: accepted_findings
+        result_contract:
+          schema_id: qwen_grounding_v1
+          success_verdicts: [PASS]
+          failure_verdicts: [BLOCKED]
+          requires_current_generation: true
+          requires_current_digest: true
+      - id: completion-controller
+        sidecar_agent: completion-controller
+        execution_kind: native_agent
+        roles: [adjudicator]
+        depends_on: [post-repair-grounding]
+        result_contract:
+          schema_id: kimi_completion_v1
+          success_verdicts: [COMPLETED]
+          branch_verdicts: [NEEDS_REVIEW]
+          failure_verdicts: [BLOCKED]
+          branch_field: completion
+          branches: {COMPLETED: critical-gate, NEEDS_REVIEW: completion-review}
+          requires_current_generation: true
+          requires_current_digest: true
+      - id: completion-review
+        sidecar_agent: completion-reviewer
+        execution_kind: native_agent
+        roles: [adversary]
+        required: false
+        depends_on: [completion-controller]
+        condition:
+          kind: phase_result_equals
+          phase_id: completion-controller
+          field: completion
+          value: NEEDS_REVIEW
+        result_contract:
+          schema_id: minimax_completion_review_v1
+          success_verdicts: [COMPLETED]
+          branch_verdicts: [NEEDS_REVIEW]
+          failure_verdicts: [BLOCKED]
+          requires_current_generation: true
+          requires_current_digest: true
+      - id: correction
+        sidecar_agent: repair-worker
+        execution_kind: native_agent
+        roles: [repairer]
+        required: false
+        mutation: true
+        depends_on: [completion-review]
+        condition:
+          kind: phase_result_equals
+          phase_id: completion-review
+          field: completion
+          value: NEEDS_REVIEW
+      - id: final-grounding
+        sidecar_agent: grounder
+        execution_kind: native_agent
+        roles: [recon]
+        required: false
+        depends_on: [correction]
+        condition:
+          kind: phase_result_equals
+          phase_id: completion-review
+          field: completion
+          value: NEEDS_REVIEW
+        result_contract:
+          schema_id: qwen_grounding_v1
+          success_verdicts: [PASS]
+          failure_verdicts: [BLOCKED]
+          requires_current_generation: true
+          requires_current_digest: true
+      - id: critical-gate
+        sidecar_agent: critical-gate
+        execution_kind: native_agent
+        roles: [adjudicator]
+        depends_on: [completion-controller, completion-review, final-grounding]
+        result_contract:
+          schema_id: glm_critical_gate_v1
+          success_verdicts: [APPROVED]
+          blocked_verdicts: [BLOCKED]
+          requires_current_generation: true
+          requires_current_digest: true
+      - id: verification
+        actor: controller
+        required: true
+        mutation: false
+        depends_on: [critical-gate]
+
+  # Combined composition: ClaudeBrigade's native slot agents own the primary
+  # implementation/review path, while the independently routed sidecars add
+  # grounding, conditional senior review, completion diagnosis, correction,
+  # and a final critical gate.  This is intentionally a separate workflow so
+  # the proven sidecar-only flow remains selectable and auditable.
+  sidecar-augmented-normal:
+    default_profile: freeinference
+    tier: normal
+    composition_mode: native-augmented
+    resource_policy:
+      max_active_native_agents: 3
+      max_active_mutators: 1
+      max_active_reviewers: 2
+      max_active_coprocessors: 1
+      max_active_worktrees: 1
+    phases:
+      - id: contract
+        actor: controller
+        required: true
+        mutation: false
+        produces: task_contract
+      - id: pre-grounding
+        agent_id: grounder
+        execution_kind: native_agent
+        roles: [recon]
+        depends_on: [contract]
+        result_contract:
+          schema_id: qwen_grounding_v1
+          success_verdicts: [PASS]
+          failure_verdicts: [BLOCKED]
+      - id: package-plan
+        actor: controller
+        required: true
+        mutation: false
+        depends_on: [pre-grounding]
+        produces: work_packages
+      - id: implementation
+        agent_id: implementer
+        execution_kind: native_agent
+        roles: [implementer]
+        required: true
+        mutation: true
+        depends_on: [package-plan]
+        fanout_from: work_packages
+        completion_mode: all_packages
+        launch_policy: all_packages
+        max_parallelism: 1
+      - id: integration
+        actor: controller
+        required: true
+        mutation: false
+        depends_on: [implementation]
+      - id: post-grounding
+        sidecar_agent: grounder
+        execution_kind: native_agent
+        roles: [recon]
+        depends_on: [integration]
+        result_contract:
+          schema_id: qwen_grounding_v1
+          success_verdicts: [PASS]
+          failure_verdicts: [BLOCKED]
+          branch_field: complexity
+          branches: {TRIVIAL: completion-controller, COMPLEX: senior-review}
+          requires_current_generation: true
+          requires_current_digest: true
+      - id: native-review
+        agent_id: reviewer
+        execution_kind: native_agent
+        roles: [adversary]
+        required: false
+        mutation: false
+        depends_on: [post-grounding]
+        condition:
+          kind: phase_result_equals
+          phase_id: post-grounding
+          field: complexity
+          value: COMPLEX
+        result_contract:
+          schema_id: native_adversary_v1
+          success_verdicts: [PASS, NO_FINDINGS]
+          failure_verdicts: [BLOCKED]
+          requires_current_generation: true
+          requires_current_digest: true
+      - id: senior-review
+        sidecar_agent: senior-reviewer
+        execution_kind: native_agent
+        roles: [adversary]
+        required: false
+        mutation: false
+        depends_on: [post-grounding]
+        condition:
+          kind: phase_result_equals
+          phase_id: post-grounding
+          field: complexity
+          value: COMPLEX
+        result_contract:
+          schema_id: minimax_senior_review_v1
+          success_verdicts: [PASS, NO_FINDINGS]
+          failure_verdicts: [BLOCKED]
+          requires_current_generation: true
+          requires_current_digest: true
+      - id: repair
+        agent_id: repairer
+        execution_kind: native_agent
+        roles: [repairer]
+        required: false
+        mutation: true
+        depends_on: [native-review, senior-review]
+        conditional: accepted_findings
+      - id: post-repair-grounding
+        sidecar_agent: grounder
+        execution_kind: native_agent
+        roles: [recon]
+        required: false
+        depends_on: [repair]
+        conditional: accepted_findings
+        result_contract:
+          schema_id: qwen_grounding_v1
+          success_verdicts: [PASS]
+          failure_verdicts: [BLOCKED]
+          requires_current_generation: true
+          requires_current_digest: true
+      - id: completion-controller
+        sidecar_agent: completion-controller
+        execution_kind: native_agent
+        roles: [adjudicator]
+        depends_on: [post-repair-grounding]
+        result_contract:
+          schema_id: kimi_completion_v1
+          success_verdicts: [COMPLETED]
+          branch_verdicts: [NEEDS_REVIEW]
+          failure_verdicts: [BLOCKED]
+          branch_field: completion
+          branches: {COMPLETED: native-critical-review, NEEDS_REVIEW: completion-review}
+          requires_current_generation: true
+          requires_current_digest: true
+      - id: completion-review
+        sidecar_agent: completion-reviewer
+        execution_kind: native_agent
+        roles: [adversary]
+        required: false
+        depends_on: [completion-controller]
+        condition:
+          kind: phase_result_equals
+          phase_id: completion-controller
+          field: completion
+          value: NEEDS_REVIEW
+        result_contract:
+          schema_id: minimax_completion_review_v1
+          success_verdicts: [COMPLETED]
+          branch_verdicts: [NEEDS_REVIEW]
+          failure_verdicts: [BLOCKED]
+          requires_current_generation: true
+          requires_current_digest: true
+      - id: correction
+        sidecar_agent: repair-worker
+        execution_kind: native_agent
+        roles: [repairer]
+        required: false
+        mutation: true
+        depends_on: [completion-review]
+        condition:
+          kind: phase_result_equals
+          phase_id: completion-review
+          field: completion
+          value: NEEDS_REVIEW
+      - id: final-grounding
+        sidecar_agent: grounder
+        execution_kind: native_agent
+        roles: [recon]
+        required: false
+        depends_on: [correction]
+        condition:
+          kind: phase_result_equals
+          phase_id: completion-review
+          field: completion
+          value: NEEDS_REVIEW
+        result_contract:
+          schema_id: qwen_grounding_v1
+          success_verdicts: [PASS]
+          failure_verdicts: [BLOCKED]
+          requires_current_generation: true
+          requires_current_digest: true
+      - id: native-critical-review
+        agent_id: critical-verifier
+        execution_kind: native_agent
+        roles: [verification]
+        depends_on: [completion-controller, completion-review, final-grounding]
+        result_contract:
+          schema_id: native_critical_verifier_v1
+          success_verdicts: [APPROVED]
+          failure_verdicts: [BLOCKED]
+          requires_current_generation: true
+          requires_current_digest: true
+      - id: critical-gate
+        sidecar_agent: critical-gate
+        execution_kind: native_agent
+        roles: [adjudicator]
+        depends_on: [native-critical-review]
+        result_contract:
+          schema_id: glm_critical_gate_v1
+          success_verdicts: [APPROVED]
+          blocked_verdicts: [BLOCKED]
+          requires_current_generation: true
+          requires_current_digest: true
+      - id: verification
+        actor: controller
+        required: true
+        mutation: false
+        depends_on: [critical-gate]
+
   cross-cutting:
-    default_profile: hybrid
+    default_profile: freeinference
+    tier: cross-cutting
+    composition_mode: sidecar-only
+    resource_policy:
+      max_active_native_agents: 3
+      max_active_mutators: 2
+      max_active_reviewers: 2
+      max_active_coprocessors: 1
+      max_active_worktrees: 2
     phases:
-      - id: recon
-        roles: [recon]
+      - id: contract
+        actor: controller
         required: true
-        mutation: false
-        parallel_group: recon
-        min_fanout: 2
-        max_fanout: 2
-        quality_quorum: 1
+        produces: task_contract
+      - id: pre-grounding
+        sidecar_agent: grounder
+        execution_kind: native_agent
+        roles: [recon]
+        depends_on: [contract]
+        result_contract: {schema_id: qwen_grounding_v1, success_verdicts: [PASS], failure_verdicts: [BLOCKED]}
+      - id: package-plan
+        actor: controller
+        depends_on: [pre-grounding]
+        produces: work_packages
       - id: implementation
+        sidecar_agent: implementation-worker
+        execution_kind: native_agent
         roles: [implementer]
-        depends_on: [recon]
         mutation: true
-        min_fanout: 1
-        max_fanout: 1
-      - id: adversarial-review
-        roles: [adversary]
+        depends_on: [package-plan]
+        fanout_from: work_packages
+        completion_mode: all_packages
+        launch_policy: all_packages
+        max_parallelism: 2
+      - id: integration
+        actor: controller
         depends_on: [implementation]
-        mutation: false
-        min_fanout: 1
-        max_fanout: 1
-        quality_quorum: 1
+      - id: post-grounding
+        sidecar_agent: grounder
+        execution_kind: native_agent
+        roles: [recon]
+        depends_on: [integration]
+        result_contract:
+          schema_id: qwen_grounding_v1
+          success_verdicts: [PASS]
+          branch_field: complexity
+          branches: {TRIVIAL: completion-controller, COMPLEX: senior-review}
+          requires_current_generation: true
+          requires_current_digest: true
+      - id: senior-review
+        sidecar_agent: senior-reviewer
+        execution_kind: native_agent
+        roles: [adversary]
+        required: false
+        depends_on: [post-grounding]
+        condition: {kind: phase_result_equals, phase_id: post-grounding, field: complexity, value: COMPLEX}
+        result_contract: {schema_id: minimax_senior_review_v1, success_verdicts: [PASS, NO_FINDINGS], requires_current_generation: true, requires_current_digest: true}
       - id: repair
+        sidecar_agent: repair-worker
+        execution_kind: native_agent
         roles: [repairer]
         required: false
-        depends_on: [adversarial-review]
-        conditional: accepted_findings
         mutation: true
+        depends_on: [senior-review]
+        conditional: accepted_findings
+      - id: post-repair-grounding
+        sidecar_agent: grounder
+        execution_kind: native_agent
+        roles: [recon]
+        required: false
+        depends_on: [repair]
+        conditional: accepted_findings
+        result_contract: {schema_id: qwen_grounding_v1, success_verdicts: [PASS], requires_current_generation: true, requires_current_digest: true}
+      - id: completion-controller
+        sidecar_agent: completion-controller
+        execution_kind: native_agent
+        roles: [adjudicator]
+        depends_on: [post-repair-grounding]
+        result_contract: {schema_id: kimi_completion_v1, success_verdicts: [COMPLETED], branch_verdicts: [NEEDS_REVIEW], failure_verdicts: [BLOCKED], requires_current_generation: true, requires_current_digest: true}
+      - id: completion-review
+        sidecar_agent: completion-reviewer
+        execution_kind: native_agent
+        roles: [adversary]
+        required: false
+        depends_on: [completion-controller]
+        condition: {kind: phase_result_equals, phase_id: completion-controller, field: completion, value: NEEDS_REVIEW}
+        result_contract: {schema_id: minimax_completion_review_v1, success_verdicts: [COMPLETED], branch_verdicts: [NEEDS_REVIEW], failure_verdicts: [BLOCKED], requires_current_generation: true, requires_current_digest: true}
+      - id: correction
+        sidecar_agent: repair-worker
+        execution_kind: native_agent
+        roles: [repairer]
+        required: false
+        mutation: true
+        depends_on: [completion-review]
+        condition: {kind: phase_result_equals, phase_id: completion-review, field: completion, value: NEEDS_REVIEW}
+      - id: final-grounding
+        sidecar_agent: grounder
+        execution_kind: native_agent
+        roles: [recon]
+        required: false
+        depends_on: [correction]
+        condition: {kind: phase_result_equals, phase_id: completion-review, field: completion, value: NEEDS_REVIEW}
+        result_contract: {schema_id: qwen_grounding_v1, success_verdicts: [PASS], requires_current_generation: true, requires_current_digest: true}
+      - id: critical-gate
+        sidecar_agent: critical-gate
+        execution_kind: native_agent
+        roles: [adjudicator]
+        depends_on: [completion-controller, completion-review, final-grounding]
+        result_contract: {schema_id: glm_critical_gate_v1, success_verdicts: [APPROVED], blocked_verdicts: [BLOCKED], requires_current_generation: true, requires_current_digest: true}
       - id: verification
         actor: controller
-        depends_on: [repair]
-        mutation: false
+        depends_on: [critical-gate]
+
   high-risk:
-    default_profile: hybrid
+    default_profile: freeinference
+    tier: high-risk
+    composition_mode: sidecar-only
+    resource_policy:
+      max_active_native_agents: 3
+      max_active_mutators: 1
+      max_active_reviewers: 2
+      max_active_coprocessors: 1
+      max_active_worktrees: 1
     phases:
-      - id: recon
+      - id: contract
+        actor: controller
+        required: true
+        produces: task_contract
+      - id: critical-design
+        sidecar_agent: critical-gate
+        execution_kind: native_agent
+        roles: [architect]
+        depends_on: [contract]
+        result_contract: {schema_id: glm_design_review_v1, success_verdicts: [APPROVED], blocked_verdicts: [BLOCKED]}
+      - id: pre-grounding
+        sidecar_agent: grounder
+        execution_kind: native_agent
         roles: [recon]
-        required: true
-        mutation: false
-        parallel_group: recon
-        min_fanout: 2
-        max_fanout: 2
-        quality_quorum: 2
-      - id: design-review
-        roles: [adversary]
-        depends_on: [recon]
-        required: true
-        mutation: false
-        distinct_agent_from: [adversarial-review]
-        min_fanout: 2
-        max_fanout: 2
-        quality_quorum: 2
+        depends_on: [critical-design]
+        result_contract: {schema_id: qwen_grounding_v1, success_verdicts: [PASS], failure_verdicts: [BLOCKED]}
+      - id: package-plan
+        actor: controller
+        depends_on: [pre-grounding]
+        produces: work_packages
       - id: implementation
+        sidecar_agent: implementation-worker
+        execution_kind: native_agent
         roles: [implementer]
-        depends_on: [design-review]
         mutation: true
-        min_fanout: 1
-        max_fanout: 1
-      - id: adversarial-review
-        roles: [adversary]
+        depends_on: [package-plan]
+        fanout_from: work_packages
+        completion_mode: all_packages
+      - id: integration
+        actor: controller
         depends_on: [implementation]
-        mutation: false
-        distinct_agent_from: [design-review]
-        min_fanout: 1
-        max_fanout: 2
+      - id: post-grounding
+        sidecar_agent: grounder
+        execution_kind: native_agent
+        roles: [recon]
+        depends_on: [integration]
+        result_contract: {schema_id: qwen_grounding_v1, success_verdicts: [PASS], branch_field: complexity, requires_current_generation: true, requires_current_digest: true}
+      - id: senior-review
+        sidecar_agent: senior-reviewer
+        execution_kind: native_agent
+        roles: [adversary]
+        depends_on: [post-grounding]
+        result_contract: {schema_id: minimax_senior_review_v1, success_verdicts: [PASS, NO_FINDINGS], requires_current_generation: true, requires_current_digest: true}
       - id: repair
+        sidecar_agent: repair-worker
+        execution_kind: native_agent
         roles: [repairer]
         required: false
-        depends_on: [adversarial-review]
-        conditional: accepted_findings
         mutation: true
+        depends_on: [senior-review]
+        conditional: accepted_findings
+      - id: completion-controller
+        sidecar_agent: completion-controller
+        execution_kind: native_agent
+        roles: [adjudicator]
+        depends_on: [repair]
+        result_contract: {schema_id: kimi_completion_v1, success_verdicts: [COMPLETED], branch_verdicts: [NEEDS_REVIEW], failure_verdicts: [BLOCKED], requires_current_generation: true, requires_current_digest: true}
+      - id: completion-review
+        sidecar_agent: completion-reviewer
+        execution_kind: native_agent
+        roles: [adversary]
+        required: false
+        depends_on: [completion-controller]
+        condition: {kind: phase_result_equals, phase_id: completion-controller, field: completion, value: NEEDS_REVIEW}
+        result_contract: {schema_id: minimax_completion_review_v1, success_verdicts: [COMPLETED], branch_verdicts: [NEEDS_REVIEW], failure_verdicts: [BLOCKED], requires_current_generation: true, requires_current_digest: true}
+      - id: correction
+        sidecar_agent: repair-worker
+        execution_kind: native_agent
+        roles: [repairer]
+        required: false
+        mutation: true
+        depends_on: [completion-review]
+        condition: {kind: phase_result_equals, phase_id: completion-review, field: completion, value: NEEDS_REVIEW}
+      - id: final-grounding
+        sidecar_agent: grounder
+        execution_kind: native_agent
+        roles: [recon]
+        required: false
+        depends_on: [correction]
+        condition: {kind: phase_result_equals, phase_id: completion-review, field: completion, value: NEEDS_REVIEW}
+        result_contract: {schema_id: qwen_grounding_v1, success_verdicts: [PASS], failure_verdicts: [BLOCKED], requires_current_generation: true, requires_current_digest: true}
+      - id: critical-gate
+        sidecar_agent: critical-gate
+        execution_kind: native_agent
+        roles: [adjudicator]
+        depends_on: [completion-controller, completion-review, final-grounding]
+        result_contract: {schema_id: glm_critical_gate_v1, success_verdicts: [APPROVED], blocked_verdicts: [BLOCKED], requires_current_generation: true, requires_current_digest: true}
       - id: verification
         actor: controller
-        depends_on: [repair]
-        mutation: false
+        depends_on: [critical-gate]

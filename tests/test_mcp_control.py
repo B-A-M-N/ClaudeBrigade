@@ -163,7 +163,14 @@ def test_fastpath_proposal_requires_main_controller_and_can_apply_logical_route(
     state.create_route_proposal(
         proposal_id="proposal-1", intake_id=intake["intake_id"], source="fastpath",
         parsed_proposal={
-            "routes": {"implementer": {"model": "longcat-2", "endpoint": "auto"}},
+            "routes": {"implementer": {"candidate_id": "i0", "endpoint": "auto"}},
+            # The router resolves compact fastpath aliases before persisting
+            # the detached proposal; MCP must apply this immutable projection.
+            "resolved_routes": {
+                "implementer": {
+                    "candidate_id": "i0", "model": "longcat-2", "endpoint": "auto",
+                },
+            },
         }, validation_status="accepted_for_controller_review", confidence=0.99,
     )
     monkeypatch.setattr(mcp_control, "get_state", lambda: state)
